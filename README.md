@@ -22,20 +22,19 @@ You need:
 
 1. Unzip `KartPadNX-Builder.zip` and run `KartPadNX-Builder.exe`. Windows might warn you
    because it isn't signed: click **More info**, then **Run anyway**.
-2. Pick your disc image, leave **Retro Rewind** and **Also download the Retro Rewind SD
-   files** ticked if you want it, and click **Build**. The first build takes 30 to 60
-   minutes. Nothing gets installed on your PC.
-3. When it's done, copy everything in the output folder (the `switch` folder, and the
-   `RetroRewind6` folder if you built Retro Rewind) to the root of your SD card, and put your
-   disc image in `sd:/iso`.
+2. Pick your disc image, leave **Retro Rewind** ticked if you want it, and click **Build**.
+   The first build takes 30 to 60 minutes. Nothing gets installed on your PC.
+3. When it's done, copy the `switch` folder from the output folder to the root of your SD
+   card, and put your disc image in `sd:/iso`.
 4. On the Switch, open the Homebrew Menu by holding **R** while starting a game, launch
-   **MKW Launcher**, and import your disc under **Game Files**. Import Retro Rewind there too.
+   **MKW Launcher**, and import your disc under **Game Files**.
 
 ### Retro Rewind
 
 Retro Rewind needs its own files on the SD card, and they have to be the exact version the
-builder built. With **Also download the Retro Rewind SD files** ticked (about 1.9 GB), the
-builder gets the right ones and puts them in the output folder as `RetroRewind6`.
+builder built. Leave **Also download the Retro Rewind SD files** ticked (about 1.9 GB) and the
+builder puts the right ones in the output folder as `RetroRewind6`. Copy that folder to the
+root of your SD card too, then import it under **Game Files**.
 
 If you untick it, download the **full pack** of the version named in `INSTALL.txt` from
 [rwfc.net](https://rwfc.net), copy its `RetroRewind6` folder to `sd:/RetroRewind6`, and import
@@ -68,6 +67,8 @@ again. Only Retro Rewind gets rebuilt, and the `RetroRewind6` folder is updated 
 | `launcher/` | MKW Launcher: disc import, profiles, saves, Miis, settings |
 | `builder/` | Scripts for building everything from source with Docker |
 | `ref/kartpad-main/` | The few KartPad files this port needs |
+| `docs/` | [How it works](docs/ARCHITECTURE.md), [building from source](docs/BUILDING-SWITCH.md), [dependencies](docs/DEPENDENCIES.md), [what can be shared](docs/DISTRIBUTION.md), [perf.cfg settings](docs/PERF-CFG-KEYS.md) |
+
 If you want to work on the port itself rather than just play it, start with
 [docs/BUILDING-SWITCH.md](docs/BUILDING-SWITCH.md).
 
