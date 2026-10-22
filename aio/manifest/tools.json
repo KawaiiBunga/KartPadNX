@@ -62,13 +62,16 @@
     "type": "zip"
   },
   "retro_rewind": {
-    "comment": "approved_url is this repo's aio/manifest/rr-versions.json; the fields below are the version built when it cannot be read.",
+    "comment": "approved_url is this repo's aio/manifest/rr-versions.json; the fields below are the version built when it cannot be read. full_* is that version's full pack, for the RetroRewind6 SD folder.",
     "approved_url": "https://raw.githubusercontent.com/KawaiiBunga/KartPadNX/main/aio/manifest/rr-versions.json",
     "version": "6.13.4",
     "url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.4.zip",
     "size": 776946,
     "sha256": "59e69024ee163dddf96220c31d53f959ed9bf400c896e579d17c7e0066c20950",
     "code_pul_sha256": "11f70007b093d5490ad6ad85868eff4d62b6d80f6ff321cd0c9dec2c59e1b640",
+    "full_url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.4-full.zip",
+    "full_size": 1939356115,
+    "full_sha256": "586b929de36018e5fc3f7ee73b0aba407730d38470d7a54b8a455dca14be7002",
     "payload_url": "http://nas.play.rwfc.net/payload?g=RMCPD00"
   }
 }

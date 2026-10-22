@@ -1,54 +1,94 @@
-# Your game dump and everything derived from it: never commit
+# ---------------------------------------------------------------------------
+# Game data. Nothing from Mario Kart Wii or Retro Rewind belongs in this repo:
+# no disc images, extracted files, translated code, saves or keys.
+# ---------------------------------------------------------------------------
 /iso/
 /private/
-*.wbfs
 *.iso
-*.wia
+*.wbfs
 *.rvz
+*.wia
+*.ciso
+*.gcz
+*.nfs
 *.wad
 *.dol
+*.rel
 *.szs
+*.u8
 *.arc
 *.brres
 *.brstm
+*.brsar
+*.bmg
 *.thp
+*.rkg
+*.pul
+rksys.dat
+NAND/
+RetroRewind6/
 common-key.bin
 common_key.bin
+*.key
+*.pem
 
-# Build trees and outputs (rebuilt by builder/ and aio/)
+# Translated game code and anything generated from it
+func_8*.cpp
+data_sections_init*
+guest_symbol_table.cpp
+RuntimeConfig.h
+/switch/src/native_model_region.cpp
+/switch/src/native_model_region.json
+
+# ---------------------------------------------------------------------------
+# Build outputs. Game NROs contain translated game code: never commit or upload
+# them. The builder release goes on the Releases page, not in git.
+# ---------------------------------------------------------------------------
 /build/
 /dist/
 /aio/out/
 *.nro
 *.nso
+*.nsp
 *.elf
 *.nacp
 *.map
+*.dksh
+*.o
+*.a
+*.zip
+*.7z
+*.exe
+*.dll
+*.pdb
+KartPadNX-Builder.data
+KartPadNX-Builder.settings
+KartPadNX-Builder-data/
 
-# Upstream checkouts from builder/fetch-deps.sh. The KartPad subset this port uses is
-# kept in the repo.
+# Upstream checkouts made by builder/fetch-deps.sh. The KartPad files this port
+# uses are kept in ref/kartpad-main.
 /ref/*
 !/ref/kartpad-main/
 
-# SD-card state written by host runs of the launcher/runtime
+# SD card state written by host runs of the launcher or runtime
 /switch/kartpad/
 /switch/mkw-launcher/
-/switch/src/native_model_region.cpp
-/switch/src/native_model_region.json
-
-# Host test leftovers
 /launcher/tests/*.o
 /launcher/tests/*_test
 /launcher/tests/sdmc*/
 /launcher/tests/test_romfs/
 /launcher/tests/test_sdmc/
 
-# Builder settings and logs next to a local exe
-KartPadNX-Builder.settings
+# Logs, caches, editors, OS
 *.log
-
+Logs/
 __pycache__/
 *.pyc
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
 .DS_Store
 Thumbs.db
 desktop.ini

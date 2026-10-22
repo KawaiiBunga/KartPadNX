@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """KartPad-NX AIO builder pipeline: the user's disc image in, mkw-launcher.nro out.
 
-  python kpnx_aio.py --data DIR --disc IMAGE --out DIR [--rr] [--jobs N]
+  python kpnx_aio.py --data DIR --disc IMAGE --out DIR [--rr [--rr-sd]] [--jobs N]
                      [--toolkit ZIP|URL] [--manifest tools.json] [--shim nxshim.exe]
 
 Runs on Windows with nothing installed. Every tool is a pinned, hash-checked portable
@@ -15,6 +15,7 @@ built from in <data>/state and is skipped when nothing changed.
   transform  the repo's source passes over the translation
   build      CMake + Ninja + clang -> game NROs
   launcher   both games zstd-packed into the launcher RomFS -> <out>/switch/mkw-launcher.nro
+  rr-sd      with --rr-sd: the built version's full Retro Rewind pack -> <out>/RetroRewind6
 
 Lines starting with "@@" are JSON progress events for the frontend; everything else is log.
 """
@@ -680,6 +681,20 @@ def _version_key(v):
     return tuple(int(x) if x.isdigit() else 0 for x in re.split(r'[.\-]', v))
 
 
+def _full_pack_problem(entry):
+    """Why an entry's full pack (full_url/full_size/full_sha256) cannot be used, or None."""
+    try:
+        url = urllib.parse.urlparse(entry['full_url'])
+        if url.scheme != 'https' or url.netloc != RR_CDN:
+            return f'{entry["full_url"]} is not on {RR_CDN}'
+        if not (SHA256_HEX.match(entry['full_sha256']) and isinstance(entry['full_size'], int)
+                and 0 < entry['full_size'] < (8 << 30)):
+            return 'incomplete entry'
+    except (KeyError, TypeError) as e:
+        return f'incomplete entry ({e})'
+    return None
+
+
 def resolve_rr(manifest, override=None):
     """The Retro Rewind version to build: the newest entry of the approved list (hosted by the
     maintainer, aio/manifest/rr-versions.json, URL in tools.json retro_rewind.approved_url), or
@@ -705,9 +720,16 @@ def resolve_rr(manifest, override=None):
             if not (SHA256_HEX.match(entry['sha256']) and SHA256_HEX.match(entry['code_pul_sha256'])
                     and isinstance(entry['size'], int) and 0 < entry['size'] < (4 << 30)):
                 raise ValueError('incomplete entry')
-            spec = {**builtin, 'version': version, 'url': entry['url'], 'size': entry['size'],
-                    'sha256': entry['sha256'], 'code_pul_sha256': entry['code_pul_sha256']}
+            spec = {**{k: v for k, v in builtin.items() if not k.startswith('full_')}, 'version': version,
+                    'url': entry['url'], 'size': entry['size'], 'sha256': entry['sha256'],
+                    'code_pul_sha256': entry['code_pul_sha256']}
             origin = 'approved list'
+            if 'full_url' in entry:
+                problem = _full_pack_problem(entry)
+                if problem:
+                    log(f'Retro Rewind {version}: ignoring the full pack in the approved list ({problem})')
+                else:
+                    spec.update({k: entry[k] for k in ('full_url', 'full_size', 'full_sha256')})
         except Exception as e:  # noqa: BLE001 - any problem with the list falls back
             log(f'Retro Rewind: approved version list unavailable ({e}); using the built-in {builtin["version"]}')
     log(f'Retro Rewind: building version {spec["version"]} ({origin})')
@@ -898,7 +920,7 @@ INSTALL_TEXT = """KartPad-NX - built {when} from your own disc
 1. Copy everything in this folder except INSTALL.txt to the root of your Switch SD card:
 
        sd:/switch/mkw-launcher.nro
-       sd:/iso/<your disc>.wbfs or .iso   (copy your disc image there{iso_note})
+       sd:/iso/<your disc>.wbfs or .iso   (copy your disc image there{iso_note}){rr_line}
 
 2. Start the MKW Launcher from the Homebrew Menu in application mode (hold R while starting a
    game), not from the album applet.
@@ -912,11 +934,23 @@ Included games: {games}
 mkw-launcher.nro sha256: {sha}
 """
 
-RR_TEXT = """
-4. Retro Rewind also needs its own files, version {rr} (the version this build was made for).
-   Download Retro Rewind from rwfc.net, copy the RetroRewind6 folder to
-   sd:/RetroRewind6, and import it in the launcher's Game Files screen.
+RR_LINE = """
+       sd:/RetroRewind6/                  (Retro Rewind {rr}'s own files)"""
+
+RR_TEXT_INCLUDED = """
+4. For Retro Rewind, import the RetroRewind6 folder in the launcher's Game Files screen. It is
+   version {rr}, the version this build was made for.
 """
+
+RR_TEXT = """
+4. Retro Rewind also needs its own files, version {rr} (the version this build was made for).{why}
+   Download the FULL Retro Rewind {rr} pack from rwfc.net (not the small update zip), copy its
+   RetroRewind6 folder (the one that contains xml/RetroRewind6.xml) to sd:/RetroRewind6, and
+   import it in the launcher's Game Files screen.
+"""
+
+RR_NO_FULL_PACK = """
+   This builder could not download them for you: no full pack is approved for this version."""
 
 
 def stage_sd_disc(run, disc, out_dir):
@@ -934,6 +968,41 @@ def stage_sd_disc(run, disc, out_dir):
     return True
 
 
+def stage_rr_sd(state, tools, spec, out_dir):
+    """<out>/RetroRewind6 for the SD card, from the full Retro Rewind pack of the version that
+    was built (the update zips carry only the files that changed). The zip stays in the work
+    folder's downloads. Returns False when the approved entry names no full pack."""
+    version = spec['version']
+    if not spec.get('full_url'):
+        log(f'Retro Rewind {version}: the approved list has no full pack for this version, so the '
+            'RetroRewind6 folder is not included; INSTALL.txt says where to get it.')
+        return False
+    dest = Path(out_dir) / 'RetroRewind6'
+    xml, code = dest / 'xml/RetroRewind6.xml', dest / 'Binaries/Code.pul'
+    key = f'{dest.resolve()}|{spec["full_sha256"]}'
+    if state.done('rr-sd', key) and xml.is_file() and code.is_file() \
+            and sha256_file(code) == spec['code_pul_sha256']:
+        return True
+    stage('rr-sd', f'Getting the Retro Rewind {version} SD files')
+    state.clear('rr-sd')
+    name = Path(urllib.parse.urlparse(spec['full_url']).path).name
+    for old in tools.dl.glob('*-full.zip'):
+        if old.name != name:
+            old.unlink()   # the pack of a version no longer built
+    zpath = download(spec['full_url'], tools.dl / name, spec['full_size'], spec['full_sha256'],
+                     label=f'Retro Rewind {version} full pack')
+    emit(progress='extract', item='RetroRewind6', done=0, total=0)
+    # Unpacked over an existing folder (it may be the SD card itself): nothing is deleted.
+    count = extract_zip(zpath, out_dir, include=['RetroRewind6/'], label='RetroRewind6')
+    if not xml.is_file() or not code.is_file():
+        raise Failure(f'the Retro Rewind {version} full pack has no RetroRewind6/xml/RetroRewind6.xml or Code.pul')
+    if sha256_file(code) != spec['code_pul_sha256']:
+        raise Failure(f'the Retro Rewind {version} full pack has a different Code.pul than the one built')
+    log(f'RetroRewind6: {count} files from {name} -> {dest}')
+    state.mark('rr-sd', key)
+    return True
+
+
 def main():
     global LOG
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -941,6 +1010,8 @@ def main():
     ap.add_argument('--disc', required=True, type=Path)
     ap.add_argument('--out', required=True, type=Path)
     ap.add_argument('--rr', action='store_true', help='also build Retro Rewind')
+    ap.add_argument('--rr-sd', action='store_true',
+                    help="with --rr: also put the built version's RetroRewind6 folder (from its full pack) in --out")
     ap.add_argument('--jobs', type=int, default=0)
     ap.add_argument('--toolkit', default=None)
     ap.add_argument('--exe-dir', default=None)
@@ -958,7 +1029,10 @@ def main():
     LOG = open(data / 'logs' / time.strftime('build-%Y%m%d-%H%M%S.log'), 'w', encoding='utf-8')
     jobs = args.jobs or default_jobs()
     profiles = ['base'] + (['retro-rewind'] if args.rr else [])
-    log(f'KartPad-NX AIO builder: data={data} jobs={jobs} profiles={",".join(profiles)}')
+    log(f'KartPad-NX AIO builder: data={data} jobs={jobs} profiles={",".join(profiles)}'
+        + (' +RetroRewind6' if args.rr and args.rr_sd else ''))
+    if args.rr_sd and not args.rr:
+        log('--rr-sd is ignored without --rr')
     t0 = time.time()
     try:
         manifest = json.loads(args.manifest.read_text(encoding='utf-8'))
@@ -1009,10 +1083,17 @@ def main():
         sha = sha256_file(dest)
         converted = stage_sd_disc(run, args.disc, args.out)
         rr = rr_spec['version']
+        rr_sd = args.rr and args.rr_sd and stage_rr_sd(state, tools, rr_spec, args.out)
+        if not args.rr:
+            rr_text = ''
+        elif rr_sd:
+            rr_text = RR_TEXT_INCLUDED.format(rr=rr)
+        else:
+            rr_text = RR_TEXT.format(rr=rr, why=RR_NO_FULL_PACK if args.rr_sd else '')
         (Path(args.out) / 'INSTALL.txt').write_text(INSTALL_TEXT.format(
             when=time.strftime('%Y-%m-%d %H:%M'),
             iso_note='; an ISO copy is already in iso/' if converted else '',
-            rr_text=RR_TEXT.format(rr=rr) if args.rr else '',
+            rr_line=RR_LINE.format(rr=rr) if rr_sd else '', rr_text=rr_text,
             games=', '.join(PROFILES[p]['app'] for p in profiles), sha=sha), encoding='utf-8')
         log(f'\nDone in {(time.time() - t0) / 60:.0f} min: {dest} ({dest.stat().st_size:,} bytes)')
         emit(done=True, output=str(dest), sha256=sha)

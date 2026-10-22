@@ -13,7 +13,8 @@ KartPadNX-Builder.data   ~263 MB, Python, the build tools and the toolkit of pre
 
 Neither contains Nintendo code or data: the games are translated and compiled on the user's PC
 from their own disc. A first run downloads only devkitPro (365 MB, in the background while the
-game is translated) and, for Retro Rewind, its 41 MB pinned update.
+game is translated) and, for Retro Rewind, its pinned update (under 50 MB) and, when "Also
+download the Retro Rewind SD files" is ticked, that version's full pack (1.9 GB).
 
 The data file is separate on purpose. Windows Defender re-scans an executable's whole content
 every time it starts: with the bundle appended to the exe, the window took ~10 s to appear on
@@ -22,7 +23,8 @@ still makes the one-file exe for anyone who prefers it.
 
 Requirements: 64-bit Windows 10 or 11 (the downloaded .NET 8, Python 3.14 and LLVM need it),
 about 10 GB free, 8 GB RAM or more (less works, one file at a time), and an internet
-connection for the first build (about 0.4 GB of pinned downloads). The exe checks these before
+connection for the first build (about 0.4 GB of pinned downloads, plus 1.9 GB for the Retro
+Rewind SD files and 2.2 GB on the output folder's drive). The exe checks these before
 it starts. It is not code-signed, so SmartScreen shows "Windows protected your PC" on first run
 (More info, Run anyway).
 
@@ -31,9 +33,23 @@ it starts. It is not code-signed, so SmartScreen shows "Windows protected your P
 1. Unzip `KartPadNX-Builder.zip` anywhere and run `KartPadNX-Builder.exe`.
 2. Choose the disc image (`.iso`, `.wbfs`, `.rvz`, `.wia`, `.ciso`, `.gcz`). It must be PAL
    RMCP01 revision 0; anything else is rejected after extraction.
-3. Click **Build**. The output folder gets `switch/mkw-launcher.nro` and `INSTALL.txt`.
+3. Click **Build**. The output folder gets `switch/mkw-launcher.nro` and `INSTALL.txt`, and
+   with **Also download the Retro Rewind SD files** (on by default) a `RetroRewind6` folder of
+   exactly the version that was built. The user copies the output folder's contents to the SD
+   card root and imports the disc and Retro Rewind in the launcher's Game Files screen.
 
-The work folder holds the downloaded tools and the build: about 6.6 GB with Retro Rewind. It
+The SD files exist because Retro Rewind's update zips (what the build translates `Code.pul`
+from) carry only changed files: a `RetroRewind6` copied from one fails the launcher's check
+("Not a Retro Rewind pack: Missing xml/RetroRewind6.xml"). The builder takes `RetroRewind6/`
+from Retro Rewind's full pack (`<version>-full.zip` on its CDN, pinned by size and SHA-256 in
+the approved list), checks its `Code.pul` is the one that was built, and unpacks it over any
+existing `<output>/RetroRewind6` (nothing there is deleted). The zip is kept in the work
+folder's `downloads` (a newer version's pack replaces it), so later builds only re-check it.
+An approved entry without a full pack skips this with a message, and `INSTALL.txt` then says
+where to get the files.
+
+The work folder holds the downloaded tools and the build: about 6.6 GB with Retro Rewind (8.5
+GB with its SD files). It
 defaults to `KartPadNX-Builder-data` next to the exe, or to `C:\KartPadNX-data` when the exe's
 folder has a path the build tools cannot use (non-ASCII characters, a network path, or too long
 for Windows' 260-character limit once the build tree nests it). Builds resume: run Build again
@@ -56,7 +72,8 @@ Tools (all pinned in `tools.json`): Python 3.14.4 embeddable, .NET 8.0.32 runtim
 (the clang version of the proven Docker build) are in the `.data` bundle; devkitPro's own
 `devkitpro/devkita64` image layer comes from Docker Hub, over parallel connections and in the
 background. Retro Rewind adds its pinned update zip (for `Code.pul`; `retro_rewind` in
-`tools.json`) and the live
+`tools.json`), optionally its full pack (`full_url`/`full_size`/`full_sha256`, for the SD
+files) and the live
 Retro WFC payload, which must carry the production RSA signature. Zips are unpacked with 8
 threads straight from the bundle.
 
@@ -113,14 +130,20 @@ To approve a new version:
 
 ```powershell
 python aio\toolkit\approve-rr.py              # newest in the feed; or give a version
-python aio\pipeline\kpnx_aio.py --rr --rr-list aio\manifest\rr-versions.json --data C:\KPNX --disc RMCP01.wbfs --out C:\KPNX-out --bundle aio\out\dist\KartPadNX-Builder.data --shim aio\out\obj\nxshim.exe
+python aio\pipeline\kpnx_aio.py --rr --rr-sd --rr-list aio\manifest\rr-versions.json --data C:\KPNX --disc RMCP01.wbfs --out C:\KPNX-out --bundle aio\out\dist\KartPadNX-Builder.data --shim aio\out\obj\nxshim.exe
 ```
+
+`approve-rr.py` also downloads the version's full pack (~2 GB, into `aio\out\cache\rr`),
+checks it has `xml/RetroRewind6.xml` and the same `Code.pul`, and records `full_url`,
+`full_size` and `full_sha256`. `--no-full` leaves them out; players then get a message and
+fetch the SD files themselves. When the approved version changes, also copy the entry's fields
+into `tools.json` `retro_rewind` (the fallback) before the next release.
 
 Check the result plays, then commit and push `aio/manifest/rr-versions.json`: the approved URL
 is this file on the repo's `main` branch. Players get it the next time they click Build: only
-Retro Rewind is re-translated and rebuilt (about 25 minutes),
-and `INSTALL.txt` names the version to put on the SD card. The builder also logs when the feed
-has a newer version than the approved one.
+Retro Rewind is re-translated and rebuilt (about 25 minutes), the
+output's `RetroRewind6` is refreshed from the new full pack, and `INSTALL.txt` names the
+version. The builder also logs when the feed has a newer version than the approved one.
 
 ## Making a release
 
@@ -152,5 +175,8 @@ profiles and the shader/pipeline seeds.
 The pipeline also runs without the frontend:
 
 ```powershell
-python aio\pipeline\kpnx_aio.py --data C:\KPNX --disc D:\RMCP01.wbfs --out C:\KPNX-out --rr --bundle aio\out\dist\KartPadNX-Builder.data --shim aio\out\obj\nxshim.exe
+python aio\pipeline\kpnx_aio.py --data C:\KPNX --disc D:\RMCP01.wbfs --out C:\KPNX-out --rr --rr-sd --bundle aio\out\dist\KartPadNX-Builder.data --shim aio\out\obj\nxshim.exe
 ```
+
+`--rr-sd` (only with `--rr`) adds `<out>\RetroRewind6`; the frontend passes it when its
+checkbox is ticked (saved as `rrsd=` in `KartPadNX-Builder.settings`).

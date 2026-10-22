@@ -15,7 +15,10 @@
       "sha256": "59e69024ee163dddf96220c31d53f959ed9bf400c896e579d17c7e0066c20950",
       "code_pul_sha256": "11f70007b093d5490ad6ad85868eff4d62b6d80f6ff321cd0c9dec2c59e1b640",
       "code_from": "6.13.4",
-      "approved_utc": "2026-10-21T10:22:17Z"
+      "full_url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.4-full.zip",
+      "full_size": 1939356115,
+      "full_sha256": "586b929de36018e5fc3f7ee73b0aba407730d38470d7a54b8a455dca14be7002",
+      "approved_utc": "2026-10-22T04:10:57Z"
     }
   },
   "latest": "6.13.4"

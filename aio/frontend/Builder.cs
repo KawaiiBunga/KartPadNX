@@ -58,7 +58,7 @@ namespace KartPadNX
         readonly string exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
         TextBox discBox, outBox, dataBox, logBox;
-        CheckBox rrBox;
+        CheckBox rrBox, rrSdBox;
         NumericUpDown jobsBox;
         Button buildButton, cancelButton, openButton;
         ProgressBar bar;
@@ -99,17 +99,28 @@ namespace KartPadNX
             layout.Controls.Add(rrBox, 1, 4);
             layout.SetColumnSpan(rrBox, 2);
 
+            // The update zip the build uses carries only Code.pul's changes; the SD card needs the
+            // whole RetroRewind6 folder of the same version, from Retro Rewind's full pack.
+            rrSdBox = new CheckBox
+            {
+                Text = "Also download the Retro Rewind SD files (the matching RetroRewind6 folder, about 1.9 GB)",
+                AutoSize = true, Checked = true, Margin = new Padding(20, 0, 3, 3)
+            };
+            layout.Controls.Add(rrSdBox, 1, 5);
+            layout.SetColumnSpan(rrSdBox, 2);
+            rrBox.CheckedChanged += delegate { rrSdBox.Enabled = rrBox.Checked && buildButton.Enabled; };
+
             var jobsLabel = new Label { Text = "Compile jobs", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 8, 0) };
             jobsBox = new NumericUpDown { Minimum = 0, Maximum = 64, Value = 0, Width = 60 };
             var jobsHint = new Label { Text = "0 = automatic (by CPU and RAM)", AutoSize = true, Margin = new Padding(8, 6, 0, 0) };
             var jobsPanel = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty };
             jobsPanel.Controls.Add(jobsBox);
             jobsPanel.Controls.Add(jobsHint);
-            layout.Controls.Add(jobsLabel, 0, 5);
-            layout.Controls.Add(jobsPanel, 1, 5);
+            layout.Controls.Add(jobsLabel, 0, 6);
+            layout.Controls.Add(jobsPanel, 1, 6);
 
             toolkitLabel = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0, 6, 0, 6) };
-            layout.Controls.Add(toolkitLabel, 1, 6);
+            layout.Controls.Add(toolkitLabel, 1, 7);
             layout.SetColumnSpan(toolkitLabel, 2);
 
             var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 4, 0, 8) };
@@ -122,17 +133,17 @@ namespace KartPadNX
             buttons.Controls.Add(buildButton);
             buttons.Controls.Add(cancelButton);
             buttons.Controls.Add(openButton);
-            layout.Controls.Add(buttons, 1, 7);
+            layout.Controls.Add(buttons, 1, 8);
             layout.SetColumnSpan(buttons, 2);
 
             stageLabel = new Label { AutoSize = true, Font = new Font(Font, FontStyle.Bold), Text = "Ready" };
-            layout.Controls.Add(stageLabel, 0, 8);
+            layout.Controls.Add(stageLabel, 0, 9);
             layout.SetColumnSpan(stageLabel, 3);
             bar = new ProgressBar { Dock = DockStyle.Fill, Height = 18, Margin = new Padding(0, 4, 0, 2) };
-            layout.Controls.Add(bar, 0, 9);
+            layout.Controls.Add(bar, 0, 10);
             layout.SetColumnSpan(bar, 3);
             detailLabel = new Label { AutoSize = true, ForeColor = SystemColors.GrayText };
-            layout.Controls.Add(detailLabel, 0, 10);
+            layout.Controls.Add(detailLabel, 0, 11);
             layout.SetColumnSpan(detailLabel, 3);
 
             logBox = new TextBox
@@ -140,9 +151,9 @@ namespace KartPadNX
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
                 Dock = DockStyle.Fill, Font = new Font("Consolas", 8.5f), BackColor = SystemColors.Window
             };
-            layout.Controls.Add(logBox, 0, 11);
+            layout.Controls.Add(logBox, 0, 12);
             layout.SetColumnSpan(logBox, 3);
-            for (int i = 0; i < 11; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            for (int i = 0; i < 12; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
             LoadSettings();
@@ -209,6 +220,7 @@ namespace KartPadNX
                     else if (k == "out") outBox.Text = v;
                     else if (k == "data") dataBox.Text = v;
                     else if (k == "rr") rrBox.Checked = v == "1";
+                    else if (k == "rrsd") rrSdBox.Checked = v == "1";
                     else if (k == "jobs") { int j; if (int.TryParse(v, out j) && j >= 0 && j <= 64) jobsBox.Value = j; }
                 }
             }
@@ -221,7 +233,7 @@ namespace KartPadNX
             {
                 File.WriteAllLines(SettingsPath, new[] {
                     "disc=" + discBox.Text, "out=" + outBox.Text, "data=" + dataBox.Text,
-                    "rr=" + (rrBox.Checked ? "1" : "0"), "jobs=" + jobsBox.Value });
+                    "rr=" + (rrBox.Checked ? "1" : "0"), "rrsd=" + (rrSdBox.Checked ? "1" : "0"), "jobs=" + jobsBox.Value });
             }
             catch { }
         }
@@ -395,22 +407,22 @@ namespace KartPadNX
             if (!File.Exists(disc)) { MessageBox.Show(this, "Choose your disc image first.", Text); return; }
             if (outDir.Length == 0 || data.Length == 0) { MessageBox.Show(this, "Choose the output and work folders.", Text); return; }
             try { data = Path.GetFullPath(data); dataBox.Text = data; } catch { }
-            if (!CheckSystem(data)) return;
+            bool rr = rrBox.Checked, rrSd = rr && rrSdBox.Checked;
+            if (!CheckSystem(data, outDir, rrSd)) return;
             SaveSettings();
             cancelled = false;
             outputPath = null;
             logBox.Clear();
             SetRunning(true);
-            bool rr = rrBox.Checked;
             int jobs = (int)jobsBox.Value;
-            var t = new Thread(delegate() { BuildThread(disc, outDir, data, rr, jobs); });
+            var t = new Thread(delegate() { BuildThread(disc, outDir, data, rr, rrSd, jobs); });
             t.IsBackground = true;
             t.Start();
         }
 
         // Requirements of the downloaded tools (.NET 8, Python 3.14, LLVM: 64-bit Windows 10+)
         // and of the build itself (disk, memory, path). Hard limits stop; soft ones ask.
-        bool CheckSystem(string data)
+        bool CheckSystem(string data, string outDir, bool rrSd)
         {
             if (!Environment.Is64BitOperatingSystem)
             { MessageBox.Show(this, "KartPad-NX Builder needs 64-bit Windows 10 or 11.", Text); return false; }
@@ -432,12 +444,26 @@ namespace KartPadNX
             {
                 Directory.CreateDirectory(data);
                 long free = new DriveInfo(Path.GetPathRoot(data)).AvailableFreeSpace;
-                const long need = 10L << 30;
+                // The Retro Rewind full pack (1.9 GB) is kept in the work folder's downloads.
+                long need = (rrSd ? 12L : 10L) << 30;
                 if (free < need && MessageBox.Show(this, string.Format(
-                        "The work folder's drive has {0:N1} GB free; a build needs about 10 GB (7 GB with only the base game).\n\nTry anyway?",
-                        free / (double)(1L << 30)), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
+                        "The work folder's drive has {0:N1} GB free; a build needs about {1} GB (7 GB with only the base game).\n\nTry anyway?",
+                        free / (double)(1L << 30), need >> 30), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
             }
             catch (Exception ex) { MessageBox.Show(this, "Cannot use the work folder: " + ex.Message, Text); return false; }
+
+            if (rrSd)
+            {
+                try
+                {
+                    string root = Path.GetPathRoot(Path.GetFullPath(outDir));
+                    long free = new DriveInfo(root).AvailableFreeSpace;
+                    if (free < (5L << 29) && MessageBox.Show(this, string.Format(
+                            "The output folder's drive has {0:N1} GB free; the Retro Rewind SD files need about 2.2 GB.\n\nTry anyway?",
+                            free / (double)(1L << 30)), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
+                }
+                catch { }   // e.g. a network share: the pipeline reports a real problem
+            }
 
             var m = new MemoryStatus { Length = (uint)Marshal.SizeOf(typeof(MemoryStatus)) };
             if (GlobalMemoryStatusEx(ref m) && m.TotalPhys < (7UL << 30) && MessageBox.Show(this, string.Format(
@@ -451,11 +477,12 @@ namespace KartPadNX
             buildButton.Enabled = !running;
             cancelButton.Enabled = running;
             discBox.Enabled = outBox.Enabled = dataBox.Enabled = rrBox.Enabled = jobsBox.Enabled = !running;
+            rrSdBox.Enabled = !running && rrBox.Checked;
             if (running) openButton.Enabled = false;
             SetThreadExecutionState(running ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) : ES_CONTINUOUS);
         }
 
-        void BuildThread(string disc, string outDir, string data, bool rr, int jobs)
+        void BuildThread(string disc, string outDir, string data, bool rr, bool rrSd, int jobs)
         {
             int rc = -1;
             try
@@ -477,6 +504,7 @@ namespace KartPadNX
                 args.Append(" --exe-dir ").Append(Q(exeDir)).Append(" --shim ").Append(Q(shim));
                 if (BundleStart() >= 0) args.Append(" --bundle ").Append(Q(bundlePath));
                 if (rr) args.Append(" --rr");
+                if (rrSd) args.Append(" --rr-sd");
                 if (jobs > 0) args.Append(" --jobs ").Append(jobs);
                 var psi = new ProcessStartInfo(python, args.ToString())
                 {
@@ -609,7 +637,7 @@ namespace KartPadNX
                 {
                     outputPath = (string)ev["output"];
                     stageLabel.Text = "Done: " + outputPath;
-                    detailLabel.Text = "Copy the output folder's \"switch\" folder to your SD card. See INSTALL.txt there.";
+                    detailLabel.Text = "Copy the output folder's contents (except INSTALL.txt) to your SD card. See INSTALL.txt there.";
                     bar.Style = ProgressBarStyle.Continuous;
                 }
             });
