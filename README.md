@@ -9,8 +9,7 @@ downloaded from here. You build it yourself on your PC from your own copy of the
 
 ## Download
 
-**[Download the builder (KartPadNX-Builder.zip)](https://github.com/KawaiiBunga/KartPadNX/releases/latest/download/KartPadNX-Builder.zip)**,
-or grab any version from the [Releases page](https://github.com/KawaiiBunga/KartPadNX/releases).
+https://github.com/KawaiiBunga/KartPadNX/releases
 
 You need:
 
