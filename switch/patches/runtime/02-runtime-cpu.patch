@@ -1,0 +1,2874 @@
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -813,8 +813,9 @@
+         return ptr;
+     }
+ #if defined(__SWITCH__)
+-    if (GuestFlat::gFlatGuestBase != nullptr && Memory::Contains(addr, length)) {
+-        return GuestFlat::gFlatGuestBase + addr;
++    if (uint8_t* const flatBase = GuestFlat::LiveFlatGuestBase();
++        flatBase != nullptr && Memory::Contains(addr, length)) {
++        return flatBase + addr;
+     }
+ #endif
+     auto& region = ResolveRegion(addr, length);
+diff --git a/runtime/src/recomp_mod_loader.cpp b/runtime/src/recomp_mod_loader.cpp
+--- a/runtime/src/recomp_mod_loader.cpp
++++ b/runtime/src/recomp_mod_loader.cpp
+@@ -34,17 +34,34 @@
+ }
+ 
+ std::vector<std::string>& OverlayRoots() {
++#if defined(MKW_PROFILE_RETRO_REWIND)
++    // The pack folder inside the virtual SD root (sdmc:/switch/kartpad/retro-rewind acts as the SD
++    // root); riivolution.cpp resolves the XML's /RetroRewind6/... externals against its parent.
++    static std::vector<std::string> roots = {RuntimeConfigFile::RetroRewindRoot("sdmc:/switch/kartpad/retro-rewind") + "/RetroRewind6"};
++#else
+     static std::vector<std::string> roots;
++#endif
+     return roots;
+ }
+ 
+ std::string& RiivolutionXmlPath() {
++#if defined(MKW_PROFILE_RETRO_REWIND)
++    // Relative to the pack folder (the overlay root), as in recomp.yml.
++    static std::string path = "xml/RetroRewind6.xml";
++#else
+     static std::string path;
++#endif
+     return path;
+ }
+ 
+ std::vector<RecompMod::RiivolutionOptionSelection>& RiivolutionSelections() {
++#if defined(MKW_PROFILE_RETRO_REWIND)
++    static std::vector<RecompMod::RiivolutionOptionSelection> selections = {
++        {"Retro Rewind", "Pack", 1}
++    };
++#else
+     static std::vector<RecompMod::RiivolutionOptionSelection> selections;
++#endif
+     return selections;
+ }
+ 
+diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
+--- a/runtime/include/abi_bridge.h
++++ b/runtime/include/abi_bridge.h
+@@ -1,801 +1,1052 @@
+-#pragma once
+-#include "memory.h"
+-#include "ppc_runtime.h"
+-#include "system_bridge.h"
+-#include "game_graphics_options.h"
+-#include "runtime_log.h"
+-
+-#include <array>
+-#include <atomic>
+-#include <cstddef>
+-#include <cstdint>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <iostream>
+-#include <optional>
+-#include <stdexcept>
+-#include <sstream>
+-#include <tuple>
+-#include <type_traits>
+-
+-inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx);
+-
+-// Some game-facing runtime options alter arguments at well-defined ABI
+-// boundaries. Keep this independent of the dispatch mechanism: generated
+-// static calls deliberately bypass InvokeDirectCpu for performance.
+-// (used for the path mask filtering in ScnRenderer::createPath: depth of
+-// field is always removed, bloom when the user disabled it)
+-inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {
+-    if (target == 0x8023BD38u) {
+-        // ScnRenderer::createPath receives the post-processing path mask in r4.
+-        ctx->gpr[4] = RuntimeGameGraphicsOptions::FilterScnRendererPathMask(ctx->gpr[4]);
+-    }
+-}
+-
+-// Persistent per-thread CPU context used across translated function calls.
+-CpuContext& GetPersistentCpuContext();
+-void InitializePersistentCpuContext();
+-
+-enum class FunctionKind : uint8_t {
+-    BaseTranslated = 0,
+-    ModTranslated = 1,
+-    Native = 2,
+-};
+-
+-inline constexpr uint32_t kPpcAllNonvolatileFprMask = 0xffffc000u;
+-inline constexpr uint32_t kBaseTranslatedFunctionPriority = 0;
+-inline constexpr uint32_t kModTranslatedFunctionPriorityBase = 100;
+-inline constexpr uint32_t kNativeFunctionPriority = 10000;
+-
+-#include "isa/ppc_isa_cr.h"
+-
+-struct TranslatedFunctionInfo {
+-    uint32_t address = 0;
+-    const char* name = "";
+-    uint64_t moduleId = 0;
+-    uint32_t priority = 0;
+-    uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
+-    void* entryPoint = nullptr; // Raw typed function pointer for indirect-call resolution
+-    void (*rawCpuInvoker)(CpuContext*) = nullptr;
+-    bool mustRemainDynamicallyDispatchable = true;
+-    FunctionKind kind = FunctionKind::BaseTranslated;
+-};
+-
+-struct RawDispatchRecord {
+-    uint32_t address = 0;
+-    void (*entry)(CpuContext*) = nullptr;
+-    uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
+-    bool preserveNonvolatileGprs = false;
+-};
+-
+-// Translator-owned indirect dispatch is split by the high address byte and
+-// then by 4 KiB guest pages. Each populated segment stores only the contiguous
+-// page range that contains verified function entry points. The final search is
+-// bounded to at most the 1024 aligned instruction addresses in one guest page.
+-struct StaticIndirectDispatchPage {
+-    uint32_t firstEntry = 0;
+-    uint16_t entryCount = 0;
+-    // Explicit tail padding to an 8-byte stride. The emitter writes it as a
+-    // literal third initializer, so it is part of the generated-data contract.
+-    uint16_t reserved = 0;
+-};
+-
+-struct StaticIndirectDispatchSegment {
+-    const StaticIndirectDispatchPage* pages = nullptr;
+-    uint16_t firstPage = 0;
+-    uint16_t pageCount = 0;
+-};
+-
+-struct StaticIndirectDispatchTable {
+-    const char* profileName = nullptr;
+-    const StaticIndirectDispatchSegment* segments = nullptr; // Exactly 256 high-byte segments.
+-    const RawDispatchRecord* entries = nullptr;
+-    size_t entryCount = 0;
+-};
+-
+-inline const RawDispatchRecord* FindStaticIndirectDispatchEntry(
+-    const StaticIndirectDispatchTable* table,
+-    uint32_t address) noexcept {
+-    if (!table || !table->segments || !table->entries || table->entryCount == 0) {
+-        return nullptr;
+-    }
+-
+-    const auto& segment = table->segments[address >> 24];
+-    const uint32_t pageNumber = (address >> 12) & 0x0FFFu;
+-    if (!segment.pages || pageNumber < segment.firstPage) {
+-        return nullptr;
+-    }
+-    const uint32_t relativePage = pageNumber - segment.firstPage;
+-    if (relativePage >= segment.pageCount) {
+-        return nullptr;
+-    }
+-
+-    const auto& page = segment.pages[relativePage];
+-    const size_t first = page.firstEntry;
+-    const size_t count = page.entryCount;
+-    if (first > table->entryCount || count > table->entryCount - first) {
+-        return nullptr;
+-    }
+-
+-    size_t lower = first;
+-    size_t upper = first + count;
+-    while (lower < upper) {
+-        const size_t middle = lower + (upper - lower) / 2;
+-        const uint32_t candidate = table->entries[middle].address;
+-        if (candidate < address) {
+-            lower = middle + 1;
+-        } else {
+-            upper = middle;
+-        }
+-    }
+-    return lower < first + count && table->entries[lower].address == address
+-        ? &table->entries[lower]
+-        : nullptr;
+-}
+-
+-void RegisterStaticIndirectDispatchTable(const StaticIndirectDispatchTable* table);
+-inline std::atomic<const StaticIndirectDispatchTable*> g_publishedStaticIndirectDispatchTable{nullptr};
+-
+-class StaticIndirectDispatchTableRegistrar {
+-public:
+-    explicit StaticIndirectDispatchTableRegistrar(const StaticIndirectDispatchTable* table) {
+-        RegisterStaticIndirectDispatchTable(table);
+-    }
+-};
+-
+-inline unsigned PpcLowestSetBitIndex(uint32_t value) noexcept {
+-    return static_cast<unsigned>(__builtin_ctz(value));
+-}
+-
+-class PpcNonvolatileFprGuard {
+-public:
+-    explicit PpcNonvolatileFprGuard(CpuContext* cpu, uint32_t mask = kPpcAllNonvolatileFprMask) noexcept
+-        : cpu_(cpu), mask_(mask & kPpcAllNonvolatileFprMask) {
+-        if (!cpu_ || mask_ == 0) {
+-            return;
+-        }
+-        // Real masks are a single contiguous register run - f14..f31 for the
+-        // conservative default and f23..f31 or similar for a measured writer -
+-        // so resolve the run once and copy it as one straight-line block instead
+-        // of testing 18 mask bits. Any other mask keeps the per-bit loop, which
+-        // saves and restores exactly the same registers.
+-        const uint32_t lowest = mask_ & (0u - mask_);
+-        const uint32_t aboveRun = mask_ + lowest;
+-        if ((aboveRun & (aboveRun - 1u)) == 0u) {
+-            const unsigned first = PpcLowestSetBitIndex(mask_);
+-            const unsigned end = aboveRun == 0u ? 32u : PpcLowestSetBitIndex(aboveRun);
+-            firstSlot_ = static_cast<uint8_t>(first - 14u);
+-            slotCount_ = static_cast<uint8_t>(end - first);
+-            std::memcpy(&saved_[firstSlot_], &cpu_->fpr[first], slotCount_ * sizeof(PPC_FPR));
+-            return;
+-        }
+-        for (size_t i = 0; i < saved_.size(); ++i) {
+-            if ((mask_ & (1u << (14 + i))) == 0) {
+-                continue;
+-            }
+-            saved_[i] = cpu_->fpr[14 + i];
+-        }
+-    }
+-
+-    ~PpcNonvolatileFprGuard() noexcept {
+-        if (!cpu_ || mask_ == 0) {
+-            return;
+-        }
+-        if (slotCount_ != 0) {
+-            const unsigned first = 14u + firstSlot_;
+-            std::memcpy(&cpu_->fpr[first], &saved_[firstSlot_], slotCount_ * sizeof(PPC_FPR));
+-            return;
+-        }
+-        for (size_t i = 0; i < saved_.size(); ++i) {
+-            if ((mask_ & (1u << (14 + i))) == 0) {
+-                continue;
+-            }
+-            cpu_->fpr[14 + i] = saved_[i];
+-        }
+-    }
+-
+-    PpcNonvolatileFprGuard(const PpcNonvolatileFprGuard&) = delete;
+-    PpcNonvolatileFprGuard& operator=(const PpcNonvolatileFprGuard&) = delete;
+-
+-private:
+-    CpuContext* cpu_ = nullptr;
+-    uint32_t mask_ = 0;
+-    // Contiguous-run description of mask_. slotCount_ == 0 means the mask is not
+-    // a single run, so the destructor mirrors the constructor's per-bit loop.
+-    uint8_t firstSlot_ = 0;
+-    uint8_t slotCount_ = 0;
+-    // Every element selected by mask_ is written before it is read. Leaving the
+-    // remaining slots uninitialized avoids zero-filling all 18 values around a
+-    // call that may preserve only one or two architectural FPRs.
+-    std::array<PPC_FPR, 18> saved_;
+-};
+-
+-class PpcNonvolatileGprGuard {
+-public:
+-    explicit PpcNonvolatileGprGuard(CpuContext* cpu, bool enabled = true) noexcept
+-        : cpu_(enabled ? cpu : nullptr) {
+-        if (!cpu_) {
+-            return;
+-        }
+-        std::memcpy(saved_.data(), &cpu_->gpr[14], sizeof(saved_));
+-    }
+-
+-    ~PpcNonvolatileGprGuard() noexcept {
+-        if (!cpu_) {
+-            return;
+-        }
+-        std::memcpy(&cpu_->gpr[14], saved_.data(), sizeof(saved_));
+-    }
+-
+-    PpcNonvolatileGprGuard(const PpcNonvolatileGprGuard&) = delete;
+-    PpcNonvolatileGprGuard& operator=(const PpcNonvolatileGprGuard&) = delete;
+-
+-private:
+-    CpuContext* cpu_ = nullptr;
+-    // Left uninitialized: enabled writes all 18 slots before reading them, disabled reads none,
+-    // so skipping the zero-fill saves 72 bytes of stack work on the common disabled hot path.
+-    std::array<uint32_t, 18> saved_;
+-};
+-
+-// Guest address of OSLoadContext, which models rfi-style context restoration
+-// and intentionally replaces the full guest register file instead of returning
+-// like a normal ABI call. It can never be guarded.
+-inline constexpr uint32_t kOSLoadContextAddress = 0x801A1F58u;
+-
+-inline bool ShouldPreserveNonvolatileGprsForRawCpuCall(const TranslatedFunctionInfo* info) noexcept {
+-    return info->kind == FunctionKind::Native && info->address != kOSLoadContextAddress;
+-}
+-
+-inline uint32_t NonvolatileFprGuardMaskFor(const TranslatedFunctionInfo* info) noexcept {
+-    if (!info || info->nonvolatileFprWriteMask == 0) {
+-        return 0;
+-    }
+-    return info->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask;
+-}
+-
+-template <uint32_t Target>
+-struct KnownTranslatedCpuCall {
+-    static constexpr bool kAvailable = false;
+-    static constexpr uint32_t kNonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
+-    static constexpr bool kMustRemainDynamicallyDispatchable = true;
+-    static constexpr void (*Entry)(CpuContext*) = nullptr;
+-};
+-
+-// Translator-emitted trait specializations, one macro shared by every generated shard.
+-// `addr` is the 8-digit hex entry point, `winner` the resolved symbol (mods/Retro Rewind can
+-// publish their own name). A specialization only exists for a single statically bound winner,
+-// so overridable/dynamically-dispatchable are hardcoded here rather than passed in.
+-#define MKW_TRANSLATED_TRAIT(addr, winner, nonvolatile_fpr_write_mask)                    \
+-    extern "C" void winner(CpuContext* ctx);                                              \
+-    template <>                                                                           \
+-    struct KnownTranslatedCpuCall<0x##addr##u> {                                          \
+-        static constexpr bool kAvailable = true;                                          \
+-        static constexpr uint32_t kNonvolatileFprWriteMask = nonvolatile_fpr_write_mask;  \
+-        static constexpr bool kMustRemainDynamicallyDispatchable = false;                 \
+-        static constexpr void (*Entry)(CpuContext*) = &winner;                            \
+-    }
+-
+-template <uint32_t Target>
+-struct KnownNativeCpuCall {
+-    static constexpr bool kAvailable = false;
+-    static constexpr uint32_t kNonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
+-    static constexpr void (*Entry)(CpuContext*) = nullptr;
+-};
+-
+-template <uint32_t Target>
+-struct KnownTypedNativeCpuCall {
+-    static constexpr bool kAvailable = false;
+-};
+-
+-#include "native_cpu_calls.inc"
+-
+-// Direct-mapped thread-local memo in front of the sorted registry lookup every bctrl performs;
+-// a miss just re-runs the sorted lookup. 512 entries (12 KiB) covers the per-frame indirect
+-// working set while staying L1/L2 resident, unlike 4096 which would thrash L2. Must stay a
+-// power of two, the index masks with (size - 1).
+-inline constexpr size_t kIndirectDispatchCacheEntries = 1024;
+-
+-// Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
+-// thread-static init epoch check on every bctrl (same as g_currentCpuContext in ppc_runtime.h).
+-struct IndirectResolvedDispatchMemoEntry {
+-    uint32_t address;
+-    const TranslatedFunctionInfo* info;
+-};
+-#if defined(__SWITCH__)
+-inline IndirectResolvedDispatchMemoEntry
+-    g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
+-#else
+-inline thread_local IndirectResolvedDispatchMemoEntry
+-    g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
+-#endif
+-
+-struct IndirectRawDispatchMemoEntry {
+-    uint32_t address;
+-    const RawDispatchRecord* record;
+-};
+-#if defined(__SWITCH__)
+-inline IndirectRawDispatchMemoEntry
+-    g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
+-#else
+-inline thread_local IndirectRawDispatchMemoEntry
+-    g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
+-#endif
+-
+-class TranslatedFunctionRegistry {
+-public:
+-    static void Register(TranslatedFunctionInfo info);
+-    static void Finalize();
+-    static inline bool IsLookupPublished() noexcept {
+-        return lookupPublished_.load(std::memory_order_relaxed);
+-    }
+-    static std::optional<TranslatedFunctionInfo> FindNearestByAddress(uint32_t address);
+-    static inline const TranslatedFunctionInfo* FindByAddressPtr(uint32_t address) {
+-        if (!lookupPublished_.load(std::memory_order_relaxed)) [[unlikely]] {
+-            return FindByAddressPtrSlow(address);
+-        }
+-
+-        auto& cached = g_indirectResolvedDispatchMemo[
+-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+-        if (cached.address == address) [[likely]] {
+-            return cached.info;
+-        }
+-
+-        const auto* info = FindByAddressPtrSlow(address);
+-        cached = {address, info};
+-        return info;
+-    }
+-
+-    // Hot wrapper: only the direct-mapped memo probe stays inline. Inlining the
+-    // generated-table binary search alongside it pushed the whole function past
+-    // the inliner's budget and out-of-lined the probe itself, which is the part
+-    // every bctrl executes.
+-    static MKW_PPC_FORCE_INLINE const RawDispatchRecord* FindRawByAddressPtr(uint32_t address) {
+-        if (!lookupPublished_.load(std::memory_order_relaxed)) [[unlikely]] {
+-            return nullptr;
+-        }
+-
+-        auto& cached = g_indirectRawDispatchMemo[
+-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+-        if (cached.address == address) [[likely]] {
+-            return cached.record;
+-        }
+-
+-        return FindRawByAddressPtrMiss(address, cached);
+-    }
+-    // Look up a registered function by host (native) address.
+-    // This enables stack trace symbolication for translated functions.
+-    static std::optional<TranslatedFunctionInfo> FindByHostAddress(uintptr_t hostAddr);
+-
+-private:
+-    // Memo miss: resolve against the header-inline generated table first; only dynamically
+-    // registered records or a not-yet-published table fall through to the slow path.
+-    static MKW_PPC_NO_INLINE MKW_PPC_COLD const RawDispatchRecord* FindRawByAddressPtrMiss(
+-        uint32_t address, IndirectRawDispatchMemoEntry& cached) {
+-        const RawDispatchRecord* record = nullptr;
+-        if (const auto* table =
+-                g_publishedStaticIndirectDispatchTable.load(std::memory_order_acquire)) {
+-            record = FindStaticIndirectDispatchEntry(table, address);
+-        }
+-        if (record == nullptr) {
+-            record = FindRawByAddressPtrSlow(address);
+-        }
+-        cached = {address, record};
+-        return record;
+-    }
+-
+-    static const TranslatedFunctionInfo* FindByAddressPtrSlow(uint32_t address);
+-    static const RawDispatchRecord* FindRawByAddressPtrSlow(uint32_t address);
+-
+-    // Finalize publishes immutable registry, generated-table, and dynamic raw
+-    // dispatch storage. Header-inlined cache hits are enabled only after that
+-    // release publication, so a pre-finalization miss can never poison them.
+-    inline static std::atomic_bool lookupPublished_{false};
+-};
+-
+-// Cold, profile-owned registration data is emitted in compact table shards.
+-// Keeping it out of generated function bodies avoids one static constructor
+-// per translated function.
+-struct BulkTranslatedFunctionRecord {
+-    uint32_t address;
+-    const char* name;
+-    void (*entry)(CpuContext*);
+-    FunctionKind kind;
+-    bool preservesNonvolatileFprs;
+-    uint32_t nonvolatileFprWriteMask;
+-    uint32_t priority;
+-    uint64_t moduleId;
+-    bool mustRemainDynamicallyDispatchable;
+-};
+-
+-void RegisterBulkTranslatedFunctions(const BulkTranslatedFunctionRecord* records, size_t count);
+-
+-class BulkTranslatedFunctionRegistrar {
+-public:
+-    BulkTranslatedFunctionRegistrar(const BulkTranslatedFunctionRecord* records, size_t count) {
+-        RegisterBulkTranslatedFunctions(records, count);
+-    }
+-    // Profile-tagged form emitted by the dual-profile translator. Only the base
+-    // product is linked into this NRO, so the profile tag is accepted and the
+-    // records register unconditionally (single-profile build; no per-profile
+-    // filtering needed). See wiicompiled-dual-profile-registry.patch for the
+-    // full multi-profile variant used when several products share one binary.
+-    BulkTranslatedFunctionRegistrar(const char* /*profileName*/,
+-                                    const BulkTranslatedFunctionRecord* records, size_t count) {
+-        RegisterBulkTranslatedFunctions(records, count);
+-    }
+-};
+-
+-MKW_PPC_FORCE_INLINE bool TryDispatchResolvedCpuTarget(const TranslatedFunctionInfo* info, CpuContext* cpu) {
+-    if (!info || !info->rawCpuInvoker) {
+-        return false;
+-    }
+-
+-    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(info->address);
+-    PpcNonvolatileFprGuard fprGuard(cpu, NonvolatileFprGuardMaskFor(info));
+-    PpcNonvolatileGprGuard gprGuard(cpu, ShouldPreserveNonvolatileGprsForRawCpuCall(info));
+-    if (TryGetCpuContext() != cpu) {
+-        CpuContextScope scope(cpu);
+-        info->rawCpuInvoker(cpu);
+-        return true;
+-    }
+-    info->rawCpuInvoker(cpu);
+-    return true;
+-}
+-
+-inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {
+-    if (!record || !record->entry) {
+-        return false;
+-    }
+-    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+-    PpcNonvolatileGprGuard gprGuard(cpu, record->preserveNonvolatileGprs);
+-    PpcNonvolatileFprGuard fprGuard(cpu, record->nonvolatileFprWriteMask);
+-    if (TryGetCpuContext() != cpu) {
+-        CpuContextScope scope(cpu);
+-        record->entry(cpu);
+-    } else {
+-        record->entry(cpu);
+-    }
+-    return true;
+-}
+-
+-template <uint32_t Target>
+-inline void DispatchKnownTranslatedCpuTargetStatic(CpuContext* cpu) {
+-    const auto invokeKnownTranslated = [&]() {
+-        KnownTranslatedCpuCall<Target>::Entry(cpu);
+-    };
+-
+-    // A statically resolved, non-overridable translated call already running
+-    // in this CpuContext needs no registry, context, or diagnostic target
+-    // transition. This is the normal generated-to-generated hot path.
+-    if (TryGetCpuContext() == cpu) {
+-        if constexpr (KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask == 0) {
+-            invokeKnownTranslated();
+-            return;
+-        } else {
+-            PpcNonvolatileFprGuard fprGuard(
+-                cpu, KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask);
+-            invokeKnownTranslated();
+-            return;
+-        }
+-    }
+-
+-    CpuContextScope contextScope(cpu);
+-    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(Target);
+-    if constexpr (KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask == 0) {
+-        invokeKnownTranslated();
+-        return;
+-    } else {
+-        PpcNonvolatileFprGuard fprGuard(cpu, KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask);
+-        invokeKnownTranslated();
+-    }
+-}
+-
+-[[noreturn]] inline void ReportMissingCpuTarget(uint32_t target, CpuContext* cpu) {
+-    // Centralized crash path: stderr diagnostics, heuristics, crash artifacts
+-    // in the run's log folder, popup, exit.
+-    RuntimeCrash::FatalMissingGuestTarget(target, cpu);
+-}
+-
+-template <uint32_t Target>
+-inline const TranslatedFunctionInfo* ResolveDirectCpuTargetInfo() {
+-    return TranslatedFunctionRegistry::FindByAddressPtr(Target);
+-}
+-
+-template <uint32_t Target>
+-inline const TranslatedFunctionInfo* ResolveDirectCpuTargetInfoCached() {
+-    // Only latch a result once the registry is published (immutable for the process lifetime);
+-    // a pre-finalization miss or provisional winner must never be cached. 0 = not yet resolved,
+-    // 1 = negative-cache sentinel, avoiding a second ready flag on the hot path.
+-    static std::atomic<uintptr_t> cachedValue{0};
+-    constexpr uintptr_t kNegativeCache = 1;
+-    const uintptr_t cached = cachedValue.load(std::memory_order_acquire);
+-    if (cached != 0) {
+-        return cached == kNegativeCache
+-            ? nullptr
+-            : reinterpret_cast<const TranslatedFunctionInfo*>(cached);
+-    }
+-    if (!TranslatedFunctionRegistry::IsLookupPublished()) {
+-        return ResolveDirectCpuTargetInfo<Target>();
+-    }
+-    const auto* info = ResolveDirectCpuTargetInfo<Target>();
+-    cachedValue.store(info != nullptr
+-                          ? reinterpret_cast<uintptr_t>(info)
+-                          : kNegativeCache,
+-                      std::memory_order_release);
+-    return info;
+-}
+-
+-// Caches the "is the published winner still base translation?" verdict for state-free fast
+-// paths guarding tens of thousands of call sites. Same latching rule as above: 0 = unresolved,
+-// 1 = negative, 2 = positive, and a verdict computed pre-publication is never stored.
+-template <uint32_t Target>
+-inline bool IsBaseTranslatedCpuTargetActive() {
+-    static std::atomic<uint8_t> cachedVerdict{0};
+-    constexpr uint8_t kNegativeVerdict = 1;
+-    constexpr uint8_t kPositiveVerdict = 2;
+-    const uint8_t cached = cachedVerdict.load(std::memory_order_acquire);
+-    if (cached != 0) {
+-        return cached == kPositiveVerdict;
+-    }
+-    const bool publishable = TranslatedFunctionRegistry::IsLookupPublished();
+-    const auto* info = ResolveDirectCpuTargetInfo<Target>();
+-    const bool active = info != nullptr && info->kind == FunctionKind::BaseTranslated;
+-    if (publishable) {
+-        cachedVerdict.store(active ? kPositiveVerdict : kNegativeVerdict,
+-                            std::memory_order_release);
+-    }
+-    return active;
+-}
+-
+-template <uint32_t Target>
+-inline void InvokeDirectCpu(CpuContext* ctx) {
+-    static_assert(Target != 0, "InvokeDirectCpu cannot target address 0");
+-    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+-    ApplyRuntimeCallOptions(Target, cpu);
+-    if constexpr (KnownNativeCpuCall<Target>::kAvailable) {
+-        const auto invokeKnownNative = [&]() {
+-            PpcNonvolatileGprGuard gprGuard(cpu);
+-            if (TryGetCpuContext() != cpu) {
+-                CpuContextScope scope(cpu);
+-                KnownNativeCpuCall<Target>::Entry(cpu);
+-                return;
+-            }
+-            KnownNativeCpuCall<Target>::Entry(cpu);
+-        };
+-        if constexpr (KnownNativeCpuCall<Target>::kNonvolatileFprWriteMask == 0) {
+-            invokeKnownNative();
+-        } else {
+-            PpcNonvolatileFprGuard fprGuard(cpu, KnownNativeCpuCall<Target>::kNonvolatileFprWriteMask);
+-            invokeKnownNative();
+-        }
+-        return;
+-    }
+-
+-    if constexpr (KnownTypedNativeCpuCall<Target>::kAvailable) {
+-        PpcNonvolatileGprGuard gprGuard(cpu);
+-        if (TryGetCpuContext() != cpu) {
+-            CpuContextScope scope(cpu);
+-            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
+-        } else {
+-            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
+-        }
+-        return;
+-    }
+-
+-    if constexpr (KnownTranslatedCpuCall<Target>::kAvailable) {
+-        DispatchKnownTranslatedCpuTargetStatic<Target>(cpu);
+-        return;
+-    }
+-
+-    const auto* registeredInfo = ResolveDirectCpuTargetInfoCached<Target>();
+-    if (TryDispatchResolvedCpuTarget(registeredInfo, cpu)) {
+-        return;
+-    }
+-
+-    ReportMissingCpuTarget(Target, cpu);
+-}
+-
+-// Indirect jump (bctr without link) - used for switch tables.
+-inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
+-    // Use the caller's context, not the persistent global context!
+-    // This is essential for tail calls via bctr where the 'this' pointer (r3)
+-    // must be passed correctly to the target function.
+-    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+-    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
+-        return;
+-    }
+-
+-    // Cold fallback for dynamically registered or signature-only targets.
+-    const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(target);
+-    if (info) {
+-        if (TryDispatchResolvedCpuTarget(info, cpu)) {
+-            return;
+-        }
+-    }
+-    
+-    // If not registered, this is likely a switch table jump to an intra-function label.
+-    // The translator should have recognized this pattern and generated proper switch code.
+-    RT_LOG(RT_TAG_RUNTIME) << "InvokeIndirectJump: target 0x"
+-              << std::hex << target << std::dec
+-              << " is not a registered function.\n"
+-              << "This is likely a switch statement jump table that the translator\n"
+-              << "failed to recognize. The function containing this bctr needs\n"
+-              << "proper switch pattern recognition." << std::endl;
+-    RT_LOG(RT_TAG_RUNTIME) << "Indirect jump context: pc=0x" << std::hex << cpu->pc
+-              << " lr=0x" << cpu->lr << " ctr=0x" << cpu->ctr
+-              << " r1=0x" << cpu->gpr[1] << " r3=0x" << cpu->gpr[3]
+-              << " r29=0x" << cpu->gpr[29] << " r30=0x" << cpu->gpr[30]
+-              << " r31=0x" << cpu->gpr[31] << std::dec << std::endl;
+-    DumpHostStackTraceForRuntimeHelper();
+-    std::fflush(stderr);
+-    std::ostringstream message;
+-    message << "The game stopped because an indirect jump targeted guest address 0x"
+-            << std::hex << target
+-            << ", but that address is not a registered translated function.\n\n"
+-            << "The translator may have missed a switch/jump-table target.";
+-    // Same artifact set as RuntimeCrash::FatalMissingGuestTarget, which is this
+-    // path's sibling for indirect *calls*: MarkFatalErrorReported below stops the
+-    // atexit reporter, so the crash log has to be written here.
+-    RuntimeCrash::WriteCrashArtifacts("missing_jump_target", message.str(), &target);
+-    SetRuntimeExitCode(EXIT_FAILURE);
+-    ShowRuntimeFatalPopup("Missing indirect jump target", message.str());
+-    MarkFatalErrorReported();
+-    std::exit(EXIT_FAILURE);
+-}
+-
+-inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+-    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+-    if (target == 0) {
+-        ReportMissingCpuTarget(target, cpu);
+-    }
+-    ApplyRuntimeCallOptions(target, cpu);
+-    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
+-        return;
+-    }
+-    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {
+-        return;
+-    }
+-    ReportMissingCpuTarget(target, cpu);
+-}
+-
+-template <typename Signature>
+-class AbiTrampoline;
+-
+-template <typename Ret, typename... Args>
+-class AbiTrampoline<Ret(Args...)> {
+-public:
+-    using TargetFn = Ret (*)(Args...);
+-
+-    AbiTrampoline(uint32_t address,
+-                  const char* name,
+-                  TargetFn target,
+-                  FunctionKind kind = FunctionKind::BaseTranslated,
+-                  bool preservesNonvolatileFprs = false,
+-                  uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask,
+-                  uint32_t priority = 0,
+-                  uint64_t moduleId = 0,
+-                  void (*rawCpuInvoker)(CpuContext*) = nullptr,
+-                  bool mustRemainDynamicallyDispatchable = true)
+-    {
+-        TranslatedFunctionInfo info;
+-        info.address = address;
+-        info.name = name ? name : "";
+-        info.moduleId = moduleId;
+-        info.priority = priority;
+-        const bool effectivePreservesNonvolatileFprs =
+-            preservesNonvolatileFprs || kind == FunctionKind::Native;
+-        info.nonvolatileFprWriteMask = effectivePreservesNonvolatileFprs ? 0 : (nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
+-        info.entryPoint = reinterpret_cast<void*>(target);
+-        info.rawCpuInvoker = rawCpuInvoker;
+-        info.mustRemainDynamicallyDispatchable = mustRemainDynamicallyDispatchable;
+-        info.kind = kind;
+-        TranslatedFunctionRegistry::Register(std::move(info));
+-    }
+-
+-    static std::tuple<Args...> BuildArgs(CpuContext* cpu) {
+-        size_t gprIndex = 0;
+-        size_t fprIndex = 0;
+-        return std::tuple<Args...>{LoadArgument<Args>(cpu, gprIndex, fprIndex)...};
+-    }
+-
+-    template <typename T>
+-    static std::remove_reference_t<T> LoadArgument(CpuContext* cpu, size_t& gprIndex, size_t& fprIndex) {
+-        using CleanT = std::remove_reference_t<T>;
+-        if constexpr (std::is_floating_point_v<CleanT>) {
+-            if (fprIndex >= 13) {
+-                throw std::out_of_range("FPR argument overflow");
+-            }
+-            return static_cast<CleanT>(cpu->fpr[1 + fprIndex++].d);
+-        } else {
+-            if (gprIndex >= 8) {
+-                size_t stackArgIndex = gprIndex - 8;
+-                uint32_t sp = cpu->gpr[1];
+-                uint32_t argAddr = sp + 8 + static_cast<uint32_t>(stackArgIndex * 4);
+-                gprIndex++;
+-                try {
+-                    return static_cast<CleanT>(Memory::Read32(argAddr));
+-                } catch (const Memory::AccessViolation&) {
+-                    RT_LOG(RT_TAG_RUNTIME) << "Stack parameter read failed at 0x" << std::hex << argAddr
+-                              << " (SP=0x" << sp << ", argIndex=" << std::dec << (gprIndex - 1) << ")" << std::endl;
+-                    throw;
+-                }
+-            }
+-            return static_cast<CleanT>(cpu->gpr[3 + gprIndex++]);
+-        }
+-    }
+-
+-    static void InvokeCpu(TargetFn target, CpuContext* cpu) {
+-        auto args = BuildArgs(cpu);
+-        if constexpr (std::is_void_v<Ret>) {
+-            std::apply(target, args);
+-        } else {
+-            auto result = std::apply(target, args);
+-            if constexpr (std::is_floating_point_v<Ret>) {
+-                cpu->fpr[1].d = static_cast<double>(result);
+-            } else {
+-                cpu->gpr[3] = static_cast<uint32_t>(result);
+-            }
+-        }
+-    }
+-};
+-
+-template <auto Target>
+-struct AbiRawCpuThunk {
+-    static void Invoke(CpuContext* cpu) {
+-        if constexpr (std::is_invocable_v<decltype(Target), CpuContext*>) {
+-            (void)Target(cpu);
+-        } else {
+-            AbiTrampoline<std::remove_pointer_t<decltype(Target)>>::InvokeCpu(Target, cpu);
+-        }
+-    }
+-};
+-
+-template <typename Ret>
+-class AbiTrampoline<Ret(CpuContext*)> {
+-public:
+-    using TargetFn = Ret (*)(CpuContext*);
+-
+-    AbiTrampoline(uint32_t address,
+-                  const char* name,
+-                  TargetFn target,
+-                  FunctionKind kind = FunctionKind::BaseTranslated,
+-                  bool preservesNonvolatileFprs = false,
+-                  uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask,
+-                  uint32_t priority = 0,
+-                  uint64_t moduleId = 0,
+-                  void (*rawCpuInvoker)(CpuContext*) = nullptr,
+-                  bool mustRemainDynamicallyDispatchable = true)
+-    {
+-        TranslatedFunctionInfo info;
+-        info.address = address;
+-        info.name = name ? name : "";
+-        info.moduleId = moduleId;
+-        info.priority = priority;
+-        // Deliberately *not* mirroring the typed specialization's
+-        // `|| kind == FunctionKind::Native`. A CpuContext* native receives the
+-        // whole guest register file and can legitimately write f14-f31 through
+-        // it, so it stays conservative until the individual address has been
+-        // measured clean and its registration opts out below.
+-        info.nonvolatileFprWriteMask = preservesNonvolatileFprs ? 0 : (nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
+-        info.entryPoint = reinterpret_cast<void*>(target);
+-        info.rawCpuInvoker = rawCpuInvoker ? rawCpuInvoker : reinterpret_cast<void (*)(CpuContext*)>(target);
+-        info.mustRemainDynamicallyDispatchable = mustRemainDynamicallyDispatchable;
+-        info.kind = kind;
+-        TranslatedFunctionRegistry::Register(std::move(info));
+-    }
+-};
+-
+-#define MKW_DETAIL_CAT(a, b) a##b
+-#define MKW_DETAIL_MAKE_UNIQUE(a, b) MKW_DETAIL_CAT(a, b)
+-
+-// Three hand-written registration macros. Generated code never registers per function; every
+-// translated function reaches the registry via the bulk BulkTranslatedFunctionRecord tables
+-// in the translator's *_registration TUs.
+-#define REGISTER_TRANSLATED_FUNCTION(address, fn) \
+-    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::BaseTranslated, false, kPpcAllNonvolatileFprMask, 0, 0, nullptr, KnownTranslatedCpuCall<address>::kMustRemainDynamicallyDispatchable)
+-
+-#define REGISTER_NATIVE_FUNCTION(address, fn) \
+-    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)
+-
+-#define REGISTER_NATIVE_FUNCTION_AS(address, fn, pretty_name) \
+-    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_named_, __COUNTER__)(address, pretty_name, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)
++#pragma once
++#include "memory.h"
++#include "ppc_runtime.h"
++#include "system_bridge.h"
++#include "game_graphics_options.h"
++#include "runtime_log.h"
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <iostream>
++#include <optional>
++#include <stdexcept>
++#include <sstream>
++#include <tuple>
++#include <type_traits>
++
++#if defined(__SWITCH__)
++extern "C" std::atomic<int> kartpad_indirect_profile_enabled;
++extern "C" void kartpad_indirect_profile_record(uint32_t caller, uint32_t target);
++inline thread_local uint32_t g_indirectProfileSampleCounter = 0;
++#endif
++MKW_PPC_FORCE_INLINE void InvokeIndirectCpu(uint32_t target, CpuContext* ctx);
++
++// Some game-facing runtime options alter arguments at well-defined ABI
++// boundaries. Keep this independent of the dispatch mechanism: generated
++// static calls deliberately bypass InvokeDirectCpu for performance.
++// (used for the path mask filtering in ScnRenderer::createPath: depth of
++// field is always removed, bloom when the user disabled it)
++inline void ApplyRuntimeCallOptions(uint32_t target, CpuContext* ctx) {
++    if (target == 0x8023BD38u) {
++        // ScnRenderer::createPath receives the post-processing path mask in r4.
++        ctx->gpr[4] = RuntimeGameGraphicsOptions::FilterScnRendererPathMask(ctx->gpr[4]);
++    }
++}
++
++// Persistent per-thread CPU context used across translated function calls.
++CpuContext& GetPersistentCpuContext();
++void InitializePersistentCpuContext();
++
++enum class FunctionKind : uint8_t {
++    BaseTranslated = 0,
++    ModTranslated = 1,
++    Native = 2,
++};
++
++inline constexpr uint32_t kPpcAllNonvolatileFprMask = 0xffffc000u;
++inline constexpr uint32_t kBaseTranslatedFunctionPriority = 0;
++inline constexpr uint32_t kModTranslatedFunctionPriorityBase = 100;
++inline constexpr uint32_t kNativeFunctionPriority = 10000;
++
++#include "isa/ppc_isa_cr.h"
++
++struct TranslatedFunctionInfo {
++    uint32_t address = 0;
++    const char* name = "";
++    uint64_t moduleId = 0;
++    uint32_t priority = 0;
++    uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
++    void* entryPoint = nullptr; // Raw typed function pointer for indirect-call resolution
++    void (*rawCpuInvoker)(CpuContext*) = nullptr;
++    bool mustRemainDynamicallyDispatchable = true;
++    FunctionKind kind = FunctionKind::BaseTranslated;
++};
++
++struct RawDispatchRecord {
++    uint32_t address = 0;
++    void (*entry)(CpuContext*) = nullptr;
++    uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
++    bool preserveNonvolatileGprs = false;
++};
++
++// Translator-owned indirect dispatch is split by the high address byte and
++// then by 4 KiB guest pages. Each populated segment stores only the contiguous
++// page range that contains verified function entry points. The final search is
++// bounded to at most the 1024 aligned instruction addresses in one guest page.
++struct StaticIndirectDispatchPage {
++    uint32_t firstEntry = 0;
++    uint16_t entryCount = 0;
++    // Explicit tail padding to an 8-byte stride. The emitter writes it as a
++    // literal third initializer, so it is part of the generated-data contract.
++    uint16_t reserved = 0;
++};
++
++struct StaticIndirectDispatchSegment {
++    const StaticIndirectDispatchPage* pages = nullptr;
++    uint16_t firstPage = 0;
++    uint16_t pageCount = 0;
++};
++
++struct StaticIndirectDispatchTable {
++    const char* profileName = nullptr;
++    const StaticIndirectDispatchSegment* segments = nullptr; // Exactly 256 high-byte segments.
++    const RawDispatchRecord* entries = nullptr;
++    size_t entryCount = 0;
++};
++
++inline const RawDispatchRecord* FindStaticIndirectDispatchEntry(
++    const StaticIndirectDispatchTable* table,
++    uint32_t address) noexcept {
++    if (!table || !table->segments || !table->entries || table->entryCount == 0) {
++        return nullptr;
++    }
++
++    const auto& segment = table->segments[address >> 24];
++    const uint32_t pageNumber = (address >> 12) & 0x0FFFu;
++    if (!segment.pages || pageNumber < segment.firstPage) {
++        return nullptr;
++    }
++    const uint32_t relativePage = pageNumber - segment.firstPage;
++    if (relativePage >= segment.pageCount) {
++        return nullptr;
++    }
++
++    const auto& page = segment.pages[relativePage];
++    const size_t first = page.firstEntry;
++    const size_t count = page.entryCount;
++    if (first > table->entryCount || count > table->entryCount - first) {
++        return nullptr;
++    }
++
++    size_t lower = first;
++    size_t upper = first + count;
++    while (lower < upper) {
++        const size_t middle = lower + (upper - lower) / 2;
++        const uint32_t candidate = table->entries[middle].address;
++        if (candidate < address) {
++            lower = middle + 1;
++        } else {
++            upper = middle;
++        }
++    }
++    return lower < first + count && table->entries[lower].address == address
++        ? &table->entries[lower]
++        : nullptr;
++}
++
++void RegisterStaticIndirectDispatchTable(const StaticIndirectDispatchTable* table);
++inline std::atomic<const StaticIndirectDispatchTable*> g_publishedStaticIndirectDispatchTable{nullptr};
++
++class StaticIndirectDispatchTableRegistrar {
++public:
++    explicit StaticIndirectDispatchTableRegistrar(const StaticIndirectDispatchTable* table) {
++        RegisterStaticIndirectDispatchTable(table);
++    }
++};
++
++inline unsigned PpcLowestSetBitIndex(uint32_t value) noexcept {
++    return static_cast<unsigned>(__builtin_ctz(value));
++}
++
++class PpcNonvolatileFprGuard {
++public:
++    explicit PpcNonvolatileFprGuard(CpuContext* cpu, uint32_t mask = kPpcAllNonvolatileFprMask) noexcept
++        : cpu_(cpu), mask_(mask & kPpcAllNonvolatileFprMask) {
++        if (!cpu_ || mask_ == 0) {
++            return;
++        }
++        // The default (unknown writer) mask: one constant-size copy, inline ldp/stp rather than the
++        // variable-length libc memmove below (b72).
++        if (mask_ == kPpcAllNonvolatileFprMask) {
++            firstSlot_ = 0;
++            slotCount_ = 18;
++            std::memcpy(saved_.data(), &cpu_->fpr[14], sizeof(saved_));
++            return;
++        }
++        // Real masks are a single contiguous register run - f14..f31 for the
++        // conservative default and f23..f31 or similar for a measured writer -
++        // so resolve the run once and copy it as one straight-line block instead
++        // of testing 18 mask bits. Any other mask keeps the per-bit loop, which
++        // saves and restores exactly the same registers.
++        const uint32_t lowest = mask_ & (0u - mask_);
++        const uint32_t aboveRun = mask_ + lowest;
++        if ((aboveRun & (aboveRun - 1u)) == 0u) {
++            const unsigned first = PpcLowestSetBitIndex(mask_);
++            const unsigned end = aboveRun == 0u ? 32u : PpcLowestSetBitIndex(aboveRun);
++            firstSlot_ = static_cast<uint8_t>(first - 14u);
++            slotCount_ = static_cast<uint8_t>(end - first);
++            std::memcpy(&saved_[firstSlot_], &cpu_->fpr[first], slotCount_ * sizeof(PPC_FPR));
++            return;
++        }
++        for (size_t i = 0; i < saved_.size(); ++i) {
++            if ((mask_ & (1u << (14 + i))) == 0) {
++                continue;
++            }
++            saved_[i] = cpu_->fpr[14 + i];
++        }
++    }
++
++    ~PpcNonvolatileFprGuard() noexcept {
++        if (!cpu_ || mask_ == 0) {
++            return;
++        }
++        if (slotCount_ == 18) {
++            std::memcpy(&cpu_->fpr[14], saved_.data(), sizeof(saved_));
++            return;
++        }
++        if (slotCount_ != 0) {
++            const unsigned first = 14u + firstSlot_;
++            std::memcpy(&cpu_->fpr[first], &saved_[firstSlot_], slotCount_ * sizeof(PPC_FPR));
++            return;
++        }
++        for (size_t i = 0; i < saved_.size(); ++i) {
++            if ((mask_ & (1u << (14 + i))) == 0) {
++                continue;
++            }
++            cpu_->fpr[14 + i] = saved_[i];
++        }
++    }
++
++    PpcNonvolatileFprGuard(const PpcNonvolatileFprGuard&) = delete;
++    PpcNonvolatileFprGuard& operator=(const PpcNonvolatileFprGuard&) = delete;
++
++private:
++    CpuContext* cpu_ = nullptr;
++    uint32_t mask_ = 0;
++    // Contiguous-run description of mask_. slotCount_ == 0 means the mask is not
++    // a single run, so the destructor mirrors the constructor's per-bit loop.
++    uint8_t firstSlot_ = 0;
++    uint8_t slotCount_ = 0;
++    // Every element selected by mask_ is written before it is read. Leaving the
++    // remaining slots uninitialized avoids zero-filling all 18 values around a
++    // call that may preserve only one or two architectural FPRs.
++    std::array<PPC_FPR, 18> saved_;
++};
++
++// PpcNonvolatileFprGuard for a mask known at compile time (statically bound translated
++// callees). The runtime-mask guard's variable-length memcpy is an out-of-line libc call in its
++// destructor; here the run is a constant, so the copy is a few inline q-register moves.
++template <uint32_t Mask>
++class PpcNonvolatileFprGuardStatic {
++    static constexpr uint32_t kMask = Mask & kPpcAllNonvolatileFprMask;
++    static constexpr uint32_t kLowest = kMask & (0u - kMask);
++    static constexpr uint32_t kAbove = kMask + kLowest;
++    static constexpr bool kContiguous = kMask != 0 && (kAbove & (kAbove - 1u)) == 0u;
++    static constexpr unsigned kFirst = kMask != 0 ? static_cast<unsigned>(__builtin_ctz(kMask)) : 14u;
++    static constexpr unsigned kEnd =
++        kContiguous ? (kAbove == 0 ? 32u : static_cast<unsigned>(__builtin_ctz(kAbove))) : 32u;
++    static constexpr unsigned kSlots = kContiguous ? kEnd - kFirst : 18u;
++
++public:
++    MKW_PPC_FORCE_INLINE explicit PpcNonvolatileFprGuardStatic(CpuContext* cpu) noexcept : cpu_(cpu) {
++        if constexpr (kContiguous) {
++            std::memcpy(saved_, &cpu_->fpr[kFirst], sizeof(saved_));
++        } else {
++            for (unsigned i = 0; i < 18; ++i) {
++                if (kMask & (1u << (14 + i))) {
++                    saved_[i] = cpu_->fpr[14 + i];
++                }
++            }
++        }
++    }
++
++    MKW_PPC_FORCE_INLINE ~PpcNonvolatileFprGuardStatic() noexcept {
++        if constexpr (kContiguous) {
++            std::memcpy(&cpu_->fpr[kFirst], saved_, sizeof(saved_));
++        } else {
++            for (unsigned i = 0; i < 18; ++i) {
++                if (kMask & (1u << (14 + i))) {
++                    cpu_->fpr[14 + i] = saved_[i];
++                }
++            }
++        }
++    }
++
++    PpcNonvolatileFprGuardStatic(const PpcNonvolatileFprGuardStatic&) = delete;
++    PpcNonvolatileFprGuardStatic& operator=(const PpcNonvolatileFprGuardStatic&) = delete;
++
++private:
++    CpuContext* cpu_;
++    PPC_FPR saved_[kSlots];
++};
++
++class PpcNonvolatileGprGuard {
++public:
++    explicit PpcNonvolatileGprGuard(CpuContext* cpu, bool enabled = true) noexcept
++        : cpu_(enabled ? cpu : nullptr) {
++        if (!cpu_) {
++            return;
++        }
++        std::memcpy(saved_.data(), &cpu_->gpr[14], sizeof(saved_));
++    }
++
++    ~PpcNonvolatileGprGuard() noexcept {
++        if (!cpu_) {
++            return;
++        }
++        std::memcpy(&cpu_->gpr[14], saved_.data(), sizeof(saved_));
++    }
++
++    PpcNonvolatileGprGuard(const PpcNonvolatileGprGuard&) = delete;
++    PpcNonvolatileGprGuard& operator=(const PpcNonvolatileGprGuard&) = delete;
++
++private:
++    CpuContext* cpu_ = nullptr;
++    // Left uninitialized: enabled writes all 18 slots before reading them, disabled reads none,
++    // so skipping the zero-fill saves 72 bytes of stack work on the common disabled hot path.
++    std::array<uint32_t, 18> saved_;
++};
++
++// Guest address of OSLoadContext, which models rfi-style context restoration
++// and intentionally replaces the full guest register file instead of returning
++// like a normal ABI call. It can never be guarded.
++inline constexpr uint32_t kOSLoadContextAddress = 0x801A1F58u;
++
++inline bool ShouldPreserveNonvolatileGprsForRawCpuCall(const TranslatedFunctionInfo* info) noexcept {
++    return info->kind == FunctionKind::Native && info->address != kOSLoadContextAddress;
++}
++
++inline uint32_t NonvolatileFprGuardMaskFor(const TranslatedFunctionInfo* info) noexcept {
++    if (!info || info->nonvolatileFprWriteMask == 0) {
++        return 0;
++    }
++    return info->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask;
++}
++
++template <uint32_t Target>
++struct KnownTranslatedCpuCall {
++    static constexpr bool kAvailable = false;
++    static constexpr uint32_t kNonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
++    static constexpr bool kMustRemainDynamicallyDispatchable = true;
++    static constexpr void (*Entry)(CpuContext*) = nullptr;
++};
++
++// Translated functions a native fast path replaces through the linker's --wrap
++// (switch/cmake/GraphicsLink.cmake). --wrap only rewrites references the linker
++// sees as undefined, so a call made from the target's own shard, or one inlined
++// there, silently reaches the translated body instead. Statically bound calls
++// therefore take the wrapper from here; native_cpu_calls.inc lists them.
++template <uint32_t Target>
++struct TranslatedEntryOverride {
++    static constexpr void (*Entry)(CpuContext*) = nullptr;
++};
++
++// Translator-emitted trait specializations, one macro shared by every generated shard.
++// `addr` is the 8-digit hex entry point, `winner` the resolved symbol (mods/Retro Rewind can
++// publish their own name). A specialization only exists for a single statically bound winner,
++// so overridable/dynamically-dispatchable are hardcoded here rather than passed in.
++#define MKW_TRANSLATED_TRAIT(addr, winner, nonvolatile_fpr_write_mask)                    \
++    extern "C" void winner(CpuContext* ctx);                                              \
++    template <>                                                                           \
++    struct KnownTranslatedCpuCall<0x##addr##u> {                                          \
++        static constexpr bool kAvailable = true;                                          \
++        static constexpr uint32_t kNonvolatileFprWriteMask = nonvolatile_fpr_write_mask;  \
++        static constexpr bool kMustRemainDynamicallyDispatchable = false;                 \
++        static constexpr void (*Entry)(CpuContext*) =                                     \
++            TranslatedEntryOverride<0x##addr##u>::Entry != nullptr                                \
++                ? TranslatedEntryOverride<0x##addr##u>::Entry                                     \
++                : &winner;                                                                        \
++    }
++
++template <uint32_t Target>
++struct KnownNativeCpuCall {
++    static constexpr bool kAvailable = false;
++    static constexpr uint32_t kNonvolatileFprWriteMask = kPpcAllNonvolatileFprMask;
++    static constexpr void (*Entry)(CpuContext*) = nullptr;
++};
++
++template <uint32_t Target>
++struct KnownTypedNativeCpuCall {
++    static constexpr bool kAvailable = false;
++    // A leaf native only reads its arguments from cpu->gpr/fpr and never runs guest code,
++    // reschedules, or writes the register file, so it needs no r14-r31 guard.
++    static constexpr bool kLeaf = false;
++};
++
++#include "native_cpu_calls.inc"
++
++// Direct-mapped memo in front of the sorted registry lookup every bctrl performs; a miss just
++// re-runs the sorted lookup. Indexed by the HIGH bits of a Fibonacci hash: the old
++// `((a >> 2) * K) & mask` index only ever saw address bits 2..11, so two hot targets at the
++// same offset in different 4 KiB guest pages evicted each other forever (0.5% of the guest
++// thread sat in the miss path in a race). Must stay a power of two.
++inline constexpr unsigned kIndirectDispatchCacheBits = 12;
++inline constexpr size_t kIndirectDispatchCacheEntries = size_t{1} << kIndirectDispatchCacheBits;
++
++MKW_PPC_FORCE_INLINE size_t IndirectDispatchMemoIndex(uint32_t address) noexcept {
++    return (address * 0x9E3779B1u) >> (32u - kIndirectDispatchCacheBits);
++}
++
++// Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
++// thread-static init epoch check on every bctrl (same as g_currentCpuContext in ppc_runtime.h).
++struct IndirectResolvedDispatchMemoEntry {
++    uint32_t address;
++    const TranslatedFunctionInfo* info;
++};
++#if defined(__SWITCH__)
++// Per host thread through a TLS pointer: the guest core uses the Main array, the hosted sound
++// thread installs its own (os_host_thread.cpp). A thread_local array would instead be carved out
++// of every libnx thread's TLS block.
++inline IndirectResolvedDispatchMemoEntry
++    g_indirectResolvedDispatchMemoMain[kIndirectDispatchCacheEntries]{};
++inline thread_local IndirectResolvedDispatchMemoEntry* g_indirectResolvedDispatchMemo =
++    g_indirectResolvedDispatchMemoMain;
++#else
++inline thread_local IndirectResolvedDispatchMemoEntry
++    g_indirectResolvedDispatchMemo[kIndirectDispatchCacheEntries]{};
++#endif
++
++struct IndirectRawDispatchMemoEntry {
++    uint32_t address;
++    const RawDispatchRecord* record;
++    // record->entry when the call needs nothing but "call it": no FPR/GPR guard, no runtime
++    // call option. InvokeIndirectCpu/Jump branch straight to it; null sends them the full way.
++    void (*fastEntry)(CpuContext*);
++};
++#if defined(__SWITCH__)
++// Per host thread, like the resolved memo above.
++inline IndirectRawDispatchMemoEntry
++    g_indirectRawDispatchMemoMain[kIndirectDispatchCacheEntries]{};
++inline thread_local IndirectRawDispatchMemoEntry* g_indirectRawDispatchMemo =
++    g_indirectRawDispatchMemoMain;
++#else
++inline thread_local IndirectRawDispatchMemoEntry
++    g_indirectRawDispatchMemo[kIndirectDispatchCacheEntries]{};
++#endif
++
++class TranslatedFunctionRegistry {
++public:
++    static void Register(TranslatedFunctionInfo info);
++    static void Finalize();
++    static inline bool IsLookupPublished() noexcept {
++        return lookupPublished_.load(std::memory_order_relaxed);
++    }
++    static std::optional<TranslatedFunctionInfo> FindNearestByAddress(uint32_t address);
++    static inline const TranslatedFunctionInfo* FindByAddressPtr(uint32_t address) {
++        if (!lookupPublished_.load(std::memory_order_relaxed)) [[unlikely]] {
++            return FindByAddressPtrSlow(address);
++        }
++
++        auto& cached = g_indirectResolvedDispatchMemo[IndirectDispatchMemoIndex(address)];
++        if (cached.address == address) [[likely]] {
++            return cached.info;
++        }
++
++        const auto* info = FindByAddressPtrSlow(address);
++        cached = {address, info};
++        return info;
++    }
++
++    // Hot wrapper: only the direct-mapped memo probe stays inline. Inlining the
++    // generated-table binary search alongside it pushed the whole function past
++    // the inliner's budget and out-of-lined the probe itself, which is the part
++    // every bctrl executes.
++    static MKW_PPC_FORCE_INLINE const RawDispatchRecord* FindRawByAddressPtr(uint32_t address) {
++        if (!lookupPublished_.load(std::memory_order_relaxed)) [[unlikely]] {
++            return nullptr;
++        }
++
++        auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(address)];
++        if (cached.address == address) [[likely]] {
++            return cached.record;
++        }
++
++        return FindRawByAddressPtrMiss(address, cached);
++    }
++    // Look up a registered function by host (native) address.
++    // This enables stack trace symbolication for translated functions.
++    static std::optional<TranslatedFunctionInfo> FindByHostAddress(uintptr_t hostAddr);
++
++private:
++    // Memo miss: resolve against the header-inline generated table first; only dynamically
++    // registered records or a not-yet-published table fall through to the slow path.
++    static MKW_PPC_NO_INLINE MKW_PPC_COLD const RawDispatchRecord* FindRawByAddressPtrMiss(
++        uint32_t address, IndirectRawDispatchMemoEntry& cached) {
++        const RawDispatchRecord* record = nullptr;
++        if (const auto* table =
++                g_publishedStaticIndirectDispatchTable.load(std::memory_order_acquire)) {
++            record = FindStaticIndirectDispatchEntry(table, address);
++        }
++        if (record == nullptr) {
++            record = FindRawByAddressPtrSlow(address);
++        }
++        cached = {address, record, IsPlainRawDispatch(record) ? record->entry : nullptr};
++        return record;
++    }
++
++    static const TranslatedFunctionInfo* FindByAddressPtrSlow(uint32_t address);
++    static const RawDispatchRecord* FindRawByAddressPtrSlow(uint32_t address);
++
++    // What TryDispatchRawCpuTarget would do beyond the call itself is nothing: no FPR or GPR
++    // guard and no ApplyRuntimeCallOptions rewrite (ScnRenderer::createPath).
++    static bool IsPlainRawDispatch(const RawDispatchRecord* record) noexcept {
++        return record != nullptr && record->entry != nullptr &&
++               (record->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask) == 0 &&
++               !record->preserveNonvolatileGprs && record->address != 0x8023BD38u;
++    }
++
++    // Finalize publishes immutable registry, generated-table, and dynamic raw
++    // dispatch storage. Header-inlined cache hits are enabled only after that
++    // release publication, so a pre-finalization miss can never poison them.
++    inline static std::atomic_bool lookupPublished_{false};
++};
++
++// Cold, profile-owned registration data is emitted in compact table shards.
++// Keeping it out of generated function bodies avoids one static constructor
++// per translated function.
++struct BulkTranslatedFunctionRecord {
++    uint32_t address;
++    const char* name;
++    void (*entry)(CpuContext*);
++    FunctionKind kind;
++    bool preservesNonvolatileFprs;
++    uint32_t nonvolatileFprWriteMask;
++    uint32_t priority;
++    uint64_t moduleId;
++    bool mustRemainDynamicallyDispatchable;
++};
++
++void RegisterBulkTranslatedFunctions(const BulkTranslatedFunctionRecord* records, size_t count);
++
++class BulkTranslatedFunctionRegistrar {
++public:
++    BulkTranslatedFunctionRegistrar(const BulkTranslatedFunctionRecord* records, size_t count) {
++        RegisterBulkTranslatedFunctions(records, count);
++    }
++    // Profile-tagged form emitted by the dual-profile translator. Only the base
++    // product is linked into this NRO, so the profile tag is accepted and the
++    // records register unconditionally (single-profile build; no per-profile
++    // filtering needed). See wiicompiled-dual-profile-registry.patch for the
++    // full multi-profile variant used when several products share one binary.
++    BulkTranslatedFunctionRegistrar(const char* /*profileName*/,
++                                    const BulkTranslatedFunctionRecord* records, size_t count) {
++        RegisterBulkTranslatedFunctions(records, count);
++    }
++};
++
++MKW_PPC_FORCE_INLINE bool TryDispatchResolvedCpuTarget(const TranslatedFunctionInfo* info, CpuContext* cpu) {
++    if (!info || !info->rawCpuInvoker) {
++        return false;
++    }
++
++    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(info->address);
++    PpcNonvolatileFprGuard fprGuard(cpu, NonvolatileFprGuardMaskFor(info));
++    PpcNonvolatileGprGuard gprGuard(cpu, ShouldPreserveNonvolatileGprsForRawCpuCall(info));
++    if (TryGetCpuContext() != cpu) {
++        CpuContextScope scope(cpu);
++        info->rawCpuInvoker(cpu);
++        return true;
++    }
++    info->rawCpuInvoker(cpu);
++    return true;
++}
++
++inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {
++    if (!record || !record->entry) {
++        return false;
++    }
++    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
++    PpcNonvolatileGprGuard gprGuard(cpu, record->preserveNonvolatileGprs);
++    PpcNonvolatileFprGuard fprGuard(cpu, record->nonvolatileFprWriteMask);
++    if (TryGetCpuContext() != cpu) {
++        CpuContextScope scope(cpu);
++        record->entry(cpu);
++    } else {
++        record->entry(cpu);
++    }
++    return true;
++}
++
++// Entering a CpuContext that is not current (host-side callers, first entry): kept out of
++// line so the hot same-context path below has no CpuContextScope/FPCR code to spill around.
++template <uint32_t Target>
++MKW_PPC_NO_INLINE MKW_PPC_COLD void DispatchKnownTranslatedCpuTargetStaticEnter(CpuContext* cpu) {
++    const auto invokeKnownTranslated = [&]() {
++        KnownTranslatedCpuCall<Target>::Entry(cpu);
++    };
++    CpuContextScope contextScope(cpu);
++    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(Target);
++    if constexpr (KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask == 0) {
++        invokeKnownTranslated();
++        return;
++    } else {
++        PpcNonvolatileFprGuard fprGuard(cpu, KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask);
++        invokeKnownTranslated();
++    }
++}
++
++template <uint32_t Target>
++inline void DispatchKnownTranslatedCpuTargetStatic(CpuContext* cpu) {
++    // A statically resolved, non-overridable translated call already running
++    // in this CpuContext needs no registry, context, or diagnostic target
++    // transition. This is the normal generated-to-generated hot path.
++    if (TryGetCpuContext() == cpu) [[likely]] {
++        if constexpr ((KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask & kPpcAllNonvolatileFprMask) == 0) {
++            KnownTranslatedCpuCall<Target>::Entry(cpu);
++        } else {
++            PpcNonvolatileFprGuardStatic<KnownTranslatedCpuCall<Target>::kNonvolatileFprWriteMask> fprGuard(cpu);
++            KnownTranslatedCpuCall<Target>::Entry(cpu);
++        }
++        return;
++    }
++    DispatchKnownTranslatedCpuTargetStaticEnter<Target>(cpu);
++}
++
++[[noreturn]] inline void ReportMissingCpuTarget(uint32_t target, CpuContext* cpu) {
++    // Centralized crash path: stderr diagnostics, heuristics, crash artifacts
++    // in the run's log folder, popup, exit.
++    RuntimeCrash::FatalMissingGuestTarget(target, cpu);
++}
++
++template <uint32_t Target>
++inline const TranslatedFunctionInfo* ResolveDirectCpuTargetInfo() {
++    return TranslatedFunctionRegistry::FindByAddressPtr(Target);
++}
++
++template <uint32_t Target>
++inline const TranslatedFunctionInfo* ResolveDirectCpuTargetInfoCached() {
++    // Only latch a result once the registry is published (immutable for the process lifetime);
++    // a pre-finalization miss or provisional winner must never be cached. 0 = not yet resolved,
++    // 1 = negative-cache sentinel, avoiding a second ready flag on the hot path.
++    static std::atomic<uintptr_t> cachedValue{0};
++    constexpr uintptr_t kNegativeCache = 1;
++    const uintptr_t cached = cachedValue.load(std::memory_order_acquire);
++    if (cached != 0) {
++        return cached == kNegativeCache
++            ? nullptr
++            : reinterpret_cast<const TranslatedFunctionInfo*>(cached);
++    }
++    if (!TranslatedFunctionRegistry::IsLookupPublished()) {
++        return ResolveDirectCpuTargetInfo<Target>();
++    }
++    const auto* info = ResolveDirectCpuTargetInfo<Target>();
++    cachedValue.store(info != nullptr
++                          ? reinterpret_cast<uintptr_t>(info)
++                          : kNegativeCache,
++                      std::memory_order_release);
++    return info;
++}
++
++// Caches the "is the published winner still base translation?" verdict for state-free fast
++// paths guarding tens of thousands of call sites. Same latching rule as above: 0 = unresolved,
++// 1 = negative, 2 = positive, and a verdict computed pre-publication is never stored.
++template <uint32_t Target>
++inline bool IsBaseTranslatedCpuTargetActive() {
++    static std::atomic<uint8_t> cachedVerdict{0};
++    constexpr uint8_t kNegativeVerdict = 1;
++    constexpr uint8_t kPositiveVerdict = 2;
++    const uint8_t cached = cachedVerdict.load(std::memory_order_acquire);
++    if (cached != 0) {
++        return cached == kPositiveVerdict;
++    }
++    const bool publishable = TranslatedFunctionRegistry::IsLookupPublished();
++    const auto* info = ResolveDirectCpuTargetInfo<Target>();
++    const bool active = info != nullptr && info->kind == FunctionKind::BaseTranslated;
++    if (publishable) {
++        cachedVerdict.store(active ? kPositiveVerdict : kNegativeVerdict,
++                            std::memory_order_release);
++    }
++    return active;
++}
++
++// Direct calls whose target's KnownTranslatedCpuCall is not visible (Retro Rewind overlay code calling
++// base functions, mod and HLE call sites): once the registry is published, a winner that needs no
++// nonvolatile guard is called straight through its raw invoker, like InvokeIndirectCpu's memo
++// fastEntry. Skipped versus TryDispatchResolvedCpuTarget: the diagnostic-only
++// ScopedTranslatedExecutionAddress (static and fast indirect calls skip it too). b69 race: that path
++// was ~2% of the guest core, mostly from RR's kart physics overlays. 0 = unresolved, 1 = none.
++using DirectCpuRawInvoker = void (*)(CpuContext*);
++template <uint32_t Target>
++MKW_PPC_NO_INLINE MKW_PPC_COLD DirectCpuRawInvoker ResolveDirectCpuFastEntrySlow(
++    std::atomic<uintptr_t>& cachedEntry) {
++    if (!TranslatedFunctionRegistry::IsLookupPublished()) {
++        return nullptr;
++    }
++    const auto* info = ResolveDirectCpuTargetInfo<Target>();
++    const bool plain = info != nullptr && info->rawCpuInvoker != nullptr &&
++                       NonvolatileFprGuardMaskFor(info) == 0 &&
++                       !ShouldPreserveNonvolatileGprsForRawCpuCall(info);
++    const DirectCpuRawInvoker entry = plain ? info->rawCpuInvoker : nullptr;
++    cachedEntry.store(entry != nullptr ? reinterpret_cast<uintptr_t>(entry) : uintptr_t{1},
++                      std::memory_order_release);
++    return entry;
++}
++
++template <uint32_t Target>
++MKW_PPC_FORCE_INLINE DirectCpuRawInvoker ResolveDirectCpuFastEntry() {
++    static std::atomic<uintptr_t> cachedEntry{0};
++    const uintptr_t cached = cachedEntry.load(std::memory_order_acquire);
++    if (cached > 1) [[likely]] {
++        return reinterpret_cast<DirectCpuRawInvoker>(cached);
++    }
++    return cached == 0 ? ResolveDirectCpuFastEntrySlow<Target>(cachedEntry) : nullptr;
++}
++
++template <uint32_t Target>
++inline void InvokeDirectCpu(CpuContext* ctx) {
++    static_assert(Target != 0, "InvokeDirectCpu cannot target address 0");
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    ApplyRuntimeCallOptions(Target, cpu);
++    if constexpr (KnownNativeCpuCall<Target>::kAvailable) {
++        const auto invokeKnownNative = [&]() {
++            PpcNonvolatileGprGuard gprGuard(cpu);
++            if (TryGetCpuContext() != cpu) {
++                CpuContextScope scope(cpu);
++                KnownNativeCpuCall<Target>::Entry(cpu);
++                return;
++            }
++            KnownNativeCpuCall<Target>::Entry(cpu);
++        };
++        if constexpr (KnownNativeCpuCall<Target>::kNonvolatileFprWriteMask == 0) {
++            invokeKnownNative();
++        } else {
++            PpcNonvolatileFprGuard fprGuard(cpu, KnownNativeCpuCall<Target>::kNonvolatileFprWriteMask);
++            invokeKnownNative();
++        }
++        return;
++    }
++
++    if constexpr (KnownTypedNativeCpuCall<Target>::kAvailable && KnownTypedNativeCpuCall<Target>::kLeaf) {
++        if (TryGetCpuContext() != cpu) [[unlikely]] {
++            CpuContextScope scope(cpu);
++            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
++        } else {
++            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
++        }
++        return;
++    }
++
++    if constexpr (KnownTypedNativeCpuCall<Target>::kAvailable) {
++        PpcNonvolatileGprGuard gprGuard(cpu);
++        if (TryGetCpuContext() != cpu) {
++            CpuContextScope scope(cpu);
++            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
++        } else {
++            KnownTypedNativeCpuCall<Target>::Invoke(cpu);
++        }
++        return;
++    }
++
++    if constexpr (KnownTranslatedCpuCall<Target>::kAvailable) {
++        DispatchKnownTranslatedCpuTargetStatic<Target>(cpu);
++        return;
++    }
++
++    if (const DirectCpuRawInvoker fast = ResolveDirectCpuFastEntry<Target>();
++        fast != nullptr && TryGetCpuContext() == cpu) [[likely]] {
++        fast(cpu);
++        return;
++    }
++
++    const auto* registeredInfo = ResolveDirectCpuTargetInfoCached<Target>();
++    if (TryDispatchResolvedCpuTarget(registeredInfo, cpu)) {
++        return;
++    }
++
++    ReportMissingCpuTarget(Target, cpu);
++}
++
++// Indirect jump (bctr without link) - used for switch tables.
++MKW_PPC_NO_INLINE inline void InvokeIndirectJumpSlow(uint32_t target, CpuContext* ctx) {
++    // Use the caller's context, not the persistent global context!
++    // This is essential for tail calls via bctr where the 'this' pointer (r3)
++    // must be passed correctly to the target function.
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
++        return;
++    }
++
++    // Cold fallback for dynamically registered or signature-only targets.
++    const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(target);
++    if (info) {
++        if (TryDispatchResolvedCpuTarget(info, cpu)) {
++            return;
++        }
++    }
++    
++    // If not registered, this is likely a switch table jump to an intra-function label.
++    // The translator should have recognized this pattern and generated proper switch code.
++    RT_LOG(RT_TAG_RUNTIME) << "InvokeIndirectJump: target 0x"
++              << std::hex << target << std::dec
++              << " is not a registered function.\n"
++              << "This is likely a switch statement jump table that the translator\n"
++              << "failed to recognize. The function containing this bctr needs\n"
++              << "proper switch pattern recognition." << std::endl;
++    RT_LOG(RT_TAG_RUNTIME) << "Indirect jump context: pc=0x" << std::hex << cpu->pc
++              << " lr=0x" << cpu->lr << " ctr=0x" << cpu->ctr
++              << " r1=0x" << cpu->gpr[1] << " r3=0x" << cpu->gpr[3]
++              << " r29=0x" << cpu->gpr[29] << " r30=0x" << cpu->gpr[30]
++              << " r31=0x" << cpu->gpr[31] << std::dec << std::endl;
++    DumpHostStackTraceForRuntimeHelper();
++    std::fflush(stderr);
++    std::ostringstream message;
++    message << "The game stopped because an indirect jump targeted guest address 0x"
++            << std::hex << target
++            << ", but that address is not a registered translated function.\n\n"
++            << "The translator may have missed a switch/jump-table target.";
++    // Same artifact set as RuntimeCrash::FatalMissingGuestTarget, which is this
++    // path's sibling for indirect *calls*: MarkFatalErrorReported below stops the
++    // atexit reporter, so the crash log has to be written here.
++    RuntimeCrash::WriteCrashArtifacts("missing_jump_target", message.str(), &target);
++    SetRuntimeExitCode(EXIT_FAILURE);
++    ShowRuntimeFatalPopup("Missing indirect jump target", message.str());
++    MarkFatalErrorReported();
++    std::exit(EXIT_FAILURE);
++}
++
++MKW_PPC_NO_INLINE inline void InvokeIndirectCpuSlow(uint32_t target, CpuContext* ctx) {
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    if (target == 0) {
++        ReportMissingCpuTarget(target, cpu);
++    }
++    ApplyRuntimeCallOptions(target, cpu);
++    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
++        return;
++    }
++    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {
++        return;
++    }
++    ReportMissingCpuTarget(target, cpu);
++}
++
++#if defined(__SWITCH__)
++// perf.cfg `eabi_verify N` (b73): runs an indirect call or tail jump, then checks that the target returned
++// r1, r2 and r13-r31 unchanged. Translated callers rely on that since b73 (they no longer reload those
++// registers after InvokeIndirectCpu/Jump); kartpad_eabi_record counts the checks, logs any violation and
++// turns the check off after N million calls.
++extern "C" void kartpad_eabi_record(uint32_t target, uint32_t returnAddress, uint32_t changedMask,
++                                    const uint32_t* before, const uint32_t* after);
++MKW_PPC_NO_INLINE inline void InvokeIndirectCpuEabiChecked(uint32_t target, CpuContext* ctx, bool jump = false) {
++    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
++    uint32_t before[32];
++    std::memcpy(before, cpu->gpr, sizeof(before));
++    const uint32_t returnAddress = cpu->lr;
++    const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
++    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr && TryGetCpuContext() == ctx)
++        cached.fastEntry(ctx);
++    else if (jump)
++        InvokeIndirectJumpSlow(target, ctx);
++    else
++        InvokeIndirectCpuSlow(target, ctx);
++    constexpr uint32_t kPreserved = (1u << 1) | (1u << 2) | 0xFFFFE000u;
++    uint32_t changed = 0;
++    for (int i = 0; i < 32; ++i)
++        if (((kPreserved >> i) & 1u) != 0 && cpu->gpr[i] != before[i]) changed |= 1u << i;
++    kartpad_eabi_record(target, returnAddress, changed, before, cpu->gpr);
++}
++#endif
++
++// Every bctrl/bctr. The common case - a memoized plain target called from the context that is
++// already current - is a probe and a direct branch, inlined so each call site gets its own
++// indirect-branch history instead of all ~14k sites sharing one `blr` in a shared dispatcher.
++// Entries are only written after registry publication (FindRawByAddressPtr), and a zeroed
++// entry has no fastEntry, so address 0 and pre-publication calls always take the slow path.
++// Skipped here versus the slow path: ScopedTranslatedExecutionAddress (diagnostic only, already
++// skipped by all static translated calls) and the guards/options IsPlainRawDispatch excludes.
++MKW_PPC_FORCE_INLINE void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
++#if defined(__SWITCH__)
++    if (__builtin_expect(kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) != 0, 0)) {
++        if ((kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) & 2) != 0) { InvokeIndirectCpuEabiChecked(target, ctx); return; } else if ((++g_indirectProfileSampleCounter & 127u) == 0u)
++            kartpad_indirect_profile_record(ctx ? ctx->lr : 0u, target);
++    }
++#endif
++    const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
++    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr &&
++        TryGetCpuContext() == ctx) [[likely]] {
++        cached.fastEntry(ctx);
++        return;
++    }
++    InvokeIndirectCpuSlow(target, ctx);
++}
++
++// One line, so the inlined body keeps its line offsets for sample PGO.
++#if defined(__SWITCH__)
++#define MKW_EABI_VERIFY_JUMP(target, ctx) if ((kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) & 2) != 0) { InvokeIndirectCpuEabiChecked(target, ctx, true); return; }
++#else
++#define MKW_EABI_VERIFY_JUMP(target, ctx)
++#endif
++MKW_PPC_FORCE_INLINE void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
++    MKW_EABI_VERIFY_JUMP(target, ctx) const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
++    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr &&
++        TryGetCpuContext() == ctx) [[likely]] {
++        cached.fastEntry(ctx);
++        return;
++    }
++    InvokeIndirectJumpSlow(target, ctx);
++}
++
++template <typename Signature>
++class AbiTrampoline;
++
++template <typename Ret, typename... Args>
++class AbiTrampoline<Ret(Args...)> {
++public:
++    using TargetFn = Ret (*)(Args...);
++
++    AbiTrampoline(uint32_t address,
++                  const char* name,
++                  TargetFn target,
++                  FunctionKind kind = FunctionKind::BaseTranslated,
++                  bool preservesNonvolatileFprs = false,
++                  uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask,
++                  uint32_t priority = 0,
++                  uint64_t moduleId = 0,
++                  void (*rawCpuInvoker)(CpuContext*) = nullptr,
++                  bool mustRemainDynamicallyDispatchable = true)
++    {
++        TranslatedFunctionInfo info;
++        info.address = address;
++        info.name = name ? name : "";
++        info.moduleId = moduleId;
++        info.priority = priority;
++        const bool effectivePreservesNonvolatileFprs =
++            preservesNonvolatileFprs || kind == FunctionKind::Native;
++        info.nonvolatileFprWriteMask = effectivePreservesNonvolatileFprs ? 0 : (nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
++        info.entryPoint = reinterpret_cast<void*>(target);
++        info.rawCpuInvoker = rawCpuInvoker;
++        info.mustRemainDynamicallyDispatchable = mustRemainDynamicallyDispatchable;
++        info.kind = kind;
++        TranslatedFunctionRegistry::Register(std::move(info));
++    }
++
++    // Register slots are fixed per signature, so they are computed at compile time: argument I
++    // is gpr[3 + (integer args before I)] or fpr[1 + (float args before I)]. The old running
++    // counters plus a throw/try path made clang emit one out-of-line call per argument.
++    static constexpr bool kIsFloatArg[] = {std::is_floating_point_v<std::remove_reference_t<Args>>..., false};
++
++    template <size_t I>
++    static constexpr size_t FprSlotOf() {
++        size_t n = 0;
++        for (size_t k = 0; k < I; ++k) n += kIsFloatArg[k] ? 1u : 0u;
++        return n;
++    }
++
++    template <size_t I>
++    static constexpr size_t GprSlotOf() {
++        return I - FprSlotOf<I>();
++    }
++
++    template <typename CleanT>
++    MKW_PPC_NO_INLINE static CleanT LoadStackArgument(CpuContext* cpu, size_t gprIndex) {
++        const size_t stackArgIndex = gprIndex - 8;
++        const uint32_t sp = cpu->gpr[1];
++        const uint32_t argAddr = sp + 8 + static_cast<uint32_t>(stackArgIndex * 4);
++        try {
++            return static_cast<CleanT>(Memory::Read32(argAddr));
++        } catch (const Memory::AccessViolation&) {
++            RT_LOG(RT_TAG_RUNTIME) << "Stack parameter read failed at 0x" << std::hex << argAddr
++                      << " (SP=0x" << sp << ", argIndex=" << std::dec << gprIndex << ")" << std::endl;
++            throw;
++        }
++    }
++
++    template <size_t I>
++    MKW_PPC_FORCE_INLINE static std::remove_reference_t<std::tuple_element_t<I, std::tuple<Args...>>>
++    LoadArgumentAt(CpuContext* cpu) {
++        using CleanT = std::remove_reference_t<std::tuple_element_t<I, std::tuple<Args...>>>;
++        if constexpr (std::is_floating_point_v<CleanT>) {
++            constexpr size_t fprIndex = FprSlotOf<I>();
++            if constexpr (fprIndex >= 13) {
++                throw std::out_of_range("FPR argument overflow");
++            } else {
++                return static_cast<CleanT>(cpu->fpr[1 + fprIndex].d);
++            }
++        } else {
++            constexpr size_t gprIndex = GprSlotOf<I>();
++            if constexpr (gprIndex >= 8) {
++                return LoadStackArgument<CleanT>(cpu, gprIndex);
++            } else {
++                return static_cast<CleanT>(cpu->gpr[3 + gprIndex]);
++            }
++        }
++    }
++
++    template <size_t... I>
++    MKW_PPC_FORCE_INLINE static std::tuple<Args...> BuildArgsAt(CpuContext* cpu, std::index_sequence<I...>) {
++        return std::tuple<Args...>{LoadArgumentAt<I>(cpu)...};
++    }
++
++    MKW_PPC_FORCE_INLINE static std::tuple<Args...> BuildArgs(CpuContext* cpu) {
++        return BuildArgsAt(cpu, std::index_sequence_for<Args...>{});
++    }
++
++    static void InvokeCpu(TargetFn target, CpuContext* cpu) {
++        auto args = BuildArgs(cpu);
++        if constexpr (std::is_void_v<Ret>) {
++            std::apply(target, args);
++        } else {
++            auto result = std::apply(target, args);
++            if constexpr (std::is_floating_point_v<Ret>) {
++                cpu->fpr[1].d = static_cast<double>(result);
++            } else {
++                cpu->gpr[3] = static_cast<uint32_t>(result);
++            }
++        }
++    }
++};
++
++template <auto Target>
++struct AbiRawCpuThunk {
++    static void Invoke(CpuContext* cpu) {
++        if constexpr (std::is_invocable_v<decltype(Target), CpuContext*>) {
++            (void)Target(cpu);
++        } else {
++            AbiTrampoline<std::remove_pointer_t<decltype(Target)>>::InvokeCpu(Target, cpu);
++        }
++    }
++};
++
++template <typename Ret>
++class AbiTrampoline<Ret(CpuContext*)> {
++public:
++    using TargetFn = Ret (*)(CpuContext*);
++
++    AbiTrampoline(uint32_t address,
++                  const char* name,
++                  TargetFn target,
++                  FunctionKind kind = FunctionKind::BaseTranslated,
++                  bool preservesNonvolatileFprs = false,
++                  uint32_t nonvolatileFprWriteMask = kPpcAllNonvolatileFprMask,
++                  uint32_t priority = 0,
++                  uint64_t moduleId = 0,
++                  void (*rawCpuInvoker)(CpuContext*) = nullptr,
++                  bool mustRemainDynamicallyDispatchable = true)
++    {
++        TranslatedFunctionInfo info;
++        info.address = address;
++        info.name = name ? name : "";
++        info.moduleId = moduleId;
++        info.priority = priority;
++        // Deliberately *not* mirroring the typed specialization's
++        // `|| kind == FunctionKind::Native`. A CpuContext* native receives the
++        // whole guest register file and can legitimately write f14-f31 through
++        // it, so it stays conservative until the individual address has been
++        // measured clean and its registration opts out below.
++        info.nonvolatileFprWriteMask = preservesNonvolatileFprs ? 0 : (nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
++        info.entryPoint = reinterpret_cast<void*>(target);
++        info.rawCpuInvoker = rawCpuInvoker ? rawCpuInvoker : reinterpret_cast<void (*)(CpuContext*)>(target);
++        info.mustRemainDynamicallyDispatchable = mustRemainDynamicallyDispatchable;
++        info.kind = kind;
++        TranslatedFunctionRegistry::Register(std::move(info));
++    }
++};
++
++#define MKW_DETAIL_CAT(a, b) a##b
++#define MKW_DETAIL_MAKE_UNIQUE(a, b) MKW_DETAIL_CAT(a, b)
++
++// Three hand-written registration macros. Generated code never registers per function; every
++// translated function reaches the registry via the bulk BulkTranslatedFunctionRecord tables
++// in the translator's *_registration TUs.
++#define REGISTER_TRANSLATED_FUNCTION(address, fn) \
++    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::BaseTranslated, false, kPpcAllNonvolatileFprMask, 0, 0, nullptr, KnownTranslatedCpuCall<address>::kMustRemainDynamicallyDispatchable)
++
++#define REGISTER_NATIVE_FUNCTION(address, fn) \
++    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)
++
++#define REGISTER_NATIVE_FUNCTION_AS(address, fn, pretty_name) \
++    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_named_, __COUNTER__)(address, pretty_name, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)
+diff --git a/runtime/include/guest_flat_memory.h b/runtime/include/guest_flat_memory.h
+--- a/runtime/include/guest_flat_memory.h
++++ b/runtime/include/guest_flat_memory.h
+@@ -20,7 +20,23 @@
+ // the Horizon user address space cannot host a fixed 16 TiB base. The reserved
+ // base is published here by Initialize(), mirroring the Apple iOS path. The flat
+ // fast path then loads this global instead of an immediate.
+-extern uint8_t* gFlatGuestBase;
++//
++// Every TU but the defining one sees it const (2026-10-03, perf.txt r42): as a plain mutable
++// global any guest store through `uint8_t*` may alias it, so clang reloaded it through the GOT
++// before nearly every guest access and after every call (~400k reloads in the image, one extra
++// load-pipe op per guest load/store on the single-load-pipe A57). Const lets translated code keep
++// it in a register. Initialize() writes it once before any translated code runs; code that can
++// run before that reads LiveFlatGuestBase(), which the compiler cannot fold to an earlier load.
++#if defined(MKW_FLAT_GUEST_BASE_STORAGE)
++extern uint8_t* gFlatGuestBase __attribute__((visibility("hidden")));
++#else
++extern uint8_t* const gFlatGuestBase __attribute__((visibility("hidden")));
++#endif
++inline uint8_t* LiveFlatGuestBase() {
++    uint8_t* const* slot = &gFlatGuestBase;
++    __asm__ volatile("" : "+r"(slot));
++    return *slot;
++}
+ #define MKW_FLAT_GUEST_BASE (GuestFlat::gFlatGuestBase)
+ #else
+ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'1000'0000'0000ull;
+diff --git a/runtime/include/isa/ppc_isa_config.h b/runtime/include/isa/ppc_isa_config.h
+--- a/runtime/include/isa/ppc_isa_config.h
++++ b/runtime/include/isa/ppc_isa_config.h
+@@ -1,35 +1,75 @@
+-#pragma once
+-
+-#include <atomic>
+-#include <cstdint>
+-
+-#define MKW_RESTRICT __restrict
+-#if defined(__aarch64__)
+-#include "../../third_party/sse2neon/sse2neon.h"
+-// sse2neon stops at SSE4.2; the paired-single helpers need FMA3 with a single
+-// rounding step, which NEON provides directly.
+-inline __m128 _mm_fmadd_ps(__m128 a, __m128 b, __m128 c) { return vfmaq_f32(c, a, b); }
+-inline __m128 _mm_fmsub_ps(__m128 a, __m128 b, __m128 c) { return vfmaq_f32(vnegq_f32(c), a, b); }
+-#else
+-#include <immintrin.h>
+-#endif
+-
+-inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
+-{
+-    return true;
+-}
+-
+-#if defined(_MSC_VER)
+-#define MKW_PPC_FORCE_INLINE __forceinline
+-#define MKW_PPC_NO_INLINE __declspec(noinline)
+-#define MKW_PPC_INTERNAL_CALL __regcall
+-#else
+-#define MKW_PPC_FORCE_INLINE inline __attribute__((always_inline))
+-#define MKW_PPC_NO_INLINE __attribute__((noinline))
+-#define MKW_PPC_INTERNAL_CALL
+-#endif
+-#define MKW_PPC_ALWAYS_INLINE_BODY __attribute__((always_inline))
+-#define MKW_PPC_COLD __attribute__((cold))
+-
+-
+-using MkwStateFreeResult2 = uint64_t __attribute__((ext_vector_type(2)));
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++#define MKW_RESTRICT __restrict
++#if defined(__aarch64__)
++#include "../../third_party/sse2neon/sse2neon.h"
++// sse2neon stops at SSE4.2; the paired-single helpers need FMA3 with a single
++// rounding step, which NEON provides directly.
++inline __m128 _mm_fmadd_ps(__m128 a, __m128 b, __m128 c) { return vfmaq_f32(c, a, b); }
++inline __m128 _mm_fmsub_ps(__m128 a, __m128 b, __m128 c) { return vfmaq_f32(vnegq_f32(c), a, b); }
++#else
++#include <immintrin.h>
++#endif
++
++inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
++{
++    return true;
++}
++
++#if defined(_MSC_VER)
++#define MKW_PPC_FORCE_INLINE __forceinline
++#define MKW_PPC_NO_INLINE __declspec(noinline)
++#define MKW_PPC_INTERNAL_CALL __regcall
++#else
++#define MKW_PPC_FORCE_INLINE inline __attribute__((always_inline))
++#define MKW_PPC_NO_INLINE __attribute__((noinline))
++#define MKW_PPC_INTERNAL_CALL
++#endif
++#define MKW_PPC_ALWAYS_INLINE_BODY __attribute__((always_inline))
++#define MKW_PPC_COLD __attribute__((cold))
++
++// b72 guest-code fast paths (docs/PERF-B72-2026-10-13.md). Compile-time, since they shape every
++// translated function. Switch defaults them to 0; -D<name>=1 restores the previous behavior to bisect.
++// KARTPAD_XER_SO_IN_CR: integer compares copy XER[SO] into the CR field. No translated
++//   instruction sets SO (no o-forms; only CA updates and context-restore mtxer), so the copy is
++//   always 0, but reading it kept the xer local live across every function.
++// KARTPAD_FPCC_ON_COMPARE: fcmpu/fcmpo also write FPSCR[FPCC] through the TLS context. Only
++//   mffs reads FPSCR (OS FPU context save/fill, PPCMffpscr, ReadFPSCR); no guest logic uses FPCC.
++// KARTPAD_PS_NAN_X86_PARITY: paired-single NaN lanes rewritten to x86's answer. That only keeps
++//   x86 and AArch64 builds bit-identical; NEON's own NaNs match Gekko's default NaN.
++// KARTPAD_SCALAR_FP_EXCEPTIONS: scalar fadd(s)/fsub(s)/fmul(s)/fdiv(s)/fmadd(s)/fmsub(s) send
++//   inf/NaN results and division by zero to the reference semantics, which set FPSCR exception
++//   bits. The game never enables FP exceptions and never reads those bits, and the host gives
++//   the same values (inf, default/propagated NaN), so 0 keeps every op on the inline path.
++#if defined(__SWITCH__)
++#ifndef KARTPAD_XER_SO_IN_CR
++#define KARTPAD_XER_SO_IN_CR 0
++#endif
++#ifndef KARTPAD_FPCC_ON_COMPARE
++#define KARTPAD_FPCC_ON_COMPARE 0
++#endif
++#ifndef KARTPAD_PS_NAN_X86_PARITY
++#define KARTPAD_PS_NAN_X86_PARITY 0
++#endif
++#ifndef KARTPAD_SCALAR_FP_EXCEPTIONS
++#define KARTPAD_SCALAR_FP_EXCEPTIONS 0
++#endif
++#endif
++#ifndef KARTPAD_XER_SO_IN_CR
++#define KARTPAD_XER_SO_IN_CR 1
++#endif
++#ifndef KARTPAD_FPCC_ON_COMPARE
++#define KARTPAD_FPCC_ON_COMPARE 1
++#endif
++#ifndef KARTPAD_PS_NAN_X86_PARITY
++#define KARTPAD_PS_NAN_X86_PARITY 1
++#endif
++#ifndef KARTPAD_SCALAR_FP_EXCEPTIONS
++#define KARTPAD_SCALAR_FP_EXCEPTIONS 1
++#endif
++
++
++using MkwStateFreeResult2 = uint64_t __attribute__((ext_vector_type(2)));
+diff --git a/runtime/include/isa/ppc_isa_context.h b/runtime/include/isa/ppc_isa_context.h
+--- a/runtime/include/isa/ppc_isa_context.h
++++ b/runtime/include/isa/ppc_isa_context.h
+@@ -53,7 +53,9 @@
+     uint32_t msr;       // Machine State Register
+ };
+ 
+-inline CpuContext* g_currentCpuContext = nullptr;
++// Per host thread: translated code also runs on the hosted sound thread (os_host_thread.h).
++// Constant-initialized, so every access is a plain TLS load with no wrapper call.
++inline thread_local CpuContext* g_currentCpuContext = nullptr;
+ 
+ class CpuContextScope {
+ public:
+diff --git a/runtime/include/isa/ppc_isa_cr.h b/runtime/include/isa/ppc_isa_cr.h
+--- a/runtime/include/isa/ppc_isa_cr.h
++++ b/runtime/include/isa/ppc_isa_cr.h
+@@ -3,8 +3,19 @@
+ #include <cmath>
+ #include <cstdint>
+ 
++#include "ppc_isa_config.h"
++
++// XER[SO] as the CR field's low bit; constant 0 when KARTPAD_XER_SO_IN_CR is 0 (ppc_isa_config.h).
++inline constexpr uint32_t PpcXerSoBitResident([[maybe_unused]] uint32_t xer) noexcept {
++#if KARTPAD_XER_SO_IN_CR
++    return (xer >> 31) & 1u;
++#else
++    return 0u;
++#endif
++}
++
+ inline void SetCRResident(uint32_t& cr, uint32_t xer, int field, int32_t a, int32_t b) noexcept {
+-    uint32_t value = (a < b ? 0x8u : 0u) | (a > b ? 0x4u : 0u) | (a == b ? 0x2u : 0u) | ((xer >> 31) & 1u);
++    uint32_t value = (a < b ? 0x8u : 0u) | (a > b ? 0x4u : 0u) | (a == b ? 0x2u : 0u) | PpcXerSoBitResident(xer);
+     if (field == 0) {
+         cr = (cr & 0x0FFFFFFFu) | (value << 28);
+     } else {
+@@ -13,7 +24,7 @@
+     }
+ }
+ inline void SetCRResident(uint32_t& cr, uint32_t xer, int field, uint32_t a, uint32_t b) noexcept {
+-    uint32_t value = (a < b ? 0x8u : 0u) | (a > b ? 0x4u : 0u) | (a == b ? 0x2u : 0u) | ((xer >> 31) & 1u);
++    uint32_t value = (a < b ? 0x8u : 0u) | (a > b ? 0x4u : 0u) | (a == b ? 0x2u : 0u) | PpcXerSoBitResident(xer);
+     if (field == 0) {
+         cr = (cr & 0x0FFFFFFFu) | (value << 28);
+     } else {
+diff --git a/runtime/include/isa/ppc_isa_float.h b/runtime/include/isa/ppc_isa_float.h
+--- a/runtime/include/isa/ppc_isa_float.h
++++ b/runtime/include/isa/ppc_isa_float.h
+@@ -205,6 +205,11 @@
+     const __m128d flush = _mm_cmplt_sd(magnitude, _mm_set_sd(g_mkwNiFlushThreshold));
+     const __m128d kept = _mm_andnot_pd(_mm_andnot_pd(signMask, flush), v);
+     return static_cast<float>(_mm_cvtsd_f64(kept));
++#elif defined(__aarch64__) && defined(__SWITCH__)
++    // FPCR.FZ mirrors FPSCR[NI] (MkwApplyHostNiMode), and AArch64 flushes on the exponent before
++    // rounding (FPRoundBase), so the conversion alone already is the pre-round NI flush below.
++    // A plain fcvt also lets clang narrow a single op whose inputs are singles (b72).
++    return static_cast<float>(value);
+ #elif defined(__aarch64__)
+     const float64x1_t v = vdup_n_f64(value);
+     const uint64x1_t signMask = vdup_n_u64(0x8000000000000000ULL);
+@@ -537,7 +542,13 @@
+ // one of the answers a real x86 build can give, not a guaranteed match.
+ inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
+ {
++#if KARTPAD_PS_NAN_X86_PARITY
+     return vget_lane_u64(vreinterpret_u64_u32(vmvn_u32(vceq_f32(value, value))), 0);
++#else
++    // NEON NaNs as computed (ppc_isa_config.h): no per-op lane test, no resolver call.
++    (void)value;
++    return 0;
++#endif
+ }
+ 
+ inline PpcPairVec PpcQuietPairInline(PpcPairVec value)
+@@ -569,6 +580,20 @@
+     const uint32x2_t resultNan = vmvn_u32(vceq_f32(result, result));
+     return vbsl_f32(resultNan, replacement, result);
+ }
++// The resolvers run out of line: inlined, clang if-converts the [[unlikely]] branch into an
++// unconditional select, so every paired op paid for the whole resolve (~10 NEON ops). As a
++// noinline call it stays a predicted-not-taken branch; results are bit-identical.
++[[gnu::noinline, gnu::cold]] inline PpcPairVec PpcResolveNanLanesCold(
++    PpcPairVec result, PpcPairVec op1, PpcPairVec op2)
++{
++    return PpcResolveNanLanesInline(result, op1, op2);
++}
++
++[[gnu::noinline, gnu::cold]] inline PpcPairVec PpcResolveNanLanes3Cold(
++    PpcPairVec result, PpcPairVec op1, PpcPairVec op2, PpcPairVec op3)
++{
++    return PpcResolveNanLanes3Inline(result, op1, op2, op3);
++}
+ #endif // defined(__aarch64__)
+ 
+ inline PpcPairVec PpcMulPairInline(PpcPairVec lhs, PpcPairVec rhs)
+@@ -578,7 +603,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vmul_f32(lhs, rhs);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanesInline(result, lhs, rhs);
++        return PpcResolveNanLanesCold(result, lhs, rhs);
+     return result;
+ #endif
+ }
+@@ -611,7 +636,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vfma_f32(addend, multiplicand, multiplier);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, addend);
++        return PpcResolveNanLanes3Cold(result, multiplicand, multiplier, addend);
+     return result;
+ #endif
+ }
+@@ -623,7 +648,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vfma_f32(vneg_f32(subtractor), multiplicand, multiplier);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, subtractor);
++        return PpcResolveNanLanes3Cold(result, multiplicand, multiplier, subtractor);
+     return result;
+ #endif
+ }
+@@ -774,7 +799,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vadd_f32(lhs, rhs);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanesInline(result, lhs, rhs);
++        return PpcResolveNanLanesCold(result, lhs, rhs);
+     return result;
+ #endif
+ }
+@@ -786,7 +811,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vsub_f32(lhs, rhs);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanesInline(result, lhs, rhs);
++        return PpcResolveNanLanesCold(result, lhs, rhs);
+     return result;
+ #endif
+ }
+@@ -798,7 +823,7 @@
+ #elif defined(__aarch64__)
+     const PpcPairVec result = vdiv_f32(lhs, rhs);
+     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
+-        return PpcResolveNanLanesInline(result, lhs, rhs);
++        return PpcResolveNanLanesCold(result, lhs, rhs);
+     return result;
+ #endif
+ }
+diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_isa_quantized.h
+--- a/runtime/include/isa/ppc_isa_quantized.h
++++ b/runtime/include/isa/ppc_isa_quantized.h
+@@ -300,7 +300,9 @@
+ #endif
+ }
+ 
+-inline double PpcLoadPairPsqFloatFastInline(uint32_t addr)
++// The four float psq fast paths are forced inline (b72): as plain `inline`, sample PGO left them
++// out of line at hundreds of hot psq_l/psq_st sites, each call clobbering the caller-saved FPRs.
++MKW_PPC_FORCE_INLINE double PpcLoadPairPsqFloatFastInline(uint32_t addr)
+ {
+     const uint8_t* host = PpcTryGetPsqReadableHostInline(addr);
+     if (host != nullptr) [[likely]]
+@@ -311,7 +313,7 @@
+         PpcLoadPairPsqFloatBitsPackedInline(MemoryInline::Read64Slow(addr)));
+ }
+ 
+-inline double PpcLoadSinglePsqFloatFastInline(uint32_t addr)
++MKW_PPC_FORCE_INLINE double PpcLoadSinglePsqFloatFastInline(uint32_t addr)
+ {
+     const uint32_t raw = PpcReadUnpairedPsqInline<uint32_t>(addr);
+     return PpcMakePairedResultInline(
+@@ -355,7 +357,7 @@
+         1.0f).d;
+ }
+ 
+-inline void PpcStorePairPsqFloatFastInline(uint32_t addr, double value)
++MKW_PPC_FORCE_INLINE void PpcStorePairPsqFloatFastInline(uint32_t addr, double value)
+ {
+     uint8_t* host = PpcTryGetPsqWritableHostInline(addr);
+     if (host != nullptr) [[likely]]
+@@ -485,7 +487,7 @@
+     }
+ }
+ 
+-inline void PpcStoreSinglePsqFloatFastInline(uint32_t addr, double value)
++MKW_PPC_FORCE_INLINE void PpcStoreSinglePsqFloatFastInline(uint32_t addr, double value)
+ {
+     const uint32_t first = PpcConvertToSingleFTZInline(
+         PpcBitCastToU64Inline(static_cast<double>(PpcGetPs0Inline(value))));
+@@ -620,15 +622,15 @@
+ {
+     if constexpr (sizeof(T) == 1)
+     {
+-        return static_cast<T>(MemoryInline::ReadStack8(addr));
++        return static_cast<T>(MemoryInline::FlatRead8(addr));
+     }
+     else if constexpr (sizeof(T) == 2)
+     {
+-        return static_cast<T>(MemoryInline::ReadStack16(addr));
++        return static_cast<T>(MemoryInline::FlatRead16(addr));
+     }
+     else
+     {
+-        return static_cast<T>(MemoryInline::ReadStack32(addr));
++        return static_cast<T>(MemoryInline::FlatRead32(addr));
+     }
+ }
+ 
+@@ -637,15 +639,15 @@
+ {
+     if constexpr (sizeof(T) == 1)
+     {
+-        MemoryInline::WriteStack8(addr, static_cast<uint8_t>(value));
++        MemoryInline::FlatWriteRam8(addr, static_cast<uint8_t>(value));
+     }
+     else if constexpr (sizeof(T) == 2)
+     {
+-        MemoryInline::WriteStack16(addr, static_cast<uint16_t>(value));
++        MemoryInline::FlatWriteRam16(addr, static_cast<uint16_t>(value));
+     }
+     else
+     {
+-        MemoryInline::WriteStack32(addr, static_cast<uint32_t>(value));
++        MemoryInline::FlatWriteRam32(addr, static_cast<uint32_t>(value));
+     }
+ }
+ 
+@@ -655,24 +657,24 @@
+     if constexpr (sizeof(T) == 1)
+     {
+         const uint16_t packed = (static_cast<uint16_t>(first) << 8) | static_cast<uint16_t>(second);
+-        MemoryInline::WriteStack16(addr, packed);
++        MemoryInline::FlatWriteRam16(addr, packed);
+     }
+     else if constexpr (sizeof(T) == 2)
+     {
+         const uint32_t packed = (static_cast<uint32_t>(first) << 16) | static_cast<uint32_t>(second);
+-        MemoryInline::WriteStack32(addr, packed);
++        MemoryInline::FlatWriteRam32(addr, packed);
+     }
+     else
+     {
+         const uint64_t packed = (static_cast<uint64_t>(first) << 32) | static_cast<uint64_t>(second);
+-        MemoryInline::WriteStack64(addr, packed);
++        MemoryInline::FlatStore<uint64_t>(addr, packed);
+     }
+ }
+ 
+ inline double PpcLoadPairPsqFloatStackInline(uint32_t addr)
+ {
+ #if defined(__SWITCH__)
+-    return PpcLoadPairPsqFloatFastInline(addr);
++    return PpcLoadPairPsqFloatFromHostInline(MKW_FLAT_GUEST_BASE + addr);
+ #else
+     // MemoryInline::ReadStack64's exact proof (TryGetPointerFast), then the
+     // same Memory::Read64 fallback it uses on a miss.
+@@ -694,21 +696,21 @@
+ {
+     if constexpr (sizeof(ValueType) == 1)
+     {
+-        const uint16_t packed = MemoryInline::ReadStack16(addr);
++        const uint16_t packed = MemoryInline::FlatRead16(addr);
+         return PpcMakePairedResultInline(
+             PpcDequantizePsqInline(static_cast<ValueType>(packed >> 8), scale),
+             PpcDequantizePsqInline(static_cast<ValueType>(packed), scale)).d;
+     }
+     else if constexpr (sizeof(ValueType) == 2)
+     {
+-        const uint32_t packed = MemoryInline::ReadStack32(addr);
++        const uint32_t packed = MemoryInline::FlatRead32(addr);
+         return PpcMakePairedResultInline(
+             PpcDequantizePsqInline(static_cast<ValueType>(packed >> 16), scale),
+             PpcDequantizePsqInline(static_cast<ValueType>(packed), scale)).d;
+     }
+     else
+     {
+-        const uint64_t packed = MemoryInline::ReadStack64(addr);
++        const uint64_t packed = MemoryInline::FlatLoad<uint64_t>(addr);
+         return PpcMakePairedResultInline(
+             PpcDequantizePsqInline(static_cast<ValueType>(packed >> 32), scale),
+             PpcDequantizePsqInline(static_cast<ValueType>(packed), scale)).d;
+@@ -728,7 +730,7 @@
+ inline void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
+ {
+ #if defined(__SWITCH__)
+-    PpcStorePairPsqFloatFastInline(addr, value);
++    PpcStorePairPsqFloatToHostInline(MKW_FLAT_GUEST_BASE + addr, value);
+ #else
+     // MemoryInline::WriteStack64's exact proof (WriteStackScalarFast ->
+     // TryGetPointerFast), then the same Memory::Write64 fallback on a miss.
+diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_calls.inc
+--- a/runtime/include/native_cpu_calls.inc
++++ b/runtime/include/native_cpu_calls.inc
+@@ -6,6 +6,14 @@
+ // are declared above its single mid-file include site in abi_bridge.h. It
+ // cannot compile standalone and must never be included anywhere else.
+ 
++// Natives installed with --wrap (see TranslatedEntryOverride in abi_bridge.h). The
++// model region (0x80064FD0) is reached only through InvokeDirectCpu; its own shard
++// holds 4 of its 9 call sites, which bypassed the wrapper once dispatch inlined.
++extern "C" void __wrap_func_80064FD0(CpuContext* ctx);
++template <> struct TranslatedEntryOverride<0x80064FD0u> {
++    static constexpr void (*Entry)(CpuContext*) = &__wrap_func_80064FD0;
++};
++
+ extern "C" void nw4r__lyt__detail__DrawQuad_800847c0(CpuContext* ctx);
+ extern "C" void nw4r__lyt__detail__DrawQuad_80084d20(CpuContext* ctx);
+ 
+@@ -42,10 +50,32 @@
+ extern "C" void GX__SetBlendMode_8017277c(uint32_t t, uint32_t s, uint32_t d, uint32_t op);
+ extern "C" void GX__LoadPosMtxImm_8017310c(uint32_t ma, uint32_t id);
+ extern "C" void GX__SetCurrentMtx_80173214(uint32_t id);
++extern "C" int32_t OS__DisableInterrupts_801a65ac();
++extern "C" int32_t OS__EnableInterrupts_801a65c0();
++extern "C" int32_t OS__RestoreInterrupts_801a65d4(int32_t level);
+ 
++// Leaf: the native only reads its arguments, never runs guest code or reschedules, so
++// InvokeDirectCpu skips the r14-r31 guard (see KnownTypedNativeCpuCall::kLeaf).
+ #define MKW_KNOWN_TYPED_NATIVE(addr, fn, ...) \
+ template <> struct KnownTypedNativeCpuCall<addr> { \
+     static constexpr bool kAvailable = true; \
++    static constexpr bool kLeaf = true; \
++    static void Invoke(CpuContext* cpu) { (void)cpu; fn(__VA_ARGS__); } \
++}
++
++// Leaf native returning an int in r3, exactly as AbiTrampoline::InvokeCpu stores it.
++#define MKW_KNOWN_TYPED_NATIVE_RET(addr, fn, ...) \
++template <> struct KnownTypedNativeCpuCall<addr> { \
++    static constexpr bool kAvailable = true; \
++    static constexpr bool kLeaf = true; \
++    static void Invoke(CpuContext* cpu) { cpu->gpr[3] = static_cast<uint32_t>(fn(__VA_ARGS__)); } \
++}
++
++// May wait on the frame worker, whose wait callback pumps guest alarms/retrace: keep the guard.
++#define MKW_KNOWN_TYPED_NATIVE_GUARDED(addr, fn, ...) \
++template <> struct KnownTypedNativeCpuCall<addr> { \
++    static constexpr bool kAvailable = true; \
++    static constexpr bool kLeaf = false; \
+     static void Invoke(CpuContext* cpu) { (void)cpu; fn(__VA_ARGS__); } \
+ }
+ 
+@@ -54,7 +84,7 @@
+ MKW_KNOWN_TYPED_NATIVE(0x8016DC68u, GX__SetVtxAttrFmt_8016dc68, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->gpr[7]);
+ MKW_KNOWN_TYPED_NATIVE(0x8016E37Cu, GX__SetTexCoordGen2_8016e37c, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->gpr[7], cpu->gpr[8]);
+ MKW_KNOWN_TYPED_NATIVE(0x8016E5A4u, GX__SetNumTexGens_8016e5a4, cpu->gpr[3]);
+-MKW_KNOWN_TYPED_NATIVE(0x8016EAB0u, GX__DrawDone_8016eab0);
++MKW_KNOWN_TYPED_NATIVE_GUARDED(0x8016EAB0u, GX__DrawDone_8016eab0);
+ MKW_KNOWN_TYPED_NATIVE(0x8016F0F0u, GX__Begin_8016f0f0, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]);
+ MKW_KNOWN_TYPED_NATIVE(0x8016F314u, GX__SetLineWidth_8016f314, cpu->gpr[3], cpu->gpr[4]);
+ MKW_KNOWN_TYPED_NATIVE(0x8016F348u, GX__SetPointSize_8016f348, cpu->gpr[3], cpu->gpr[4]);
+@@ -82,8 +112,13 @@
+ MKW_KNOWN_TYPED_NATIVE(0x8017277Cu, GX__SetBlendMode_8017277c, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]);
+ MKW_KNOWN_TYPED_NATIVE(0x8017310Cu, GX__LoadPosMtxImm_8017310c, cpu->gpr[3], cpu->gpr[4]);
+ MKW_KNOWN_TYPED_NATIVE(0x80173214u, GX__SetCurrentMtx_80173214, cpu->gpr[3]);
++MKW_KNOWN_TYPED_NATIVE_RET(0x801A65ACu, OS__DisableInterrupts_801a65ac);
++MKW_KNOWN_TYPED_NATIVE_RET(0x801A65C0u, OS__EnableInterrupts_801a65c0);
++MKW_KNOWN_TYPED_NATIVE_RET(0x801A65D4u, OS__RestoreInterrupts_801a65d4, static_cast<int32_t>(cpu->gpr[3]));
+ 
+ #undef MKW_KNOWN_TYPED_NATIVE
++#undef MKW_KNOWN_TYPED_NATIVE_RET
++#undef MKW_KNOWN_TYPED_NATIVE_GUARDED
+ 
+ #define MKW_KNOWN_NATIVE_CPU_CALL(addr, fn) \
+ template <> struct KnownNativeCpuCall<addr> { \
+diff --git a/runtime/include/ppc_runtime.h b/runtime/include/ppc_runtime.h
+--- a/runtime/include/ppc_runtime.h
++++ b/runtime/include/ppc_runtime.h
+@@ -12,154 +12,276 @@
+ #include "isa/ppc_isa_int.h"
+ #include "isa/ppc_isa_float.h"
+ #include "isa/ppc_isa_quantized.h"
+-#include <kartpad/semantics/ppc_semantics.h>
+-
+-// State-aware scalar FP adapters (from wiicompiled-apple-runtime.patch). The
+-// translator emits calls to these so FPSCR sticky bits, exception enables, FPRF
+-// and suppressed destination writes stay visible to the guest. Architectural
+-// rules live in KartPad's tested semantics library.
+-inline bool PpcCommitScalarFpInline(
+-    CpuContext* cpu, double& destination, kartpad::semantics::ScalarFpResult result)
+-{
+-    cpu->fpscr = result.fpscr;
+-    MkwApplyHostNiMode(cpu->fpscr);
+-    if (result.write_destination)
+-        destination = result.value;
+-    return result.write_destination;
+-}
+-
+-inline bool PpcCommitScalarFpInline(
+-    double& destination, kartpad::semantics::ScalarFpResult result)
+-{
+-    return PpcCommitScalarFpInline(CurrentCpuContext(), destination, result);
+-}
+-
+-inline uint32_t PpcCompareStateInline(bool ordered, double a, double b)
+-{
+-    if (__builtin_expect(!std::isnan(a) && !std::isnan(b), 1)) {
+-        const uint32_t cond = (a < b ? 8u : 0u) | (a > b ? 4u : 0u) | (a == b ? 2u : 0u);
+-        CpuContext* cpu = g_currentCpuContext;
+-        if (cpu) {
+-            cpu->fpscr = (cpu->fpscr & ~0x0000f000u) | (cond << 12);
+-        }
+-        return cond;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    const auto result = kartpad::semantics::EvaluatePpcFloatCompare(
+-        cpu->fpscr, a, b, ordered);
+-    cpu->fpscr = result.fpscr;
+-    return result.condition;
+-}
+-
+-inline bool PpcFaddsStateInline(double& d, double a, double b) {
+-    const double r = a + b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = static_cast<double>(static_cast<float>(r));
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Add, a, b, true));
+-}
+-inline bool PpcFsubsStateInline(double& d, double a, double b) {
+-    const double r = a - b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = static_cast<double>(static_cast<float>(r));
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Subtract, a, b, true));
+-}
+-inline bool PpcFmulsStateInline(double& d, double a, double b) {
+-    const double r = a * b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = static_cast<double>(static_cast<float>(r));
+-        return true;
+-    }
+-    const double b25 = kartpad::semantics::Force25Bit(b);
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Multiply, a, b25, true));
+-}
+-inline bool PpcFdivsStateInline(double& d, double a, double b) {
+-    if (__builtin_expect(b != 0.0, 1)) {
+-        const double r = a / b;
+-        if (__builtin_expect(std::isfinite(r), 1)) {
+-            d = static_cast<double>(static_cast<float>(r));
+-            return true;
+-        }
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Divide, a, b, true));
+-}
+-inline bool PpcFaddStateInline(double& d, double a, double b) {
+-    const double r = a + b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = r;
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Add, a, b, false));
+-}
+-inline bool PpcFsubStateInline(double& d, double a, double b) {
+-    const double r = a - b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = r;
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Subtract, a, b, false));
+-}
+-inline bool PpcFmulStateInline(double& d, double a, double b) {
+-    const double r = a * b;
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = r;
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Multiply, a, b, false));
+-}
+-inline bool PpcFdivStateInline(double& d, double a, double b) {
+-    if (__builtin_expect(b != 0.0, 1)) {
+-        const double r = a / b;
+-        if (__builtin_expect(std::isfinite(r), 1)) {
+-            d = r;
+-            return true;
+-        }
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Divide, a, b, false));
+-}
+-inline bool PpcFctiwzStateInline(double& d, double value) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcConvertToInteger(cpu->fpscr, value, FE_TOWARDZERO)); }
+-inline bool PpcFmaddsStateInline(double& d, double a, double c, double b) {
+-    const double r = std::fma(a, c, b);
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = static_cast<double>(static_cast<float>(r));
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, false, true, false));
+-}
+-inline bool PpcFmsubsStateInline(double& d, double a, double c, double b) {
+-    const double r = std::fma(a, c, -b);
+-    if (__builtin_expect(std::isfinite(r), 1)) {
+-        d = static_cast<double>(static_cast<float>(r));
+-        return true;
+-    }
+-    CpuContext* cpu = CurrentCpuContext();
+-    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, true, false));
+-}
+-inline bool PpcFnmsubStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, false, true)); }
+-inline bool PpcFnmsubsStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, true, true)); }
+-inline bool PpcFrsqrteStateInline(double& d, double value) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcEstimate(cpu->fpscr, value, true)); }
+-
+-inline double PpcFresValueStateInline(double current, double value)
+-{
+-    CpuContext* cpu = CurrentCpuContext();
+-    const auto result = kartpad::semantics::EvaluatePpcEstimate(
+-        cpu->fpscr, value, false);
+-    cpu->fpscr = result.fpscr;
+-    MkwApplyHostNiMode(cpu->fpscr);
+-    if (!result.write_destination)
+-        return current;
+-    const float lane = static_cast<float>(result.value);
+-    return PpcPackPairedInline(lane, lane);
+-}
++#include <kartpad/semantics/ppc_semantics.h>
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++#include "scalar_fp_cold.h"
++#endif
++
++// State-aware scalar FP adapters (from wiicompiled-apple-runtime.patch). The
++// translator emits calls to these so FPSCR sticky bits, exception enables, FPRF
++// and suppressed destination writes stay visible to the guest. Architectural
++// rules live in KartPad's tested semantics library.
++inline bool PpcCommitScalarFpInline(
++    CpuContext* cpu, double& destination, kartpad::semantics::ScalarFpResult result)
++{
++    cpu->fpscr = result.fpscr;
++    MkwApplyHostNiMode(cpu->fpscr);
++    if (result.write_destination)
++        destination = result.value;
++    return result.write_destination;
++}
++
++inline bool PpcCommitScalarFpInline(
++    double& destination, kartpad::semantics::ScalarFpResult result)
++{
++    return PpcCommitScalarFpInline(CurrentCpuContext(), destination, result);
++}
++
++// For ops that always use the reference semantics (fnmsub(s), frsqrte, fres): the exact value,
++// and the FPSCR update only when KARTPAD_SCALAR_FP_EXCEPTIONS keeps exception state (b72).
++inline bool PpcCommitScalarFpValueInline(
++    CpuContext* cpu, double& destination, kartpad::semantics::ScalarFpResult result)
++{
++#if KARTPAD_SCALAR_FP_EXCEPTIONS
++    return PpcCommitScalarFpInline(cpu, destination, result);
++#else
++    (void)cpu;
++    if (result.write_destination)
++        destination = result.value;
++    return result.write_destination;
++#endif
++}
++
++inline uint32_t PpcCompareStateInline(bool ordered, double a, double b)
++{
++#if !KARTPAD_SCALAR_FP_EXCEPTIONS && !KARTPAD_FPCC_ON_COMPARE
++    // No FPSCR side effects to keep (ppc_isa_config.h): unordered is just FU, no slow-path call.
++    (void)ordered;
++    return (a < b ? 8u : 0u) | (a > b ? 4u : 0u) | (a == b ? 2u : 0u) |
++           (std::isunordered(a, b) ? 1u : 0u);
++#else
++    if (__builtin_expect(!std::isnan(a) && !std::isnan(b), 1)) {
++        const uint32_t cond = (a < b ? 8u : 0u) | (a > b ? 4u : 0u) | (a == b ? 2u : 0u);
++#if KARTPAD_FPCC_ON_COMPARE
++        CpuContext* cpu = g_currentCpuContext;
++        if (cpu) {
++            cpu->fpscr = (cpu->fpscr & ~0x0000f000u) | (cond << 12);
++        }
++#endif
++        return cond;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Compare(ordered, a, b);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    const auto result = kartpad::semantics::EvaluatePpcFloatCompare(
++        cpu->fpscr, a, b, ordered);
++    cpu->fpscr = result.fpscr;
++    return result.condition;
++#endif
++#endif
++}
++
++inline void PpcCompareCrStateInline(
++    uint32_t& cr, unsigned field, bool ordered, double a, double b)
++{
++    // FPCC and the selected CR field use the same PowerPC condition nibble.
++    // Evaluate once, preserving the original ordered/NaN FPSCR semantics.
++    const uint32_t condition = PpcCompareStateInline(ordered, a, b);
++    const unsigned shift = (7u - field) * 4u;
++    cr = (cr & ~(0xfu << shift)) | (condition << shift);
++}
++
++// Single-precision fast paths round first and test the single (b72). The double op's only use is
++// then its conversion, so clang narrows fptrunc(op(fpext x, fpext y)) to the native single op
++// whenever both inputs are visibly singles (exact for + - * /, Figueroa's double-rounding bound):
++// chains of single ops stay in S registers instead of paying fcvt s,d + fcvt d,s per op. A finite
++// double that overflows the single now takes the slow path, which also sets FPSCR[OX].
++inline bool PpcFaddsStateInline(double& d, double a, double b) {
++    const float r = static_cast<float>(a + b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = static_cast<double>(r);
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Add, true, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Add, a, b, true));
++#endif
++}
++inline bool PpcFsubsStateInline(double& d, double a, double b) {
++    const float r = static_cast<float>(a - b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = static_cast<double>(r);
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Subtract, true, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Subtract, a, b, true));
++#endif
++}
++inline bool PpcFmulsStateInline(double& d, double a, double b) {
++    const float r = static_cast<float>(a * b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = static_cast<double>(r);
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Multiply, true, true);
++#else
++    const double b25 = kartpad::semantics::Force25Bit(b);
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Multiply, a, b25, true));
++#endif
++}
++inline bool PpcFdivsStateInline(double& d, double a, double b) {
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || b != 0.0, 1)) {
++        const float r = static_cast<float>(a / b);
++        if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++            d = static_cast<double>(r);
++            return true;
++        }
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Divide, true, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Divide, a, b, true));
++#endif
++}
++inline bool PpcFaddStateInline(double& d, double a, double b) {
++    const double r = a + b;
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = r;
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Add, false, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Add, a, b, false));
++#endif
++}
++inline bool PpcFsubStateInline(double& d, double a, double b) {
++    const double r = a - b;
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = r;
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Subtract, false, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Subtract, a, b, false));
++#endif
++}
++inline bool PpcFmulStateInline(double& d, double a, double b) {
++    const double r = a * b;
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = r;
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Multiply, false, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Multiply, a, b, false));
++#endif
++}
++inline bool PpcFdivStateInline(double& d, double a, double b) {
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || b != 0.0, 1)) {
++        const double r = a / b;
++        if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++            d = r;
++            return true;
++        }
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Binary(d, a, b, kartpad::semantics::ScalarFpBinaryOperation::Divide, false, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcScalarBinary(cpu->fpscr, kartpad::semantics::ScalarFpBinaryOperation::Divide, a, b, false));
++#endif
++}
++inline bool PpcFctiwzStateInline(double& d, double value) {
++#if !KARTPAD_SCALAR_FP_EXCEPTIONS
++    // Out of range saturates and NaN gives 0x80000000: the reference's word, without the
++    // FPSCR[VXCVI/VXSNAN/FR/FI/XX] updates nothing in the game reads (ppc_isa_config.h).
++    const uint32_t word = std::isnan(value) ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(
++        std::fmin(std::fmax(value, -2147483648.0), 2147483647.0)));
++#else
++    if (!(std::fabs(value) < 2147483648.0)) [[unlikely]] {
++        CpuContext* cpu = CurrentCpuContext();
++        return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcConvertToInteger(cpu->fpscr, value, FE_TOWARDZERO));
++    }
++    // In range: the truncation, same bits as EvaluatePpcConvertToInteger. Like the arithmetic
++    // fast paths, FPSCR[FR/FI/XX] are not updated (b72).
++    const uint32_t word = static_cast<uint32_t>(static_cast<int32_t>(value));
++#endif
++    uint64_t bits = 0xfff8000000000000ULL | word;
++    if (word == 0 && std::signbit(value))
++        bits |= 0x0000000100000000ULL;
++    d = PpcBitCastToDoubleInline(bits);
++    return true;
++}
++inline bool PpcFmaddsStateInline(double& d, double a, double c, double b) {
++    const double r = std::fma(a, c, b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = static_cast<double>(static_cast<float>(r));
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Fused(d, a, c, b, false, true, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, false, true, false));
++#endif
++}
++inline bool PpcFmsubsStateInline(double& d, double a, double c, double b) {
++    const double r = std::fma(a, c, -b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = static_cast<double>(static_cast<float>(r));
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Fused(d, a, c, b, true, true, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, true, false));
++#endif
++}
++// Double-precision fmadd (first emitted for Retro Rewind 6.13.3's module).
++inline bool PpcFmaddStateInline(double& d, double a, double c, double b) {
++    const double r = std::fma(a, c, b);
++    if (__builtin_expect(!KARTPAD_SCALAR_FP_EXCEPTIONS || std::isfinite(r), 1)) {
++        d = r;
++        return true;
++    }
++#if defined(__SWITCH__) && defined(KARTPAD_OUTLINE_SCALAR_FP)
++    return KartPadSwitchFp::Fused(d, a, c, b, false, false, false);
++#else
++    CpuContext* cpu = CurrentCpuContext();
++    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, false, false, false));
++#endif
++}
++inline bool PpcFnmsubStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, false, true)); }
++inline bool PpcFnmsubsStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, true, true)); }
++inline bool PpcFrsqrteStateInline(double& d, double value) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcEstimate(cpu->fpscr, value, true)); }
++
++inline double PpcFresValueStateInline(double current, double value)
++{
++    CpuContext* cpu = CurrentCpuContext();
++    const auto result = kartpad::semantics::EvaluatePpcEstimate(
++        cpu->fpscr, value, false);
++#if KARTPAD_SCALAR_FP_EXCEPTIONS
++    cpu->fpscr = result.fpscr;
++    MkwApplyHostNiMode(cpu->fpscr);
++#endif
++    if (!result.write_destination)
++        return current;
++    const float lane = static_cast<float>(result.value);
++    return PpcPackPairedInline(lane, lane);
++}
+diff --git a/runtime/include/recomp_mod_loader.h b/runtime/include/recomp_mod_loader.h
+--- a/runtime/include/recomp_mod_loader.h
++++ b/runtime/include/recomp_mod_loader.h
+@@ -43,13 +43,20 @@
+         // stays visible, and the unconditional restore below keeps nesting exact.
+         if (address != 0) {
+             g_currentTranslatedExecutionAddress = address;
++#if !defined(__SWITCH__)
+             g_publishedGuestPc = address;
++#endif
+         }
+     }
+ 
++    // The Switch PC sampler reads the guest thread's PC (svcGetThreadContext3), never this global.
++    // With the sound thread on its own core (b70) both cores dispatch here, and the global's line
++    // (shared with dispatch-memo entries) would bounce between them.
+     ~ScopedTranslatedExecutionAddress() noexcept {
+         g_currentTranslatedExecutionAddress = previous_;
++#if !defined(__SWITCH__)
+         g_publishedGuestPc = previous_;
++#endif
+     }
+ 
+     ScopedTranslatedExecutionAddress(const ScopedTranslatedExecutionAddress&) = delete;

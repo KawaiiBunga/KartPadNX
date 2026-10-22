@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "versions": {
+    "6.13.3": {
+      "url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.3.zip",
+      "size": 41254934,
+      "sha256": "e1a2f2a77d9f5f567fa71d636683afd8c808b7778a787d5bb02111f82b1777f5",
+      "code_pul_sha256": "58f4ac46afdeda4d57aacab361b381ccd95f08c3dbb2779e6e5760b48b1df036",
+      "code_from": "6.13.3",
+      "approved_utc": "2026-10-21T10:22:16Z"
+    },
+    "6.13.4": {
+      "url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.4.zip",
+      "size": 776946,
+      "sha256": "59e69024ee163dddf96220c31d53f959ed9bf400c896e579d17c7e0066c20950",
+      "code_pul_sha256": "11f70007b093d5490ad6ad85868eff4d62b6d80f6ff321cd0c9dec2c59e1b640",
+      "code_from": "6.13.4",
+      "approved_utc": "2026-10-21T10:22:17Z"
+    }
+  },
+  "latest": "6.13.4"
+}

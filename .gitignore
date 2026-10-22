@@ -1,0 +1,54 @@
+# Your game dump and everything derived from it: never commit
+/iso/
+/private/
+*.wbfs
+*.iso
+*.wia
+*.rvz
+*.wad
+*.dol
+*.szs
+*.arc
+*.brres
+*.brstm
+*.thp
+common-key.bin
+common_key.bin
+
+# Build trees and outputs (rebuilt by builder/ and aio/)
+/build/
+/dist/
+/aio/out/
+*.nro
+*.nso
+*.elf
+*.nacp
+*.map
+
+# Upstream checkouts from builder/fetch-deps.sh. The KartPad subset this port uses is
+# kept in the repo.
+/ref/*
+!/ref/kartpad-main/
+
+# SD-card state written by host runs of the launcher/runtime
+/switch/kartpad/
+/switch/mkw-launcher/
+/switch/src/native_model_region.cpp
+/switch/src/native_model_region.json
+
+# Host test leftovers
+/launcher/tests/*.o
+/launcher/tests/*_test
+/launcher/tests/sdmc*/
+/launcher/tests/test_romfs/
+/launcher/tests/test_sdmc/
+
+# Builder settings and logs next to a local exe
+KartPadNX-Builder.settings
+*.log
+
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+desktop.ini

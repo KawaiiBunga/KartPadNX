@@ -1,0 +1,169 @@
+diff --git a/runtime/src/hle/input/kpad.cpp b/runtime/src/hle/input/kpad.cpp
+--- a/runtime/src/hle/input/kpad.cpp
++++ b/runtime/src/hle/input/kpad.cpp
+@@ -1,7 +1,10 @@
+ #include "hle_stubs.h"
+ #include "memory.h"
+-#if defined(__SWITCH__)
++// The Classic Controller host (kartpad_mobile_runtime_host.h) is the Switch shim, or the Windows
++// pipeline-harvest build's scripted driver (builder/pc-harvest, KARTPAD_CLASSIC_INPUT_HOST).
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
+ #include "kartpad_mobile_runtime_host.h"
++#include <dolphin/pad.h>
+ #endif
+ 
+ #include <algorithm>
+@@ -12,7 +15,7 @@
+ 
+ namespace {
+ 
+-#if defined(__SWITCH__)
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
+ // RVL SDK layouts, expressed as guest-byte offsets.  A Switch pad is presented
+ // as a Classic Controller so Mario Kart uses its native KPAD control path.
+ constexpr uint32_t kKpadStatusSize = 0x84;
+@@ -43,7 +46,15 @@
+ }
+ 
+ bool ReadInput(uint32_t channel, KartPadMobileClassicInputSnapshot& input) {
+-    return KartPadMobileReadClassicInputForPlayer(channel, &input) && input.connected != 0;
++    if (!KartPadMobileReadClassicInputForPlayer(channel, &input) || input.connected == 0) return false;
++    // While the port menu is open the game sees a connected controller with nothing pressed, so
++    // menu navigation does not also drive the game (and no "controller disconnected" prompt shows).
++    if (PADIsInputBlocked()) {
++        input.buttons = 0;
++        input.leftStickX = 0.0f;
++        input.leftStickY = 0.0f;
++    }
++    return true;
+ }
+ 
+ int32_t WriteKpadStatus(uint32_t channel, uint32_t address, const KartPadMobileClassicInputSnapshot* input) {
+@@ -91,10 +102,10 @@
+ #endif
+ 
+ } // namespace
+-
++
+ extern "C" int32_t KPAD__Read_HLE(uint32_t chan, uint32_t statusPtr, uint32_t count)
+ {
+-#if defined(__SWITCH__)
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
+     if (chan >= g_channels.size() || statusPtr == 0 || count == 0) return 0;
+     KartPadMobileClassicInputSnapshot input{};
+     try {
+@@ -103,18 +114,18 @@
+         return 0;
+     }
+ #else
+-    (void)chan;
+-    (void)statusPtr;
+-    (void)count;
++    (void)chan;
++    (void)statusPtr;
++    (void)count;
+     return 0;
+ #endif
+-}
+-PPC_NATIVE_OVERRIDE(80197380, KPAD__Read_HLE, int32_t, (uint32_t chan, uint32_t statusPtr, uint32_t count),
+-         (chan, statusPtr, count));
+-
+-extern "C" int32_t KPAD__GetUnifiedWpadStatus_HLE(uint32_t chan, uint32_t statusPtr, uint32_t count)
++}
++PPC_NATIVE_OVERRIDE(80197380, KPAD__Read_HLE, int32_t, (uint32_t chan, uint32_t statusPtr, uint32_t count),
++         (chan, statusPtr, count));
++
++extern "C" int32_t KPAD__GetUnifiedWpadStatus_HLE(uint32_t chan, uint32_t statusPtr, uint32_t count)
+ {
+-#if defined(__SWITCH__)
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
+     if (chan >= g_channels.size() || statusPtr == 0 || count == 0) return 0;
+     KartPadMobileClassicInputSnapshot input{};
+     const bool connected = ReadInput(chan, input);
+@@ -127,11 +138,11 @@
+     }
+     return connected ? 1 : 0;
+ #else
+-    (void)chan;
+-    (void)statusPtr;
+-    (void)count;
++    (void)chan;
++    (void)statusPtr;
++    (void)count;
+     return 0;
+ #endif
+-}
+-PPC_NATIVE_OVERRIDE(8019812C, KPAD__GetUnifiedWpadStatus_HLE, int32_t,
+-         (uint32_t chan, uint32_t statusPtr, uint32_t count), (chan, statusPtr, count));
++}
++PPC_NATIVE_OVERRIDE(8019812C, KPAD__GetUnifiedWpadStatus_HLE, int32_t,
++         (uint32_t chan, uint32_t statusPtr, uint32_t count), (chan, statusPtr, count));
+diff --git a/runtime/src/hle/input/wpad.cpp b/runtime/src/hle/input/wpad.cpp
+--- a/runtime/src/hle/input/wpad.cpp
++++ b/runtime/src/hle/input/wpad.cpp
+@@ -1,9 +1,11 @@
+ #include "hle_stubs.h"
+ #include "memory.h"
+-#include "hle/controller_status_contract.h"
+-#if defined(__SWITCH__)
+-#include "kartpad_mobile_runtime_host.h"
+-#endif
++#include "hle/controller_status_contract.h"
++// The Classic Controller host (kartpad_mobile_runtime_host.h) is the Switch shim, or the Windows
++// pipeline-harvest build's scripted driver (builder/pc-harvest, KARTPAD_CLASSIC_INPUT_HOST).
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
++#include "kartpad_mobile_runtime_host.h"
++#endif
+ 
+ #include <cstdint>
+ 
+@@ -107,19 +109,19 @@
+ }
+ PPC_NATIVE_OVERRIDE(801C0B9C, WPADSetDataFormat_HLE, int32_t, (uint32_t chan, int32_t format), (chan, format));
+ 
+-extern "C" int32_t WPADProbe_HLE(uint32_t chan, uint32_t typePtr)
++extern "C" int32_t WPADProbe_HLE(uint32_t chan, uint32_t typePtr)
+ {
+     if (chan >= WpadContract::kChannelCount) {
+         return WpadContract::kErrorBadChannel;
+     }
+ 
+-#if defined(__SWITCH__)
+-    if (KartPadMobileIsControllerConnected(chan)) {
+-        if (typePtr != 0) Memory::Write32(typePtr, 2); // WPAD_DEV_CLASSIC
+-        return kStatusOk;
+-    }
+-#endif
+-    if (typePtr != 0) {
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
++    if (KartPadMobileIsControllerConnected(chan)) {
++        if (typePtr != 0) Memory::Write32(typePtr, 2); // WPAD_DEV_CLASSIC
++        return kStatusOk;
++    }
++#endif
++    if (typePtr != 0) {
+         Memory::Write32(typePtr, WpadContract::kExtensionCore);
+     }
+     return WpadContract::kErrorNoController;
+@@ -133,16 +135,16 @@
+ }
+ PPC_NATIVE_OVERRIDE(801C0EC4, WPADControlMotor_HLE, void, (uint32_t chan, uint32_t command), (chan, command));
+ 
+-extern "C" int32_t WPADGetInfoAsync_HLE(uint32_t chan, uint32_t infoPtr, uint32_t callback)
++extern "C" int32_t WPADGetInfoAsync_HLE(uint32_t chan, uint32_t infoPtr, uint32_t callback)
+ {
+     if (chan >= WpadContract::kChannelCount) {
+         return CompleteWpadRequest(chan, callback, WpadContract::kErrorBadChannel);
+     }
+ 
+-    (void)infoPtr;
+-#if defined(__SWITCH__)
+-    if (KartPadMobileIsControllerConnected(chan)) return CompleteWpadRequest(chan, callback, kStatusOk);
+-#endif
++    (void)infoPtr;
++#if defined(__SWITCH__) || defined(KARTPAD_CLASSIC_INPUT_HOST)
++    if (KartPadMobileIsControllerConnected(chan)) return CompleteWpadRequest(chan, callback, kStatusOk);
++#endif
+     return CompleteWpadRequest(chan, callback, WpadContract::kErrorNoController);
+ }
+ PPC_NATIVE_OVERRIDE(801C0CA4, WPADGetInfoAsync_HLE, int32_t,

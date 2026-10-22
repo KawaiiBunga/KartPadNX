@@ -1,0 +1,150 @@
+--- a/src/audio/switch/SDL_switchaudio.c
++++ b/src/audio/switch/SDL_switchaudio.c
+@@ -34,6 +34,11 @@
+ #define SWITCH_AUDIO_ALIGN 0x1000
+ #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((u64)(a) - 1))
+ 
++// KartPad-NX modification: keep both buffers in flight so SDL can mix the
++// replacement while AUDOUT plays the other. The old wait emptied the queue
++// after every buffer. Track released pointers rather than assuming pool order.
++extern int kartpad_opt(const char *, int) __attribute__((weak));
++
+ static bool SWITCHAUDIO_OpenDevice(SDL_AudioDevice *device)
+ {
+     bool audout_inited = false;
+@@ -79,33 +84,25 @@
+         device->hidden->buffers[i].data_offset = 0;
+     }
+ 
+-    device->hidden->mixbuf = (Uint8 *)SDL_malloc(device->buffer_size);
+-    if (!device->hidden->mixbuf) {
+-        goto failed;
+-    }
+-    SDL_memset(device->hidden->mixbuf, device->silence_value, device->buffer_size);
++    device->hidden->queue_depth = (!kartpad_opt || kartpad_opt("audio_double_buffer", 1)) ? 2 : 1;
+     device->hidden->next = 0;
+ 
+     return true;
+ 
+ failed:
+     // Unwind any partial initialization so the device can be reopened cleanly.
++    if (audout_started) {
++        audoutStopAudioOut();
++    }
++    if (audout_inited) {
++        audoutExit();
++    }
+     for (i = 0; i < NUM_AUDIO_BUFFERS; i++) {
+         if (device->hidden->buffers[i].buffer) {
+             free(device->hidden->buffers[i].buffer); // memalign() pairs with free()
+             device->hidden->buffers[i].buffer = NULL;
+         }
+     }
+-    if (device->hidden->mixbuf) {
+-        SDL_free(device->hidden->mixbuf);
+-        device->hidden->mixbuf = NULL;
+-    }
+-    if (audout_started) {
+-        audoutStopAudioOut();
+-    }
+-    if (audout_inited) {
+-        audoutExit();
+-    }
+     SDL_free(device->hidden);
+     device->hidden = NULL;
+     return false;
+@@ -114,30 +111,57 @@
+ static Uint8 *SWITCHAUDIO_GetDeviceBuf(SDL_AudioDevice *device, int *buffer_size)
+ {
+     (void)buffer_size;
+-    return device->hidden->mixbuf;
++    // Mix directly into the free aligned pool slot, avoiding a PCM memcpy.
++    return (Uint8 *)device->hidden->buffers[device->hidden->next].buffer;
+ }
+ 
+ static bool SWITCHAUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int buflen)
+ {
+-    AudioOutBuffer *b = &device->hidden->buffers[device->hidden->next];
+-
+-    SDL_memcpy(b->buffer, buffer, buflen);
++    struct SDL_PrivateAudioData *hidden = device->hidden;
++    AudioOutBuffer *b = &hidden->buffers[hidden->next];
++
++    if (hidden->in_flight[hidden->next] || buflen <= 0 || buflen > device->buffer_size) {
++        return SDL_SetError("Invalid or busy AUDOUT buffer");
++    }
++    if (buffer != b->buffer) {
++        SDL_memcpy(b->buffer, buffer, buflen);
++    }
+     b->data_size = (u64)buflen;
+-    device->hidden->next = (device->hidden->next + 1) % NUM_AUDIO_BUFFERS;
+ 
+     if (R_FAILED(audoutAppendAudioOutBuffer(b))) {
+         return SDL_SetError("audoutAppendAudioOutBuffer() failed");
+     }
++    hidden->in_flight[hidden->next] = true;
++    ++hidden->queued;
++    hidden->next = (hidden->next + 1) % NUM_AUDIO_BUFFERS;
+     return true;
+ }
+ 
+ static bool SWITCHAUDIO_WaitDevice(SDL_AudioDevice *device)
+ {
+-    AudioOutBuffer *released = NULL;
+-    u32 released_count = 0;
+-    (void)device;
+-    if (R_FAILED(audoutWaitPlayFinish(&released, &released_count, UINT64_MAX))) {
+-        return SDL_SetError("audoutWaitPlayFinish() failed");
++    struct SDL_PrivateAudioData *hidden = device->hidden;
++    // Skip the first wait to prime two buffers. Thereafter free exactly the
++    // pointer returned by libnx; a successful wait can still return no buffer.
++    while (hidden->queued >= hidden->queue_depth) {
++        AudioOutBuffer *released = NULL;
++        u32 released_count = 0;
++        if (R_FAILED(audoutWaitPlayFinish(&released, &released_count, UINT64_MAX))) {
++            return SDL_SetError("audoutWaitPlayFinish() failed");
++        }
++        if (released_count == 0) {
++            continue;
++        }
++        // libnx requests one pointer per GetReleasedAudioOutBuffer IPC.
++        int slot;
++        for (slot = 0; slot < NUM_AUDIO_BUFFERS; ++slot) {
++            if (released == &hidden->buffers[slot]) break;
++        }
++        if (released_count != 1 || slot == NUM_AUDIO_BUFFERS || !hidden->in_flight[slot]) {
++            return SDL_SetError("Unexpected released AUDOUT buffer");
++        }
++        hidden->in_flight[slot] = false;
++        --hidden->queued;
++        hidden->next = slot;
+     }
+     return true;
+ }
+@@ -156,10 +180,6 @@
+             free(device->hidden->buffers[i].buffer); // memalign() pairs with free()
+             device->hidden->buffers[i].buffer = NULL;
+         }
+-    }
+-    if (device->hidden->mixbuf) {
+-        SDL_free(device->hidden->mixbuf);
+-        device->hidden->mixbuf = NULL;
+     }
+     SDL_free(device->hidden);
+     device->hidden = NULL;
+--- a/src/audio/switch/SDL_switchaudio.h
++++ b/src/audio/switch/SDL_switchaudio.h
+@@ -30,9 +30,11 @@
+ 
+ struct SDL_PrivateAudioData
+ {
+-    Uint8 *mixbuf;                            // buffer SDL fills each iteration
+     AudioOutBuffer buffers[NUM_AUDIO_BUFFERS]; // libnx AUDOUT buffer pool
+-    int next;                                  // next pool slot to submit
++    bool in_flight[NUM_AUDIO_BUFFERS];          // only a released slot may be filled again
++    int queued;                                // buffers still owned by AUDOUT
++    int queue_depth;                           // 2 normally, 1 for an A/B test
++    int next;                                  // free pool slot SDL fills next
+ };
+ 
+ #endif // SDL_switchaudio_h_

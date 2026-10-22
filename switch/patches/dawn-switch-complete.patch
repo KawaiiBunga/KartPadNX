@@ -1,0 +1,336 @@
+diff --git a/src/dawn/common/DynamicLib.cpp b/src/dawn/common/DynamicLib.cpp
+index d155e490d..ccd6de46d 100644
+--- a/src/dawn/common/DynamicLib.cpp
++++ b/src/dawn/common/DynamicLib.cpp
+@@ -38,7 +38,19 @@
+ #include "src/dawn/common/WindowsUtils.h"
+ #endif
+ #elif DAWN_PLATFORM_IS(POSIX)
++#if DAWN_PLATFORM_IS(SWITCH)
++// Horizon/libnx has no dynamic loader. Vulkan (NVK) is linked statically and the
++// Switch code path never calls DynamicLib, but this TU must still compile — supply
++// always-failing dl* stubs instead of <dlfcn.h>.
++#define RTLD_NOW 0
++#define RTLD_NOLOAD 0
++inline void* dlopen(const char*, int) { return nullptr; }
++inline int dlclose(void*) { return 0; }
++inline void* dlsym(void*, const char*) { return nullptr; }
++inline const char* dlerror() { return "no dynamic loader on Horizon"; }
++#else
+ #include <dlfcn.h>
++#endif
+ #else
+ #error "Unsupported platform for DynamicLib"
+ #endif
+diff --git a/src/dawn/common/SystemUtils.cpp b/src/dawn/common/SystemUtils.cpp
+index 8f90fd328..832c2c07d 100644
+--- a/src/dawn/common/SystemUtils.cpp
++++ b/src/dawn/common/SystemUtils.cpp
+@@ -149,8 +149,10 @@ std::optional<std::string> GetExecutablePath() {
+     // UNIMPLEMENTED
+     return {};
+ }
+-#elif DAWN_PLATFORM_IS(EMSCRIPTEN)
++#elif DAWN_PLATFORM_IS(EMSCRIPTEN) || DAWN_PLATFORM_IS(SWITCH)
+ std::optional<std::string> GetExecutablePath() {
++    // Horizon: no process exec path; only used for validation-layer discovery we
++    // don't ship.
+     return {};
+ }
+ #else
+@@ -203,7 +205,7 @@ std::optional<std::string> GetModulePath() {
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
+-#elif DAWN_PLATFORM_IS(EMSCRIPTEN)
++#elif DAWN_PLATFORM_IS(EMSCRIPTEN) || DAWN_PLATFORM_IS(SWITCH)
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
+diff --git a/src/dawn/common/vulkan_platform.h b/src/dawn/common/vulkan_platform.h
+index dbab8fadd..98693f7fe 100644
+--- a/src/dawn/common/vulkan_platform.h
++++ b/src/dawn/common/vulkan_platform.h
+@@ -188,6 +188,9 @@ const HandleType* AsVkArray(const detail::VkHandle<Tag, HandleType>* handle) {
+ 
+ // The actual inclusion of vulkan.h!
+ #define VK_NO_PROTOTYPES
++#if DAWN_PLATFORM_IS(SWITCH)
++#define VK_USE_PLATFORM_VI_NN
++#endif
+ #include <vulkan/vulkan.h>
+ 
+ // Redefine VK_NULL_HANDLE for better type safety where possible.
+diff --git a/src/dawn/dawn.json b/src/dawn/dawn.json
+index c483e46fb..6480781ce 100644
+--- a/src/dawn/dawn.json
++++ b/src/dawn/dawn.json
+@@ -3996,6 +3996,13 @@
+             {"name": "label", "type": "string view", "optional": true}
+         ]
+     },
++    "surface source switch native window": {
++        "category": "structure",
++        "chained": "in",
++        "chain roots": ["surface descriptor"],
++        "tags": ["dawn", "native"],
++        "members": [{"name": "window", "type": "void *"}]
++    },
+     "surface source android native window": {
+         "category": "structure",
+         "chained": "in",
+@@ -4147,6 +4154,7 @@
+ 
+             {"value": 0, "name": "emscripten surface source canvas HTML selector", "tags": ["emscripten"]},
+ 
++            {"value": 32760, "name": "surface source switch native window", "tags": ["dawn", "native"]},
+             {"value": 0, "name": "surface descriptor from windows core window", "tags": ["dawn"]},
+             {"value": 3, "name": "surface descriptor from windows UWP swap chain panel", "tags": ["dawn"]},
+             {"value": 4, "name": "dawn texture internal usage descriptor", "tags": ["dawn"]},
+diff --git a/src/dawn/native/Surface.cpp b/src/dawn/native/Surface.cpp
+index 1abcaa14e..1e3ea5ec3 100644
+--- a/src/dawn/native/Surface.cpp
++++ b/src/dawn/native/Surface.cpp
+@@ -61,6 +61,9 @@ absl::FormatConvertResult<absl::FormatConversionCharSet::kString> AbslFormatConv
+     const absl::FormatConversionSpec& spec,
+     absl::FormatSink* s) {
+     switch (value) {
++        case Surface::Type::SwitchWindow:
++            s->Append("SwitchWindow");
++            break;
+         case Surface::Type::AndroidWindow:
+             s->Append("AndroidWindow");
+             break;
+@@ -112,12 +115,19 @@ ResultOrError<UnpackedPtr<SurfaceDescriptor>> ValidateSurfaceDescriptor(
+     wgpu::SType type;
+     DAWN_TRY_ASSIGN(
+         type, (descriptor.ValidateBranches<
+-                  Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
++                  Branch<SurfaceSourceSwitchNativeWindow>, Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
+                   Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                   Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
+                   Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
+                   Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>>()));
+     switch (type) {
++#if DAWN_PLATFORM_IS(SWITCH)
++        case wgpu::SType::SurfaceSourceSwitchNativeWindow: {
++            auto* subDesc = descriptor.Get<SurfaceSourceSwitchNativeWindow>();
++            DAWN_INVALID_IF(subDesc->window == nullptr, "Switch window is not set.");
++            return descriptor;
++        }
++#endif
+ #if DAWN_PLATFORM_IS(ANDROID)
+         case wgpu::SType::SurfaceSourceAndroidNativeWindow: {
+             auto* subDesc = descriptor.Get<SurfaceSourceAndroidNativeWindow>();
+@@ -300,13 +310,18 @@ Surface::Surface(InstanceBase* instance, const UnpackedPtr<SurfaceDescriptor>& d
+     wgpu::SType type =
+         descriptor
+             .ValidateBranches<
+-                Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
++                Branch<SurfaceSourceSwitchNativeWindow>, Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
+                 Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                 Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
+                 Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
+                 Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>>()
+             .AcquireSuccess();
+     switch (type) {
++        case wgpu::SType::SurfaceSourceSwitchNativeWindow: {
++            mType = Type::SwitchWindow;
++            mSwitchNativeWindow = descriptor.Get<SurfaceSourceSwitchNativeWindow>()->window;
++            break;
++        }
+         case wgpu::SType::SurfaceSourceAndroidNativeWindow: {
+             auto* subDesc = descriptor.Get<SurfaceSourceAndroidNativeWindow>();
+             mType = Type::AndroidWindow;
+@@ -389,6 +404,11 @@ Surface::Type Surface::GetType() const {
+     return mType;
+ }
+ 
++void* Surface::GetSwitchNativeWindow() const {
++    DAWN_CHECK(mType == Type::SwitchWindow);
++    return mSwitchNativeWindow;
++}
++
+ void* Surface::GetAndroidNativeWindow() const {
+     DAWN_CHECK(!IsError());
+     DAWN_CHECK(mType == Type::AndroidWindow);
+diff --git a/src/dawn/native/Surface.h b/src/dawn/native/Surface.h
+index 4e0ba99e0..65b3b7366 100644
+--- a/src/dawn/native/Surface.h
++++ b/src/dawn/native/Surface.h
+@@ -78,6 +78,7 @@ class Surface final : public ErrorMonad {
+     enum class Type {
+         Undefined,
+         AndroidWindow,
++        SwitchWindow,
+         MetalLayer,
+         WaylandSurface,
+         WindowsHWND,
+@@ -95,6 +96,7 @@ class Surface final : public ErrorMonad {
+ 
+     // Valid to call if the type is Android
+     void* GetAndroidNativeWindow() const;
++    void* GetSwitchNativeWindow() const;
+ 
+     // Valid to call if the type is WaylandSurface
+     void* GetWaylandDisplay() const;
+@@ -159,6 +161,7 @@ class Surface final : public ErrorMonad {
+ 
+     // ANativeWindow
+     raw_ptr<void> mAndroidNativeWindow = nullptr;
++    raw_ptr<void> mSwitchNativeWindow = nullptr;
+ 
+     // Wayland
+     raw_ptr<void> mWaylandDisplay = nullptr;
+diff --git a/src/dawn/native/vulkan/BackendVk.cpp b/src/dawn/native/vulkan/BackendVk.cpp
+index a93ea4f99..045146950 100644
+--- a/src/dawn/native/vulkan/BackendVk.cpp
++++ b/src/dawn/native/vulkan/BackendVk.cpp
+@@ -69,6 +69,11 @@ constexpr char kVulkanLibName[] = "vulkan-1.dll";
+ constexpr char kVulkanLibName[] = "libvulkan.dylib";
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ constexpr char kVulkanLibName[] = "libvulkan.so";
++#elif DAWN_PLATFORM_IS(SWITCH)
++// Unused on Switch: Vulkan (NVK) is linked statically and vkGetInstanceProcAddr
++// is resolved at link time (see VulkanInstance::Initialize below). Kept so the
++// unconditional references to kVulkanLibName still compile.
++constexpr char kVulkanLibName[] = "";
+ #else
+ #error "Unimplemented Vulkan backend platform"
+ #endif
+@@ -370,7 +375,12 @@ MaybeError VulkanInstance::Initialize(const InstanceBase* instance, ICD icd) {
+ 
+     switch (icd) {
+         case ICD::None: {
++#if DAWN_PLATFORM_IS(SWITCH)
++            // Vulkan (NVK) is linked statically on Horizon; nothing to dlopen.
++            (void)LoadVulkan;
++#else
+             DAWN_TRY(LoadVulkan(kVulkanLibName));
++#endif
+             // Succesfully loaded driver; break.
+             break;
+         }
+diff --git a/src/dawn/native/vulkan/SwapChainVk.cpp b/src/dawn/native/vulkan/SwapChainVk.cpp
+index 41447ee57..0ebe5e93d 100644
+--- a/src/dawn/native/vulkan/SwapChainVk.cpp
++++ b/src/dawn/native/vulkan/SwapChainVk.cpp
+@@ -648,6 +648,21 @@ ResultOrError<VkSurfaceKHR> CreateVulkanSurface(InstanceBase* instance,
+             break;
+ #endif  // DAWN_PLATFORM_IS(WINDOWS)
+ 
++#if DAWN_PLATFORM_IS(SWITCH)
++        case Surface::Type::SwitchWindow: {
++            if (info.HasExt(InstanceExt::ViSurface)) {
++                VkViSurfaceCreateInfoNN createInfo = {};
++                createInfo.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
++                createInfo.window = surface->GetSwitchNativeWindow();
++                VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
++                DAWN_TRY(CheckVkSuccess(
++                    fn.CreateViSurfaceNN(vkInstance, &createInfo, nullptr, &*vkSurface),
++                    "CreateViSurfaceNN"));
++                return vkSurface;
++            }
++            break;
++        }
++#endif
+ #if DAWN_PLATFORM_IS(ANDROID)
+         case Surface::Type::AndroidWindow: {
+             if (info.HasExt(InstanceExt::AndroidSurface)) {
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.cpp b/src/dawn/native/vulkan/VulkanExtensions.cpp
+index 8ce610dc4..16c9b5da8 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.cpp
++++ b/src/dawn/native/vulkan/VulkanExtensions.cpp
+@@ -49,6 +49,7 @@ static constexpr std::array<InstanceExtInfo, kInstanceExtCount> sInstanceExtInfo
+     {InstanceExt::XcbSurface, "VK_KHR_xcb_surface"},
+     {InstanceExt::XlibSurface, "VK_KHR_xlib_surface"},
+     {InstanceExt::AndroidSurface, "VK_KHR_android_surface"},
++    {InstanceExt::ViSurface, "VK_NN_vi_surface"},
+ 
+     {InstanceExt::DebugUtils, "VK_EXT_debug_utils"},
+     {InstanceExt::ValidationFeatures, "VK_EXT_validation_features"},
+@@ -95,6 +96,7 @@ InstanceExtSet EnsureDependencies(const InstanceExtSet& advertisedExts) {
+                 hasDependencies = true;
+                 break;
+ 
++            case InstanceExt::ViSurface:
+             case InstanceExt::AndroidSurface:
+             case InstanceExt::FuchsiaImagePipeSurface:
+             case InstanceExt::MetalSurface:
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.h b/src/dawn/native/vulkan/VulkanExtensions.h
+index 78d79a4c6..66d304128 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.h
++++ b/src/dawn/native/vulkan/VulkanExtensions.h
+@@ -47,6 +47,7 @@ enum class InstanceExt : uint32_t {
+     XcbSurface,
+     XlibSurface,
+     AndroidSurface,
++    ViSurface,
+ 
+     // Others
+     DebugUtils,
+diff --git a/src/dawn/native/vulkan/VulkanFunctions.cpp b/src/dawn/native/vulkan/VulkanFunctions.cpp
+index 60b075dea..4bac39023 100644
+--- a/src/dawn/native/vulkan/VulkanFunctions.cpp
++++ b/src/dawn/native/vulkan/VulkanFunctions.cpp
+@@ -33,6 +33,14 @@
+ #include "src/dawn/common/DynamicLib.h"
+ #include "src/dawn/native/vulkan/VulkanInfo.h"
+ 
++#if DAWN_PLATFORM_IS(SWITCH)
++// Dawn compiles with VK_NO_PROTOTYPES, so vkGetInstanceProcAddr has no declaration.
++// On Horizon it is linked statically from NVK's libvulkan.a; declare it at file
++// scope (a language-linkage spec is illegal inside a function body).
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(
++    VkInstance instance, const char* pName);
++#endif
++
+ namespace dawn::native::vulkan {
+ 
+ namespace {
+@@ -89,9 +97,18 @@ F AsVkFn(void(VKAPI_PTR* addr)()) {
+     } while (0)
+ 
+ MaybeError VulkanFunctions::LoadGlobalProcs(const DynamicLib& vulkanLib) {
++#if DAWN_PLATFORM_IS(SWITCH)
++    // No dynamic loader on Horizon: Vulkan (NVK) is linked statically, so the
++    // whole proc table bootstraps from the link-time vkGetInstanceProcAddr symbol.
++    // vkGetInstanceProcAddr is declared at file scope above and provided by NVK's
++    // static libvulkan.a at link time.
++    (void)vulkanLib;
++    GetInstanceProcAddr = &vkGetInstanceProcAddr;
++#else
+     if (!vulkanLib.GetProc(&GetInstanceProcAddr, "vkGetInstanceProcAddr")) {
+         return DAWN_INTERNAL_ERROR("Couldn't get vkGetInstanceProcAddr");
+     }
++#endif
+ 
+     GET_GLOBAL_PROC(CreateInstance);
+     GET_GLOBAL_PROC(EnumerateInstanceExtensionProperties);
+@@ -187,6 +204,11 @@ MaybeError VulkanFunctions::LoadInstanceProcs(VkInstance instance,
+     }
+ #endif  // DAWN_PLATFORM_IS(WINDOWS)
+ 
++#if DAWN_PLATFORM_IS(SWITCH)
++    if (globalInfo.HasExt(InstanceExt::ViSurface)) {
++        GET_INSTANCE_PROC(CreateViSurfaceNN);
++    }
++#endif
+ #if DAWN_PLATFORM_IS(ANDROID)
+     if (globalInfo.HasExt(InstanceExt::AndroidSurface)) {
+         GET_INSTANCE_PROC(CreateAndroidSurfaceKHR);
+diff --git a/src/dawn/native/vulkan/VulkanFunctions.h b/src/dawn/native/vulkan/VulkanFunctions.h
+index 5f50822de..e87bbed69 100644
+--- a/src/dawn/native/vulkan/VulkanFunctions.h
++++ b/src/dawn/native/vulkan/VulkanFunctions.h
+@@ -180,6 +180,10 @@ struct VulkanFunctions {
+         GetPhysicalDeviceWin32PresentationSupportKHR = nullptr;
+ #endif  // DAWN_PLATFORM_IS(WINDOWS)
+ 
++#if DAWN_PLATFORM_IS(SWITCH)
++    VkFn<PFN_vkCreateViSurfaceNN> CreateViSurfaceNN = nullptr;
++#endif
++
+ #if DAWN_PLATFORM_IS(ANDROID)
+     // KHR_android_surface
+     VkFn<PFN_vkCreateAndroidSurfaceKHR> CreateAndroidSurfaceKHR = nullptr;

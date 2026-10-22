@@ -1,0 +1,38 @@
+            {
+                // Nonvolatile GPRs each body provably returns unchanged: callers skip their post-call
+                // reload (docs/TRANSLATOR-PLAN-B73.md W1/W2).
+                var preservationPolicy = new GuestPreservationCallPolicy(
+                    guestAbiContracts,
+                    nativeGuestEffects.Contracts.Keys.ToHashSet(),
+                    modOverridableCallTargets,
+                    new HashSet<uint>(),
+                    new HashSet<uint>());
+                var preservedGprs = GuestNonvolatilePreservationAnalyzer.Analyze(
+                    canonicalGuestFunctions, preservationPolicy);
+                var reloadExemptions = GuestNonvolatilePreservation.BuildExemptions(
+                    canonicalGuestFunctions.Keys.Concat(nativeGuestEffects.Contracts.Keys).Distinct(),
+                    preservedGprs, preservationPolicy);
+                GuestNonvolatilePreservation.Install(reloadExemptions);
+                if (outputMetadataPath is not null)
+                {
+                    GuestNonvolatilePreservation.Write(
+                        Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outputMetadataPath))!,
+                            GuestNonvolatilePreservation.FileName),
+                        reloadExemptions);
+                }
+                var nonvolatileMask = GuestNonvolatilePreservationAnalyzer.TrackedGprMask;
+                var complete = preservedGprs.Count(pair => pair.Value == nonvolatileMask);
+                var fenced = preservedGprs.Count(pair => guestAbiContracts[pair.Key].HasFullSynchronizationFence);
+                var fencedComplete = preservedGprs.Count(pair =>
+                    pair.Value == nonvolatileMask && guestAbiContracts[pair.Key].HasFullSynchronizationFence);
+                Console.WriteLine(
+                    $"[translator] Nonvolatile GPR preservation: {complete:N0} of {preservedGprs.Count:N0} " +
+                    $"function(s) proven to return r1/r2/r13-r31 unchanged ({fencedComplete:N0} of {fenced:N0} " +
+                    $"full-fence); reload elision {(GuestNonvolatilePreservation.Enabled ? "on" : "off (KARTPAD_RELOAD_ELISION=0)")}.");
+                if (Environment.GetEnvironmentVariable("KARTPAD_PRESERVATION_REPORT") is { Length: > 0 } reportPath)
+                    File.WriteAllLines(reportPath, GuestNonvolatilePreservationAnalyzer.Report(
+                        canonicalGuestFunctions, preservedGprs, preservationPolicy));
+                LogPhase("nonvolatile preservation");
+                if (Environment.GetEnvironmentVariable("KARTPAD_PRESERVATION_REPORT_ONLY") == "1")
+                    return 0;
+            }

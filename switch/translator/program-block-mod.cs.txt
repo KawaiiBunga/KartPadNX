@@ -1,0 +1,9 @@
+    // Post-call reload exemptions proven by translate-recursive for base callees (b73): mod overlay
+    // bodies have no base contracts, so this table is all they get.
+    if (GuestNonvolatilePreservation.TryRead(Path.Combine(
+            Path.GetDirectoryName(Path.GetFullPath(baseTranslationOutputMetadataPath))!,
+            GuestNonvolatilePreservation.FileName)) is { } modReloadExemptions)
+    {
+        GuestNonvolatilePreservation.Install(modReloadExemptions);
+        Console.WriteLine($"[translator] Nonvolatile reload exemptions loaded for {modReloadExemptions.Count:N0} base target(s).");
+    }

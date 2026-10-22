@@ -1,0 +1,172 @@
+diff --git a/aurora-main/lib/dolphin/pad/pad.cpp b/aurora-main/lib/dolphin/pad/pad.cpp
+--- a/aurora-main/lib/dolphin/pad/pad.cpp
++++ b/aurora-main/lib/dolphin/pad/pad.cpp
+@@ -653,6 +653,7 @@
+ }
+ 
+ u32 PADRead(PADStatus* status) {
++  std::lock_guard inputLock(aurora::input::input_mutex());
+   if (!g_keyboardBindingsLoaded) {
+     g_keyboardBindingsLoaded = true;
+     load_keyboard_bindings();
+@@ -894,6 +895,7 @@
+ }
+ 
+ void PADControlMotor(const u32 chan, const u32 cmd) {
++  std::lock_guard inputLock(aurora::input::input_mutex());
+   const auto controller = aurora::input::get_controller_for_player(chan);
+   const auto instance = aurora::input::get_instance_for_player(chan);
+   if (controller == nullptr) {
+diff --git a/aurora-main/lib/dolphin/si/si.cpp b/aurora-main/lib/dolphin/si/si.cpp
+--- a/aurora-main/lib/dolphin/si/si.cpp
++++ b/aurora-main/lib/dolphin/si/si.cpp
+@@ -4,6 +4,7 @@
+ #include <SDL3/SDL_power.h>
+ 
+ uint32_t SIProbe(int32_t chan) {
++  std::lock_guard inputLock(aurora::input::input_mutex());
+   auto* const controller = aurora::input::get_controller_for_player(chan);
+   if (controller == nullptr) {
+     return SI_ERROR_NO_RESPONSE;
+diff --git a/aurora-main/lib/input.cpp b/aurora-main/lib/input.cpp
+--- a/aurora-main/lib/input.cpp
++++ b/aurora-main/lib/input.cpp
+@@ -10,6 +10,8 @@
+ #include <SDL3/SDL_iostream.h>
+ 
+ #include <absl/container/flat_hash_map.h>
++#include <atomic>
++#include <mutex>
+ #include <algorithm>
+ #include <array>
+ #include <string>
+@@ -258,6 +260,7 @@
+ void assign_player_index(GameController& controller, int32_t port) {
+   SDL_SetGamepadPlayerIndex(controller.m_controller, port);
+   controller.m_playerIndex = port;
++  invalidate_player_cache();
+ }
+ 
+ // SDL forgets the index for devices mapped after connect, so player_index() falls
+@@ -337,14 +340,63 @@
+ }
+ } // namespace
+ 
++#if defined(__SWITCH__)
++// Per-thread port -> controller answers, valid for one generation. The generation moves on every
++// SDL event pump (window::poll_events/pump_events, where SDL itself can renumber players) and on
++// every controller add/remove or explicit index assignment here, so a cached pointer never
++// outlives the map entry or the index it was derived from.
++std::atomic<uint32_t> g_playerCacheGeneration{1};
++struct PlayerCache {
++  uint32_t generation = 0;
++  std::array<GameController*, PAD_MAX_CONTROLLERS> controller{};
++  std::array<bool, PAD_MAX_CONTROLLERS> valid{};
++};
++thread_local PlayerCache t_playerCache;
++#endif
++
++std::recursive_mutex& input_mutex() noexcept {
++  static std::recursive_mutex mutex;
++  return mutex;
++}
++}  // namespace aurora::input
++extern "C" void aurora_input_lock() { aurora::input::input_mutex().lock(); }
++extern "C" void aurora_input_unlock() { aurora::input::input_mutex().unlock(); }
++namespace aurora::input {
++
++void invalidate_player_cache() noexcept {
++#if defined(__SWITCH__)
++  g_playerCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
++#endif
++}
++
+ GameController* get_controller_for_player(uint32_t player) noexcept {
++#if defined(__SWITCH__)
++  const bool cacheable = player < PAD_MAX_CONTROLLERS;
++  if (cacheable) {
++    const uint32_t generation = g_playerCacheGeneration.load(std::memory_order_acquire);
++    if (t_playerCache.generation != generation) {
++      t_playerCache = PlayerCache{};
++      t_playerCache.generation = generation;
++    }
++    if (t_playerCache.valid[player]) {
++      return t_playerCache.controller[player];
++    }
++  }
++#endif
++  GameController* found = nullptr;
+   for (auto& [which, controller] : g_GameControllers) {
+     if (player_index(which) == player) {
+-      return &controller;
++      found = &controller;
++      break;
+     }
+   }
+-
+-  return nullptr;
++#if defined(__SWITCH__)
++  if (cacheable) {
++    t_playerCache.controller[player] = found;
++    t_playerCache.valid[player] = true;
++  }
++#endif
++  return found;
+ }
+ 
+ Sint32 get_instance_for_player(uint32_t player) noexcept {
+@@ -358,6 +410,7 @@
+ }
+ 
+ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
++  invalidate_player_cache();
+   if (g_GameControllers.contains(which)) {
+     return which;
+   }
+@@ -405,6 +458,7 @@
+ }
+ 
+ void remove_controller(Uint32 instance) noexcept {
++  invalidate_player_cache();
+   if (auto it = g_GameControllers.find(instance); it != g_GameControllers.end()) {
+     SDL_CloseGamepad(it->second.m_controller);
+     g_GameControllers.erase(it);
+@@ -428,6 +482,7 @@
+ }
+ 
+ void set_player_index(Uint32 instance, Sint32 index) noexcept {
++  invalidate_player_cache();
+   if (auto it = g_GameControllers.find(instance); it != g_GameControllers.end()) {
+     SDL_SetGamepadPlayerIndex(it->second.m_controller, index);
+     it->second.m_playerIndex = index;
+@@ -477,6 +532,7 @@
+ }
+ 
+ void initialize() noexcept {
++  std::lock_guard lock(input_mutex());
+   /* Make sure we initialize everything input related now, this will automatically add all of the connected controllers
+    * as expected */
+   ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD), "Failed to initialize SDL subsystems: {}",
+diff --git a/aurora-main/lib/input.hpp b/aurora-main/lib/input.hpp
+--- a/aurora-main/lib/input.hpp
++++ b/aurora-main/lib/input.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <mutex>
++
+ #include <string>
+ #include <array>
+ #include "dolphin/pad.h" // For PADDeaZones and PADButtonMapping
+@@ -49,6 +51,11 @@
+ };
+ 
+ GameController* get_controller_for_player(uint32_t player) noexcept;
++// Guards the controller map and port mappings: SDL event processing and the settings overlay can
++// run on a different thread (KartPad's GX HLE thread) than the game's pad reads.
++std::recursive_mutex& input_mutex() noexcept;
++// Drops cached port -> controller answers (Switch); called on every SDL event pump.
++void invalidate_player_cache() noexcept;
+ Sint32 get_instance_for_player(uint32_t player) noexcept;
+ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept;
+ bool refresh_controller(SDL_JoystickID instance) noexcept;

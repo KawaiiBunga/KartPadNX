@@ -1,0 +1,42 @@
+schema_version: 1
+workspace_root: ..
+
+project:
+  id: kartpad-mkwii-rmcp01-base
+  display_name: KartPad Mario Kart Wii PAL base title
+  game_id: RMCP01
+  region: P
+
+memory:
+  base: 0x80000000
+  size: 0x01A00000
+  sda_base: 0x8038CC00
+  sda2_base: 0x8038EFA0
+
+inputs:
+  dol:
+    path: private/self-build/disc/sys/main.dol
+    sha256: 80d18895b39c63bd80f457398bfcbb91b7d16ac116a41a88967e954080155b05
+  rel:
+    path: private/self-build/disc/files/rel/StaticR.rel
+    load_address: 0x805102E0
+    sha256: 16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d
+
+translation:
+  entry_points:
+    - 0x800060A4
+  function_map:
+    path: ref/upstream/Wiicompiled/projects/mkwii/MAP.txt
+  allow_unsupported_instructions: false
+
+runtime:
+  native_registration_root: build/wiicompiled-fpscr/runtime/src
+  native_abi_directories:
+    - build/wiicompiled-fpscr/runtime/src/hle/gx
+
+output:
+  root: private/self-build/translation
+  functions: functions
+  runtime_config: RuntimeConfig.h
+  data_initializer: data_sections_init.cpp
+  base_manifest: base/base_manifest.json

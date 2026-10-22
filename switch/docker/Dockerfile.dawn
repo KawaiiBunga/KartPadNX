@@ -1,0 +1,32 @@
+# Dawn (WebGPU) cross-build image for Nintendo Switch / libnx.
+#
+# Why a dedicated image: Dawn (Sept-2026 revision) targets modern C++20/23 against
+# devkitA64's libstdc++-15 headers, and clang-14 fails ~380 Dawn/Tint units on
+# std::ranges / consteval / <format> conformance. clang-19 clears those, leaving only
+# the newlib/Horizon portability gaps that switch/patches/dawn-*.patch fix. The same
+# image builds the runtime, the game NROs and the launcher.
+#
+# Base carries the devkitA64 sysroot at /opt/devkitpro (libnx + libstdc++-15).
+# We add clang-19 from apt.llvm.org for the aarch64-none-elf cross compile and make
+# it the default `clang`/`clang++` so switch/cmake/SwitchClang.cmake finds it.
+#
+# Build:  docker build -f switch/docker/Dockerfile.dawn -t kartpad-dawn switch/docker
+FROM devkitpro/devkita64:latest
+
+ARG LLVM_VERSION=19
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg lsb-release software-properties-common \
+        ninja-build cmake git python3 python3-pip pkg-config \
+    && curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh ${LLVM_VERSION} \
+    && apt-get install -y --no-install-recommends llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-linker-tools \
+    && ln -sf /usr/bin/clang-${LLVM_VERSION}   /usr/local/bin/clang \
+    && ln -sf /usr/bin/clang++-${LLVM_VERSION} /usr/local/bin/clang++ \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+
+# Dawn's generators run at build time via host python + jinja2/markupsafe (already
+# vendored under ref/dawn/third_party) — nothing else to install here.
+
+ENV DEVKITPRO=/opt/devkitpro
+ENV PATH="/usr/local/bin:${PATH}"

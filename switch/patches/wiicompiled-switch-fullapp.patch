@@ -1,0 +1,337 @@
+--- a/src/memory.cpp	2026-09-13 20:50:13.355676100 -0500
++++ b/src/memory.cpp	2026-09-13 20:50:13.357677800 -0500
+@@ -20,11 +20,13 @@
+ #include <sstream>
+ #include <unordered_map>
+ 
++#if defined(_WIN32)
+ #ifndef NOMINMAX
+ #define NOMINMAX
+ #endif
+ #include <windows.h>
+ #include <dbghelp.h>
++#endif
+ 
+ MemoryInline::PageEntry MemoryInline::g_pageTable[MemoryInline::kPageCount]{};
+ uintptr_t MemoryInline::g_fullPageBias[MemoryInline::kPageCount]{};
+--- a/src/system_bridge.cpp	2026-09-13 20:50:13.504213200 -0500
++++ b/src/system_bridge.cpp	2026-09-13 20:50:13.504213200 -0500
+@@ -9,10 +9,13 @@
+ #include <string>
+ #include <vector>
+ 
++#if defined(_WIN32)
+ #ifndef NOMINMAX
+ #define NOMINMAX
+ #endif
+ #include <windows.h>
++#endif
++#include <csetjmp>
+ 
+ 
+ #include "abi_bridge.h"
+--- a/src/hle/storage/dvd.cpp	2026-09-13 20:50:13.592122400 -0500
++++ b/src/hle/storage/dvd.cpp	2026-09-13 20:50:13.593727600 -0500
+@@ -636,7 +636,7 @@
+     }
+     for (const DVDFileEntry& entry : g_fileEntries) {
+         if (entry.discOffsetWords != 0) {
+-            nextFreeBytes = std::max(
++            nextFreeBytes = std::max<uint64_t>(
+                 nextFreeBytes, static_cast<uint64_t>(entry.discOffsetWords) * 4ull + entry.size);
+         }
+     }
+--- a/include/wii_es_crypto.h	2026-09-13 20:50:13.679428200 -0500
++++ b/include/wii_es_crypto.h	2026-09-13 20:50:13.679428200 -0500
+@@ -36,6 +36,21 @@
+ #include <stdexcept>
+ #include <string>
+ 
++#if defined(__SWITCH__)
++// Crypto++'s AutoSeededRandomPool compiles out on Horizon (no recognized OS
++// entropy source). libnx exposes the sysmodule CSPRNG through randomGet(); wrap
++// it as a Crypto++ RNG for ECDSA nonce generation.
++#include <switch.h>
++namespace WiiESCrypto_detail {
++class SwitchRandomPool : public CryptoPP::RandomNumberGenerator {
++public:
++    void GenerateBlock(CryptoPP::byte* output, size_t size) override {
++        if (size != 0) randomGet(output, size);
++    }
++};
++}  // namespace WiiESCrypto_detail
++#endif
++
+ namespace WiiEsCrypto {
+ 
+ using EcSignature = std::array<uint8_t, 60>;
+@@ -149,7 +164,11 @@
+         throw std::runtime_error("Crypto++ returned an unexpected sect233r1 signature size");
+     }
+ 
++#if defined(__SWITCH__)
++    thread_local WiiESCrypto_detail::SwitchRandomPool random;
++#else
+     thread_local CryptoPP::AutoSeededRandomPool random;
++#endif
+     EcSignature signature{};
+     const size_t written = signer.SignMessage(random, data, size, signature.data());
+     if (written != signature.size()) {
+--- a/include/abi_bridge.h	2026-09-13 20:50:13.760681600 -0500
++++ b/include/abi_bridge.h	2026-09-13 20:50:13.760681600 -0500
+@@ -416,6 +416,15 @@
+     BulkTranslatedFunctionRegistrar(const BulkTranslatedFunctionRecord* records, size_t count) {
+         RegisterBulkTranslatedFunctions(records, count);
+     }
++    // Profile-tagged form emitted by the dual-profile translator. Only the base
++    // product is linked into this NRO, so the profile tag is accepted and the
++    // records register unconditionally (single-profile build; no per-profile
++    // filtering needed). See wiicompiled-dual-profile-registry.patch for the
++    // full multi-profile variant used when several products share one binary.
++    BulkTranslatedFunctionRegistrar(const char* /*profileName*/,
++                                    const BulkTranslatedFunctionRecord* records, size_t count) {
++        RegisterBulkTranslatedFunctions(records, count);
++    }
+ };
+ 
+ MKW_PPC_FORCE_INLINE bool TryDispatchResolvedCpuTarget(const TranslatedFunctionInfo* info, CpuContext* cpu) {
+--- a/src/main.cpp	2026-09-13 20:50:13.843681700 -0500
++++ b/src/main.cpp	2026-09-13 20:50:13.844681900 -0500
+@@ -300,6 +300,13 @@
+ #endif
+ 
+ bool InstallTranscriptPipe(int& outReadFd, int& outWriteFd, int targetFd) {
++#if defined(__SWITCH__)
++    // Horizon/newlib provides no pipe(); the process transcript (which mirrors
++    // stdout/stderr through a pipe into a log) is disabled on Switch. Callers
++    // treat a false return as "transcript unavailable" and continue.
++    (void)outReadFd; (void)outWriteFd; (void)targetFd;
++    return false;
++#else
+ #if defined(_WIN32)
+     int pipeFds[2]{-1, -1};
+     if (_pipe(pipeFds, 8192, _O_BINARY) != 0) {
+@@ -328,6 +335,7 @@
+         return false;
+     }
+     return true;
++#endif  // !__SWITCH__
+ }
+ 
+ #if defined(_WIN32)
+--- a/include/runtime_config.h	2026-09-13 20:50:13.920681500 -0500
++++ b/include/runtime_config.h	2026-09-13 20:50:13.921682100 -0500
+@@ -197,6 +197,11 @@
+         CoTaskMemFree(rawPath);
+         return directory;
+     }
++#elif defined(__SWITCH__)
++    // Writable SD location for Config.toml, saves, logs and the renderer cache.
++    // Matches switch/src/runtime_host_switch.cpp (kRoot). current_path() on
++    // Horizon is not a usable writable app-data root.
++    return std::filesystem::path("sdmc:/switch/kartpad");
+ #endif
+     return std::filesystem::current_path() / kApplicationDirectoryName;
+ }
+@@ -790,6 +795,14 @@
+ // The extracted DATA directory. Empty when nothing is configured.
+ inline std::filesystem::path ResolvedDvdRoot() {
+     const std::string configured = DvdRoot();
++#if defined(__SWITCH__)
++    // Default to the standalone extractor's output when Config.toml names no
++    // dvd_root. Matches switch/src/runtime_host_switch.cpp (kDataDir) and the
++    // disc-extractor front end.
++    if (configured.empty()) {
++        return std::filesystem::path("sdmc:/switch/kartpad/data");
++    }
++#endif
+     return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
+ }
+
+--- a/include/memory.h
++++ b/include/memory.h
+@@ -13,7 +13,11 @@ class Memory {
+ public:
+     using DeferredReadCallback = bool (*)(void* user);
+ 
+     static constexpr size_t kMem1Size = 24u * 1024u * 1024u;
+-    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;
++    // Retail Wii hardware has 64 MiB of MEM2. The upstream desktop runtime
++    // defaults to the 128 MiB NDEV layout, but a single 128 MiB Horizon shared
++    // memory backing object is rejected with KernelError_OutOfResource before
++    // the game can initialize. The PAL retail title must see its real layout.
++    static constexpr size_t kMem2Size = 64u * 1024u * 1024u;
+     static constexpr uint32_t kMem1PhysicalBase = 0x00000000u;
+     static constexpr uint32_t kMem1CachedBase = 0x80000000u;
+     static constexpr uint32_t kMem1UncachedBase = 0xC0000000u;
+
+--- a/src/memory.cpp
++++ b/src/memory.cpp
+@@ -431,9 +431,8 @@ GuestFlat::Backing ClassifyBacking(uint32_t baseAddress) {
+         return GuestFlat::Backing::Mem1;
+     }
+ 
+-    // NDEV-sized MEM2: physical (0x10000000), cached (0x90000000),
+-    // uncached (0xD0000000). Mario Kart Wii detects this configuration and
+-    // creates its original EGGRootDebug expansion heap.
++    // Retail-sized MEM2: physical (0x10000000), cached (0x90000000),
++    // uncached (0xD0000000). PAL RMCP01 targets the retail 64 MiB Wii layout.
+     if ((baseAddress >= Memory::kMem2PhysicalBase &&
+          baseAddress < Memory::kMem2PhysicalEnd) ||
+          (baseAddress >= Memory::kMem2CachedBase &&
+
+--- a/include/runtime_config.h	2026-09-13 20:50:13.920681500 -0500
++++ b/include/runtime_config.h	2026-09-13 20:50:13.921682100 -0500
+@@ -225,9 +225,20 @@ inline void EnsureConfigFile() {
+     }
+     output << "# WiiCompiled user configuration\n"
++#if defined(__SWITCH__)
++              "# Switch paths use the SD layout created by KartPad-NX's extractor.\n"
++              "# dvd_root must be the DATA directory itself, not its files/ child.\n\n"
++#else
+               "# Set paths.dvd_root to an extracted Mario Kart Wii DATA directory.\n\n"
++#endif
+               "[video]\n"
+               "widescreen = true\n"
+               "resolution_multiplier = 1.0\n"
+               "frame_interpolation_fps = 0\n"
++#if defined(__SWITCH__)
++              "# Horizon is always fullscreen; exclusive is the closest valid UI value.\n"
++              "display_mode = \"exclusive\"\n"
++              "graphics_api = \"vulkan\"\n"
++#else
+               "display_mode = \"windowed\"\n"
+               "graphics_api = \"auto\"\n"
++#endif
+               "skip_unready_pipelines = true\n"
+@@ -256,7 +267,12 @@ inline void EnsureConfigFile() {
+               "enabled = true\n\n"
+               "[paths]\n"
++#if defined(__SWITCH__)
++              "dvd_root = \"sdmc:/switch/kartpad/data\"\n"
++              "nand_root = \"sdmc:/switch/kartpad/NAND\"\n"
++#else
+               "# dvd_root = \"D:\\\\MarioKartWii\\\\DATA\"\n"
+               "# nand_root = \"D:\\\\WiiNand\"\n"
++#endif
+               "# retro_rewind_root = \"D:\\\\RetroRewind\\\\RetroRewind6\"\n"
+               "# overlay_roots = [\"D:\\\\RetroRewind\"]\n";
+ }
+
+--- a/include/nand_path.h	2026-09-13 20:50:13.920681500 -0500
++++ b/include/nand_path.h	2026-09-13 20:50:13.921682100 -0500
+@@ -68,6 +68,14 @@ inline std::filesystem::path ManagedNandRootPath() {
+ }
+ 
+ inline std::optional<std::filesystem::path> BootstrapPayloadPath() {
++#if defined(__SWITCH__)
++    // FullApp packs the runtime's small first-run WC24 tree into ROMFS. The
++    // NRO has no meaningful executable directory on Horizon.
++    const std::filesystem::path romfsPayload("romfs:/wii_bootstrap");
++    if (ExistingDirectory(romfsPayload / "shared2" / "wc24")) {
++        return romfsPayload;
++    }
++#endif
+     if (auto executableDirectory = RuntimeConfigFile::ExecutableDirectory()) {
+         const auto adjacent = *executableDirectory / "wii_bootstrap";
+         if (ExistingDirectory(adjacent / "shared2" / "wc24")) {
+
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1163,7 +1163,12 @@ int RuntimeMain(int argc, char** argv) {
+     std::atexit(AtExitHandler);
+     std::set_terminate(TerminateHandler);
+     
+-    std::string currentEntryLabel;
++    std::string currentEntryLabel;
++    // aurora_shutdown() assumes ImGui/WebGPU initialization completed. An
++    // exception before aurora_initialize returns must not call it: ImGui's
++    // shutdown backend otherwise dereferences a null backend user-data block
++    // and masks the actual startup exception with a native Data Abort.
++    bool auroraInitialized = false;
+ 
+     try {
+         if (argc != 1) {
+@@ -1200,8 +1206,14 @@ int RuntimeMain(int argc, char** argv) {
+     auroraConfig.hasWindowPosition = RuntimeConfigFile::WindowPosition(
+         auroraConfig.windowPosX, auroraConfig.windowPosY);
+     auroraConfig.allowJoystickBackgroundEvents = true;
+     auroraConfig.disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
++#if defined(__SWITCH__)
++    // Horizon has one native fullscreen NWindow. Keep the full game on the
++    // same proven window/backend contract as the hardware-tested GX fixture;
++    // desktop Config.toml values such as windowed/auto are not meaningful here.
++    auroraConfig.startFullscreen = true;
++#endif
+     // Dolphin-style custom textures. Aurora indexes <userPath>/texture_replacements
+     // once during aurora_initialize, so both knobs only take effect on the next launch.
+     // Dumps name each unmatched texture the way its replacement would have to be named,
+     // which is only useful while the index is live - hence the conjunction.
+@@ -1229,17 +1241,23 @@ int RuntimeMain(int argc, char** argv) {
+         }
+         return "unknown";
+     };
+ 
++#if defined(__SWITCH__)
++    const std::string backend = "vulkan";
++    auroraConfig.desiredBackend = BACKEND_VULKAN;
++#else
+     const std::string backend = RuntimeConfigFile::GraphicsApi("auto");
+     for (const auto& entry : kGraphicsBackends) {
+         if (backend == entry.configName) {
+             auroraConfig.desiredBackend = entry.backend;
+             break;
+         }
+     }
++#endif
+     const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
+ 
+     const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
++    auroraInitialized = true;
+     if (requestedBackend != BACKEND_AUTO && auroraInfo.backend != requestedBackend) {
+         RT_LOG(RT_TAG_RUNTIME) << "graphics_api=\"" << backend
+                   << "\" is not available on this system; aurora fell back to \""
+@@ -1296,7 +1314,9 @@ int RuntimeMain(int argc, char** argv) {
+     Fiber::GuestFiberManager::Shutdown();
+     WindowPlacementPersistence::Flush(true);
+     Wup028Adapter::Shutdown();
+-    aurora_shutdown();
++    if (auroraInitialized) {
++        aurora_shutdown();
++    }
+     SetRuntimeExitCodeImpl(0);
+     ShutdownProcessTranscript();
+     return 0;
+@@ -1313,7 +1331,9 @@ int RuntimeMain(int argc, char** argv) {
+     SetRuntimeExitCodeImpl(1);
+     Fiber::GuestFiberManager::Shutdown();
+     WindowPlacementPersistence::Flush(true);
+     Wup028Adapter::Shutdown();
+-    aurora_shutdown();
++    if (auroraInitialized) {
++        aurora_shutdown();
++    }
+     ShutdownProcessTranscript();
+     return 1;
+ }
+@@ -1320,13 +1340,15 @@ int RuntimeMain(int argc, char** argv) {
+ } catch (const std::exception& ex) {
+     std::cerr << "Runtime error: " << ex.what() << std::endl;
+     SystemBridge::DumpCpuState(TryGetCpuContext());
+     ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
+-    WriteFatalLogImpl("exception");
++    WriteFatalLogImpl("exception", ex.what());
+     SetRuntimeExitCodeImpl(1);
+     Fiber::GuestFiberManager::Shutdown();
+     WindowPlacementPersistence::Flush(true);
+     Wup028Adapter::Shutdown();
+-    aurora_shutdown();
++    if (auroraInitialized) {
++        aurora_shutdown();
++    }
+     ShutdownProcessTranscript();
+     return 1;
+ }
+
+ 
+

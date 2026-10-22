@@ -1,0 +1,275 @@
+diff -ruN a/include/guest_flat_memory.h b/include/guest_flat_memory.h
+--- a/include/guest_flat_memory.h
++++ b/include/guest_flat_memory.h
+@@ -15,9 +15,18 @@
+ // of a global. 16 TiB: clear of the Windows ASan shadow (32 TiB) and of the
+ // usual image/heap placement.
+ inline constexpr uint64_t kGuestSpaceSize = 0x1'0000'0000ull;
++#if defined(__SWITCH__)
++// Switch (libnx) chooses the 4 GiB reservation at launch via virtmemFindAslr;
++// the Horizon user address space cannot host a fixed 16 TiB base. The reserved
++// base is published here by Initialize(), mirroring the Apple iOS path. The flat
++// fast path then loads this global instead of an immediate.
++extern uint8_t* gFlatGuestBase;
++#define MKW_FLAT_GUEST_BASE (GuestFlat::gFlatGuestBase)
++#else
+ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'1000'0000'0000ull;
+ 
+ #define MKW_FLAT_GUEST_BASE (reinterpret_cast<uint8_t*>(GuestFlat::kFixedFlatGuestBase))
++#endif
+ 
+ enum class Backing {
+     Owned,
+diff -ruN a/src/fiber_manager.cpp b/src/fiber_manager.cpp
+--- a/src/fiber_manager.cpp
++++ b/src/fiber_manager.cpp
+@@ -13,6 +13,38 @@
+ #include <iomanip>
+ #include <sstream>
+ 
++#if defined(__SWITCH__)
++// Switch has neither Win32 fibers nor a working newlib ucontext. The guest
++// scheduler's cooperative host fibers are provided by the hand-written AArch64
++// coroutine primitive in switch/src/aarch64_fiber.*.
++#include "aarch64_fiber.h"
++#endif
++
++namespace {
++#if defined(__SWITCH__)
++// Host-fiber abstraction over the AArch64 coroutine primitive, mirroring the
++// Win32 backend below. A GuestFiber::fiber handle is a kartpad_fiber*.
++void SwitchHostFiber(void* handle)
++{
++    kartpad_fiber_switch(static_cast<kartpad_fiber*>(handle));
++}
++
++void* CurrentHostFiber()
++{
++    return kartpad_fiber_current();
++}
++
++void DeleteHostFiber(void* handle)
++{
++    kartpad_fiber_destroy(static_cast<kartpad_fiber*>(handle));
++}
++#elif defined(_WIN32)
++void SwitchHostFiber(void* handle) { SwitchToFiber(handle); }
++void* CurrentHostFiber() { return GetCurrentFiber(); }
++void DeleteHostFiber(void* handle) { DeleteFiber(handle); }
++#endif
++} // namespace
++
+ namespace Fiber {
+ 
+ std::mutex GuestFiberManager::s_mutex;
+@@ -24,16 +56,16 @@
+ thread_local CpuContext* GuestFiberManager::s_cpuContext = nullptr;
+ 
+ void GuestFiberManager::PurgePendingFibers() {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__SWITCH__)
+     std::vector<void*> toDelete;
+     {
+         std::lock_guard<std::mutex> lock(s_mutex);
+         toDelete.swap(s_fibersPendingDelete);
+     }
+-    const void* current = GetCurrentFiber();
++    const void* current = CurrentHostFiber();
+     for (void* f : toDelete) {
+         if (f && f != current) {
+-            DeleteFiber(f);
++            DeleteHostFiber(f);
+         }
+     }
+ #endif
+@@ -202,7 +234,14 @@
+             std::abort();
+         }
+     }
+-    
++
++#elif defined(__SWITCH__)
++    // Adopt the calling (main) thread as the scheduler fiber.
++    s_schedulerFiber = kartpad_fiber_init_current();
++    if (!s_schedulerFiber) {
++        RT_LOG(RT_TAG_OS) << "FATAL: Failed to initialize Switch scheduler fiber!" << std::endl;
++        std::abort();
++    }
+ #else
+     RT_LOG(RT_TAG_OS) << "WARNING: Fiber support not available on this platform!" << std::endl;
+     s_schedulerFiber = nullptr;
+@@ -215,22 +254,28 @@
+ void GuestFiberManager::Shutdown() {
+     std::lock_guard<std::mutex> lock(s_mutex);
+ 
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__SWITCH__)
+     for (auto& [addr, fiber] : s_fibers) {
+         if (fiber.fiber && !fiber.isSchedulerFiber) {
+-            DeleteFiber(fiber.fiber);
++            DeleteHostFiber(fiber.fiber);
+             fiber.fiber = nullptr;
+         }
+     }
+     s_fibers.clear();
+-    
++
++#if defined(_WIN32)
+     // Convert scheduler fiber back to thread
+     if (s_schedulerFiber) {
+         ConvertFiberToThread();
+         s_schedulerFiber = nullptr;
+     }
++#else
++    // The Switch scheduler fiber is the init_current adoption of the main
++    // thread; it owns no separate stack, so drop the handle without destroying.
++    s_schedulerFiber = nullptr;
+ #endif
+-    
++#endif
++
+     s_initialized = false;
+ }
+ 
+@@ -250,10 +295,10 @@
+     // Check if fiber already exists for this thread - if so, reset it
+     auto existingIt = s_fibers.find(guestThreadAddr);
+     if (existingIt != s_fibers.end()) {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__SWITCH__)
+         // Delete the old fiber if it exists and is not the scheduler fiber
+         if (existingIt->second.fiber && !existingIt->second.isSchedulerFiber) {
+-            DeleteFiber(existingIt->second.fiber);
++            DeleteHostFiber(existingIt->second.fiber);
+         }
+ #endif
+         s_fibers.erase(existingIt);
+@@ -287,6 +332,20 @@
+                   << " error=" << std::dec << err << std::endl;
+         return false;
+     }
++#elif defined(__SWITCH__)
++    // Guest threads run translated code that recurses into the HLE, so give each
++    // fiber a generous stack (matches the Apple aarch64 port for this runtime).
++    // The pthread 8MB floor does NOT cover fibers — they own the stack given here.
++    constexpr size_t kHostStackSize = 256 * 1024;
++    gf.fiber = kartpad_fiber_create(
++        kHostStackSize, &GuestFiberManager::FiberProc,
++        reinterpret_cast<void*>(static_cast<uintptr_t>(guestThreadAddr)),
++        static_cast<kartpad_fiber*>(s_schedulerFiber));
++    if (!gf.fiber) {
++        RT_LOG(RT_TAG_OS) << "kartpad_fiber_create failed for thread 0x"
++                  << std::hex << guestThreadAddr << std::dec << std::endl;
++        return false;
++    }
+ #else
+     gf.fiber = nullptr;
+ #endif
+@@ -342,13 +401,13 @@
+         s_currentGuestThread = 0;
+     }
+     
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__SWITCH__)
+     if (it->second.fiber && !it->second.isSchedulerFiber) {
+-        const void* current = GetCurrentFiber();
++        const void* current = CurrentHostFiber();
+         if (it->second.fiber == current) {
+             s_fibersPendingDelete.push_back(it->second.fiber);
+         } else {
+-            DeleteFiber(it->second.fiber);
++            DeleteHostFiber(it->second.fiber);
+         }
+         it->second.fiber = nullptr;
+     }
+@@ -415,10 +474,10 @@
+     // Store CPU context pointer for the target fiber to use
+     s_cpuContext = cpu;
+     
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__SWITCH__)
+     // Check if we're already on the target fiber (e.g., switching to main thread
+     // when we're already on the scheduler fiber)
+-    void* currentFiber = GetCurrentFiber();
++    void* currentFiber = CurrentHostFiber();
+     if (currentFiber == fiberHandle) {
+         // Already executing on the target host fiber. This is common for the
+         // default guest thread, which also owns the scheduler fiber. Keep the
+@@ -436,7 +495,7 @@
+     }
+ 
+     // Switch to the target fiber (the target fiber will load its own context)
+-    SwitchToFiber(fiberHandle);
++    SwitchHostFiber(fiberHandle);
+     
+     // When we return here, the fiber that issued SwitchToThread has resumed.
+     // That does not automatically mean the previous guest thread became runnable
+@@ -558,9 +617,9 @@
+ #endif
+ {
+     uint32_t guestThreadAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(param));
+-    
+-    
+-#if defined(_WIN32)
++
++
++#if defined(_WIN32) || defined(__SWITCH__)
+     // Get our fiber info
+     GuestFiber* fiber = nullptr;
+     uint32_t entryPoint = 0;
+@@ -571,7 +630,7 @@
+         auto it = s_fibers.find(guestThreadAddr);
+         if (it == s_fibers.end()) {
+             RT_LOG(RT_TAG_OS) << "FiberProc: fiber not found!" << std::endl;
+-            SwitchToFiber(s_schedulerFiber);
++            SwitchHostFiber(s_schedulerFiber);
+             return;
+         }
+         fiber = &it->second;
+@@ -634,7 +693,7 @@
+                       << ", fn=0x" << startFn << ") after retries; continuing anyway." << std::dec << std::endl;
+             break;
+         }
+-        SwitchToFiber(s_schedulerFiber);
++        SwitchHostFiber(s_schedulerFiber);
+     }
+ 
+     // The deferral loop above yields to the scheduler and therefore can resume
+@@ -691,7 +750,7 @@
+     }
+     
+     // Return to scheduler
+-    SwitchToFiber(s_schedulerFiber);
++    SwitchHostFiber(s_schedulerFiber);
+ #else
+     (void)guestThreadAddr;
+     RT_LOG(RT_TAG_OS) << "Fibers not supported on this platform!" << std::endl;
+diff -ruN a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1332,7 +1332,21 @@
+         ShutdownProcessTranscript();
+         return 1;
+     }
+ }
+ 
+-int main(int argc, char** argv) {
+-    return RuntimeMain(argc, argv);
+-}
++#if defined(__SWITCH__)
++// libnx supplies main() (switch/src/main_switch.cpp); the game runtime is
++// entered through this exported seam instead. RuntimeMain rejects argv (the
++// product is chosen at build time and options come from Config.toml), so pass
++// only argv[0]. profile is informational for now: the base product is the only
++// one linked into this NRO (retro-rewind is a separate executable, deferred).
++extern "C" int KartPadRuntimeMain(const char* /*profile*/) {
++    static char progname[] = "kartpad";
++    char* argv[] = {progname, nullptr};
++    return RuntimeMain(1, argv);
++}
++#else
++int main(int argc, char** argv) {
++    return RuntimeMain(argc, argv);
++}
++#endif
+ extern "C" bool g_dynamicAspectRatioEnabled = false;

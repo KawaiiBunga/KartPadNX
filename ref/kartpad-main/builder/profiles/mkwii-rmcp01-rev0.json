@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "id": "mkwii-rmcp01-rev0",
+  "displayName": "Mario Kart Wii PAL RMCP01 revision 0",
+  "sourceDependencies": [
+    "WiiCompiled",
+    "Retro Rewind Pulsar",
+    "Retro Rewind WFC patcher",
+    "SunPad",
+    "Dolphin"
+  ],
+  "game": {
+    "discId": "RMCP01",
+    "region": "P",
+    "discNumber": 0,
+    "revision": 0,
+    "wiiMagic": "5d1c9ea3"
+  },
+  "containers": {
+    "extensions": ["iso", "gcm", "gcz", "ciso", "wbfs", "wia", "rvz"],
+    "acceptedImages": [
+      {
+        "format": "wbfs",
+        "sha256": "fc035e60610842da6860d23d4a30c1f1c0f019d492469deb8a2ac25ef5822331",
+        "note": "Current verified development image"
+      }
+    ]
+  },
+  "extraction": {
+    "extractor": {"command": "nodtool", "version": "2.0.0-alpha.9"},
+    "requiredFiles": [
+      "sys/boot.bin",
+      "sys/bi2.bin",
+      "sys/apploader.img",
+      "sys/fst.bin",
+      "sys/main.dol",
+      "files/rel/StaticR.rel"
+    ],
+    "executables": {
+      "dol": {
+        "path": "sys/main.dol",
+        "sha256": "80d18895b39c63bd80f457398bfcbb91b7d16ac116a41a88967e954080155b05"
+      },
+      "rel": {
+        "path": "files/rel/StaticR.rel",
+        "loadAddress": "0x805102E0",
+        "sha256": "16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d"
+      }
+    }
+  },
+  "translation": {
+    "memoryBase": "0x80000000",
+    "memorySize": "0x01A00000",
+    "sdaBase": "0x8038CC00",
+    "sda2Base": "0x8038EFA0",
+    "entryPoints": ["0x800060A4"],
+    "functionMap": "ref/upstream/Wiicompiled/projects/mkwii/MAP.txt",
+    "injectors": [
+      {"function": "func_8051FC84.cpp", "script": "scripts/inject-g10-rkg-fixture-hook.py"},
+      {"function": "func_8083DFA8.cpp", "script": "scripts/inject-online-rkg-selection-hooks.py"},
+      {"function": "func_80846C1C.cpp", "script": "scripts/inject-online-rkg-selection-hooks.py"},
+      {"function": "func_8084E388.cpp", "script": "scripts/inject-online-rkg-selection-hooks.py"},
+      {"function": "func_80643F48.cpp", "script": "scripts/inject-online-rkg-selection-hooks.py"},
+      {"function": "func_805A1A8C.cpp", "script": "scripts/inject-g10-camera-lifecycle-guard.py"},
+      {"function": "func_8000A440.cpp", "script": "scripts/inject-retro-rel-report-guard.py"}
+    ],
+    "expectedGeneratedFunctions": 29637,
+    "expectedBaseFunctions": 29065,
+    "expectedRetroFunctions": 4095
+  },
+  "retroRewind": {
+    "version": "6.13.3",
+    "versionManifestUrl": "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt",
+    "root": "RetroRewind6",
+    "archive": {
+      "url": "https://cdn.update.rwfc.net/RetroRewind/zip/6.13.1-full.zip",
+      "bytes": 1859035109,
+      "sha256": "9dc9f689b2d1bc03f7b9f49e9013f31d2ab31e9b800aa2da1f6badbd2ecf21dc",
+      "maximumExpandedBytes": 2200000000
+    },
+    "codePul": {
+      "path": "Binaries/Code.pul",
+      "bytes": 1806316,
+      "sha256": "58f4ac46afdeda4d57aacab361b381ccd95f08c3dbb2779e6e5760b48b1df036"
+    },
+    "riivolutionXml": {
+      "path": "xml/RetroRewind6.xml",
+      "bytes": 21064,
+      "sha256": "8759d8d9e14406de3bd5a4981a30a58826c9b952cfc856a997a267b3896e3a41"
+    },
+    "payload": {
+      "url": "http://nas.play.rwfc.net/payload?g=RMCPD00",
+      "bytes": 28968,
+      "sha256": "fd8f26d6af26f1a0cfaecd1e472fe744a25d75f5136910533b7c75e3eca2f1d2"
+    }
+  }
+}

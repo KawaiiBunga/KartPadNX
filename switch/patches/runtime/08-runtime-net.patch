@@ -1,0 +1,4475 @@
+diff --git a/runtime/src/hle/net/network_core.cpp b/runtime/src/hle/net/network_core.cpp
+--- a/runtime/src/hle/net/network_core.cpp
++++ b/runtime/src/hle/net/network_core.cpp
+@@ -1,751 +1,808 @@
+-#include "network_internal.h"
+-
+-#include "console_identity.h"
+-#include "hle/net/network.h"
+-#include "runtime_config.h"
+-#include "runtime_log.h"
+-#include "runtime_product.h"
+-
+-namespace NetworkHle {
+-
+-bool RetroRewindProfileActive();
+-
+-static std::mutex g_mutex;
+-static std::map<int32_t, DeviceKind> g_devices;
+-static int32_t g_nextDeviceFd = 2000;
+-
+-const std::array<uint8_t, 6>& RuntimeMacAddress() {
+-    return RuntimeConsoleIdentity::Current().mac;
+-}
+-
+-uint64_t RuntimeGeneratedUserId() {
+-    return 0x000000014D4B5752ull;
+-}
+-
+-void ZeroMemoryRange(uint32_t addr, uint32_t size) {
+-    if (!addr || !size) {
+-        return;
+-    }
+-    for (uint32_t i = 0; i < size; ++i) {
+-        Memory::Write8(addr + i, 0);
+-    }
+-}
+-
+-void CopyToGuest(uint32_t addr, const void* data, uint32_t size) {
+-    if (!addr || !data || !size) {
+-        return;
+-    }
+-    uint8_t* out = Memory::GetPointer(addr, size);
+-    if (out) {
+-        std::memcpy(out, data, size);
+-    }
+-}
+-
+-std::string ReadGuestString(uint32_t addr, uint32_t maxLen) {
+-    std::string result;
+-    if (!addr) {
+-        return result;
+-    }
+-    for (uint32_t i = 0; i < maxLen; ++i) {
+-        const char ch = static_cast<char>(Memory::Read8(addr + i));
+-        if (ch == '\0') {
+-            break;
+-        }
+-        result.push_back(ch);
+-    }
+-    return result;
+-}
+-
+-std::string Lower(std::string_view text) {
+-    return RuntimeHle::Lower(text);
+-}
+-
+-bool RetroRewindProfileActive() {
+-    return RuntimeProduct::IsRetroRewind();
+-}
+-
+-bool StartsWith(std::string_view text, std::string_view prefix) {
+-    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+-}
+-
+-// No host rewriting here: the Retro-WFC payload already redirects Nintendo
+-// hostnames at its own resolver hooks before the name reaches this HLE.
+-
+-std::vector<IoVector> ReadVectors(uint32_t vectorPtr, uint32_t count) {
+-    std::vector<IoVector> vectors;
+-    vectors.reserve(count);
+-    for (uint32_t i = 0; i < count; ++i) {
+-        vectors.push_back(RuntimeHle::ReadIoVector(vectorPtr, i));
+-    }
+-    return vectors;
+-}
+-
+-bool WriteReturn(uint32_t outBuf, uint32_t outLen, int32_t value) {
+-    if (!outBuf || outLen < 4) {
+-        return false;
+-    }
+-    Memory::Write32(outBuf, static_cast<uint32_t>(value));
+-    return true;
+-}
+-
+-bool WriteVectorReturn(const std::vector<IoVector>& out, size_t index, int32_t value) {
+-    if (index >= out.size() || out[index].size < 4 || !out[index].address) {
+-        return false;
+-    }
+-    Memory::Write32(out[index].address, static_cast<uint32_t>(value));
+-    return true;
+-}
+-
+-static int32_t AllocateDevice(DeviceKind kind) {
+-    std::lock_guard<std::mutex> lock(g_mutex);
+-    const int32_t fd = g_nextDeviceFd++;
+-    g_devices.emplace(fd, kind);
+-    return fd;
+-}
+-
+-std::optional<DeviceKind> GetDeviceKind(uint32_t fd) {
+-    std::lock_guard<std::mutex> lock(g_mutex);
+-    auto it = g_devices.find(static_cast<int32_t>(fd));
+-    if (it == g_devices.end()) {
+-        return std::nullopt;
+-    }
+-    return it->second;
+-}
+-
+-static bool RemoveDevice(uint32_t fd) {
+-    std::lock_guard<std::mutex> lock(g_mutex);
+-    return g_devices.erase(static_cast<int32_t>(fd)) != 0;
+-}
+-
+-void NetFail(const char* format, ...) {
+-    char line[512];
+-    std::va_list args;
+-    va_start(args, format);
+-    const int written = std::vsnprintf(line, sizeof(line), format, args);
+-    va_end(args);
+-    if (written < 0) {
+-        return;
+-    }
+-    RT_LOGF(RT_TAG_NET, "%s\n", line);
+-    std::fflush(stderr);
+-}
+-
+-std::array<WiiSocket, kWiiSocketMax> g_sockets;
+-int32_t g_lastSocketError = 0;
+-static uint64_t g_nextSocketGeneration = 1;
+-
+-static uint64_t NextSocketGeneration() {
+-    const uint64_t generation = g_nextSocketGeneration++;
+-    if (g_nextSocketGeneration == 0) {
+-        g_nextSocketGeneration = 1;
+-    }
+-    return generation;
+-}
+-
+-bool EnsureSocketRuntime() {
+-#ifdef _WIN32
+-    static bool initialized = [] {
+-        WSADATA data{};
+-        const int result = WSAStartup(MAKEWORD(2, 2), &data);
+-        if (result != 0) {
+-            RT_LOGF(RT_TAG_NET, "WSAStartup failed: %d\n", result);
+-            return false;
+-        }
+-        return true;
+-    }();
+-    return initialized;
+-#else
+-    return true;
+-#endif
+-}
+-
+-int NativeLastError() {
+-#ifdef _WIN32
+-    return WSAGetLastError();
+-#else
+-    return errno;
+-#endif
+-}
+-
+-// Dolphin: WiiSockMan::TranslateErrorCode (IOS/Network/Socket.cpp:42-86).
+-// isReadWrite mirrors Dolphin's is_rw: a nonblocking connect/bind must still
+-// report SO_EINPROGRESS on would-block while send/recv/accept report SO_EAGAIN.
+-// Unmapped codes collapse to -1 rather than -SO_EINVAL, which would make
+-// unrelated failures look like malformed requests to the SDK.
+-int32_t TranslateSocketError(int err, bool isReadWrite) {
+-#ifdef _WIN32
+-    switch (err) {
+-    case WSAEMSGSIZE:
+-        return -1;
+-    case WSAENOTSOCK:
+-        return -SO_EBADF;
+-    case WSAEADDRINUSE:
+-        return -SO_EADDRINUSE;
+-    case WSAECONNRESET:
+-        return -SO_ECONNRESET;
+-    case WSAEISCONN:
+-        return -SO_EISCONN;
+-    case WSAENOTCONN:
+-        return -SO_ENOTCONN;
+-    case WSAEINPROGRESS:
+-        return -SO_EINPROGRESS;
+-    case WSAEALREADY:
+-        return -SO_EALREADY;
+-    case WSAEACCES:
+-        return -SO_EACCES;
+-    case WSAECONNREFUSED:
+-        return -SO_ECONNREFUSED;
+-    case WSAENETUNREACH:
+-        return -SO_ENETUNREACH;
+-    case WSAEHOSTUNREACH:
+-        return -SO_EHOSTUNREACH;
+-    case WSAENOBUFS:
+-        return -SO_ENOMEM;
+-    case WSAENETRESET:
+-        return -SO_ENETRESET;
+-    case WSAEWOULDBLOCK:
+-        return isReadWrite ? -SO_EAGAIN : -SO_EINPROGRESS;
+-    default:
+-        return -1;
+-    }
+-#else
+-    switch (err) {
+-    case EMSGSIZE:
+-        return -1;
+-    case EBADF:
+-        return -SO_EBADF;
+-    case EADDRINUSE:
+-        return -SO_EADDRINUSE;
+-    case ECONNRESET:
+-        return -SO_ECONNRESET;
+-    case EISCONN:
+-        return -SO_EISCONN;
+-    case ENOTCONN:
+-        return -SO_ENOTCONN;
+-    case EINPROGRESS:
+-        return -SO_EINPROGRESS;
+-    case EALREADY:
+-        return -SO_EALREADY;
+-    case EACCES:
+-        return -SO_EACCES;
+-    case ECONNREFUSED:
+-        return -SO_ECONNREFUSED;
+-    case ENETUNREACH:
+-        return -SO_ENETUNREACH;
+-    case EHOSTUNREACH:
+-        return -SO_EHOSTUNREACH;
+-    case ENOMEM:
+-    case ENOBUFS:
+-        return -SO_ENOMEM;
+-    case ENETRESET:
+-        return -SO_ENETRESET;
+-#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+-    case EWOULDBLOCK:
+-#endif
+-    case EAGAIN:
+-        return isReadWrite ? -SO_EAGAIN : -SO_EINPROGRESS;
+-    default:
+-        return -1;
+-    }
+-#endif
+-}
+-
+-#ifdef _WIN32
+-// Dolphin: WiiSockMan::GetNetErrorCode (IOS/Network/Socket.cpp:100-109). Winsock
+-// reports WSAEINVAL rather than WSAEALREADY when a connect is already pending on
+-// the socket (a Winsock 1.1 compatibility behaviour, also seen when a layered
+-// provider hijacks ws2_32). Only the connect paths may apply this.
+-int NormalizeConnectError(int err) {
+-    return err == WSAEINVAL ? WSAEALREADY : err;
+-}
+-#else
+-int NormalizeConnectError(int err) {
+-    return err;
+-}
+-#endif
+-
+-int32_t SocketResult(int ret, bool isReadWrite) {
+-    if (ret >= 0) {
+-        g_lastSocketError = 0;
+-        return ret;
+-    }
+-    g_lastSocketError = TranslateSocketError(NativeLastError(), isReadWrite);
+-    return g_lastSocketError;
+-}
+-
+-int32_t SocketErrorResult(int nativeErr, bool isReadWrite) {
+-    g_lastSocketError = TranslateSocketError(nativeErr, isReadWrite);
+-    return g_lastSocketError;
+-}
+-
+-bool IsWouldBlockError(int err) {
+-#ifdef _WIN32
+-    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEALREADY;
+-#else
+-    return err == EWOULDBLOCK || err == EAGAIN || err == EINPROGRESS || err == EALREADY;
+-#endif
+-}
+-
+-// Mirrors Dolphin's WiiSocket::GetConnectingState (IOS/Network/Socket.cpp:751-826):
+-// select() on write+except, never WSAPoll, since WSAPoll does not report a failed
+-// connect and a refused/unreachable peer would stay "pending" forever. Returns >0
+-// once settled, 0 while in flight, <0 if the probe itself failed.
+-int ProbeConnectSettled(NativeSocket socket, int timeoutMs) {
+-#ifdef _WIN32
+-    fd_set writeFds;
+-    fd_set exceptFds;
+-    FD_ZERO(&writeFds);
+-    FD_ZERO(&exceptFds);
+-    FD_SET(socket, &writeFds);
+-    FD_SET(socket, &exceptFds);
+-    timeval limit{};
+-    limit.tv_sec = timeoutMs / 1000;
+-    limit.tv_usec = (timeoutMs % 1000) * 1000;
+-    const int ret = select(0, nullptr, &writeFds, &exceptFds, timeoutMs < 0 ? nullptr : &limit);
+-    if (ret <= 0) {
+-        return ret;
+-    }
+-    return (FD_ISSET(socket, &writeFds) || FD_ISSET(socket, &exceptFds)) ? 1 : 0;
+-#else
+-    pollfd descriptor{};
+-    descriptor.fd = socket;
+-    descriptor.events = POLLOUT;
+-    const int ret = poll(&descriptor, 1, timeoutMs);
+-    if (ret <= 0) {
+-        return ret;
+-    }
+-    return (descriptor.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) ? 1 : 0;
+-#endif
+-}
+-
+-// Dolphin confirms a settled connect with getsockopt(SO_ERROR) followed by
+-// getpeername(); the second call is what rejects a socket that reported
+-// writability without ever reaching ESTABLISHED.
+-int32_t ClassifySettledConnect(NativeSocket socket) {
+-    int socketError = 0;
+-    socklen_t socketErrorLen = sizeof(socketError);
+-    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError),
+-                   &socketErrorLen) != 0) {
+-        return TranslateSocketError(NativeLastError(), false);
+-    }
+-    if (socketError != 0) {
+-        return TranslateSocketError(socketError, false);
+-    }
+-
+-    sockaddr_in peer{};
+-    socklen_t peerLen = sizeof(peer);
+-    if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peerLen) != 0) {
+-        return TranslateSocketError(NativeLastError(), false);
+-    }
+-    return 0;
+-}
+-
+-static int32_t FinishNonBlockingConnect(NativeSocket socket, int timeoutMs) {
+-    const int pollRet = ProbeConnectSettled(socket, timeoutMs);
+-    if (pollRet <= 0) {
+-        // Dolphin reports a connect that never settled as -SO_ENETUNREACH
+-        // (IOS/Network/Socket.cpp:352-356), not -SO_ETIMEDOUT: ETIMEDOUT is not
+-        // even reachable through its error table, so the SDK never handles it.
+-        const int hostError = pollRet < 0 ? NativeLastError() : 0;
+-        return pollRet == 0 ? -SO_ENETUNREACH : TranslateSocketError(hostError, false);
+-    }
+-    return ClassifySettledConnect(socket);
+-}
+-
+-bool WaitForReadable(NativeSocket socket, int timeoutMs) {
+-    if (timeoutMs <= 0) {
+-        return false;
+-    }
+-
+-    pollfd pfd{};
+-    pfd.fd = socket;
+-    pfd.events = POLLRDNORM;
+-#ifdef _WIN32
+-    const int ret = WSAPoll(&pfd, 1, timeoutMs);
+-#else
+-    const int ret = poll(&pfd, 1, timeoutMs);
+-#endif
+-    return ret > 0 && (pfd.revents & (POLLRDNORM | POLLIN | POLLERR | POLLHUP)) != 0;
+-}
+-
+-void CloseNativeSocket(NativeSocket socket) {
+-    if (socket == kInvalidSocket) {
+-        return;
+-    }
+-#ifdef _WIN32
+-    closesocket(socket);
+-#else
+-    close(socket);
+-#endif
+-}
+-
+-void SetNonBlocking(NativeSocket socket, bool enabled) {
+-#ifdef _WIN32
+-    u_long mode = enabled ? 1 : 0;
+-    ioctlsocket(socket, FIONBIO, &mode);
+-#else
+-    int flags = fcntl(socket, F_GETFL, 0);
+-    if (flags >= 0) {
+-        if (enabled) {
+-            flags |= O_NONBLOCK;
+-        } else {
+-            flags &= ~O_NONBLOCK;
+-        }
+-        fcntl(socket, F_SETFL, flags);
+-    }
+-#endif
+-}
+-
+-
+-
+-static void ConfigureUdpSocket(NativeSocket socket, int type) {
+-#ifdef _WIN32
+-    if (type != SOCK_DGRAM) {
+-        return;
+-    }
+-
+-    BOOL disabled = FALSE;
+-    DWORD bytesReturned = 0;
+-    WSAIoctl(socket, SIO_UDP_CONNRESET, &disabled, sizeof(disabled),
+-             nullptr, 0, &bytesReturned, nullptr, nullptr);
+-#else
+-    (void)socket;
+-    (void)type;
+-#endif
+-}
+-
+-int32_t ReconnectWiiSocket(WiiSocket& socket, uint16_t port) {
+-    if (!socket.hasPeerAddr || socket.type != SOCK_STREAM) {
+-        return -SO_EINVAL;
+-    }
+-
+-    NativeSocket native = ::socket(socket.af, socket.type, socket.protocol);
+-    if (native == kInvalidSocket) {
+-        return SocketResult(-1, false);
+-    }
+-    ConfigureUdpSocket(native, socket.type);
+-
+-    SetNonBlocking(native, true);
+-    sockaddr_in addr = socket.peerAddr;
+-    addr.sin_port = htons(port);
+-    const int ret = connect(native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+-    const int nativeErr = ret < 0 ? NormalizeConnectError(NativeLastError()) : 0;
+-    int32_t result = 0;
+-    if (ret < 0 && IsWouldBlockError(nativeErr)) {
+-        result = FinishNonBlockingConnect(native, 10000);
+-    } else if (ret < 0) {
+-        result = SocketErrorResult(nativeErr, false);
+-    } else {
+-        result = SocketResult(ret, false);
+-    }
+-    g_lastSocketError = result;
+-    if (result != 0) {
+-        CloseNativeSocket(native);
+-        return result;
+-    }
+-
+-    CloseNativeSocket(socket.native);
+-    socket.native = native;
+-    socket.generation = NextSocketGeneration();
+-    socket.peerAddr = addr;
+-    socket.peerPort = port;
+-    socket.nonblocking = false;
+-    SetNonBlocking(socket.native, false);
+-    return 0;
+-}
+-
+-int MapWiiAf(uint32_t af) {
+-    if (af == kWiiAfInet) {
+-        return AF_INET;
+-    }
+-#ifdef AF_INET6
+-    if (af == kWiiAfInet6) {
+-        return AF_INET6;
+-    }
+-#endif
+-    return -1;
+-}
+-
+-int MapNativeAfToWii(int af) {
+-    if (af == AF_INET) {
+-        return kWiiAfInet;
+-    }
+-#ifdef AF_INET6
+-    if (af == AF_INET6) {
+-        return kWiiAfInet6;
+-    }
+-#endif
+-    return -1;
+-}
+-
+-int MapWiiSocketType(uint32_t type) {
+-    if (type == 0) {
+-        return 0;
+-    }
+-    if (type == kWiiSockStream) {
+-        return SOCK_STREAM;
+-    }
+-    if (type == kWiiSockDgram) {
+-        return SOCK_DGRAM;
+-    }
+-#ifdef SOCK_RAW
+-    if (type == kWiiSockRaw) {
+-        return SOCK_RAW;
+-    }
+-#endif
+-#ifdef SOCK_RDM
+-    if (type == kWiiSockRdm) {
+-        return SOCK_RDM;
+-    }
+-#endif
+-#ifdef SOCK_SEQPACKET
+-    if (type == kWiiSockSeqPacket) {
+-        return SOCK_SEQPACKET;
+-    }
+-#endif
+-    return -1;
+-}
+-
+-int MapWiiAddrInfoFamily(uint32_t family) {
+-    const int mapped = MapWiiAf(family);
+-    // Dolphin passes unfamiliar addrinfo hint values through to the host
+-    // resolver, which then returns the platform's EAI_FAMILY equivalent. Do
+-    // not turn an invalid family into AF_INET and accidentally resolve it.
+-    return mapped >= 0 ? mapped : static_cast<int>(family);
+-}
+-
+-int MapWiiAddrInfoSocketType(uint32_t type) {
+-    const int mapped = MapWiiSocketType(type);
+-    // Wii and host socket type values match for the common types, but retain
+-    // Dolphin's pass-through behavior for an unfamiliar hint so getaddrinfo
+-    // can reject it instead of silently broadening the query.
+-    return mapped >= 0 ? mapped : static_cast<int>(type);
+-}
+-
+-uint32_t MapNativeSocketTypeToWii(int type) {
+-    if (type == 0) {
+-        return 0;
+-    }
+-    if (type == SOCK_STREAM) {
+-        return kWiiSockStream;
+-    }
+-    if (type == SOCK_DGRAM) {
+-        return kWiiSockDgram;
+-    }
+-#ifdef SOCK_RAW
+-    if (type == SOCK_RAW) {
+-        return kWiiSockRaw;
+-    }
+-#endif
+-#ifdef SOCK_RDM
+-    if (type == SOCK_RDM) {
+-        return kWiiSockRdm;
+-    }
+-#endif
+-#ifdef SOCK_SEQPACKET
+-    if (type == SOCK_SEQPACKET) {
+-        return kWiiSockSeqPacket;
+-    }
+-#endif
+-    // Dolphin writes ai_socktype without coercion. Preserve an unfamiliar host
+-    // value rather than silently changing it to SOCK_STREAM.
+-    return static_cast<uint32_t>(type);
+-}
+-
+-int32_t AddWiiSocket(NativeSocket native, int af, int type, int protocol) {
+-    if (native == kInvalidSocket) {
+-        return SocketResult(-1, false);
+-    }
+-    for (int i = 0; i < kWiiSocketMax; ++i) {
+-        if (g_sockets[i].native == kInvalidSocket) {
+-            ConfigureUdpSocket(native, type);
+-            if (type == SOCK_DGRAM) {
+-                // Dolphin: WiiSockMan::AddSocket - "Wii UDP sockets can use
+-                // broadcast address by default" (IOS/Network/Socket.cpp:905-916).
+-                // Without this a sendto() to a broadcast address fails with
+-                // EACCES/WSAEACCES on the host but succeeds on hardware.
+-                const int enableBroadcast = 1;
+-                setsockopt(native, SOL_SOCKET, SO_BROADCAST,
+-                           reinterpret_cast<const char*>(&enableBroadcast),
+-                           sizeof(enableBroadcast));
+-            }
+-            SetNonBlocking(native, true);
+-            // IOS keeps the host descriptor nonblocking while the guest flag starts cleared.
+-            g_sockets[i] = {native, af, type, protocol, false};
+-            g_sockets[i].generation = NextSocketGeneration();
+-            return i;
+-        }
+-    }
+-    CloseNativeSocket(native);
+-    return -SO_EMFILE;
+-}
+-
+-WiiSocket* GetWiiSocket(uint32_t fd) {
+-    if (fd >= kWiiSocketMax || g_sockets[fd].native == kInvalidSocket) {
+-        g_lastSocketError = -SO_EBADF;
+-        return nullptr;
+-    }
+-    return &g_sockets[fd];
+-}
+-
+-bool SocketIdentityIsCurrent(uint32_t wiiFd, NativeSocket nativeFd, uint64_t generation) {
+-    if (wiiFd >= g_sockets.size()) {
+-        return false;
+-    }
+-    const WiiSocket& socket = g_sockets[wiiFd];
+-    return socket.native != kInvalidSocket && socket.native == nativeFd &&
+-           socket.generation == generation;
+-}
+-
+-bool CopiedPollSocketIsStillValid(const NetworkPollContract::CopiedDescriptor& descriptor) {
+-    return SocketIdentityIsCurrent(descriptor.wiiFd, descriptor.nativeFd,
+-                                   descriptor.socketGeneration);
+-}
+-
+-bool ValidatePollRequest(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen,
+-                         uint32_t& descriptorCount) {
+-    descriptorCount = outLen / 12u;
+-    return inBuf && outBuf && inLen >= 8u && descriptorCount != 0 &&
+-           descriptorCount <= NetworkPollContract::kMaxDescriptors &&
+-           Memory::Contains(inBuf, 8u) &&
+-           Memory::Contains(outBuf, static_cast<size_t>(descriptorCount) * 12u);
+-}
+-
+-std::vector<NetworkPollContract::CopiedDescriptor> CopyPollDescriptors(uint32_t outBuf,
+-                                                                      uint32_t descriptorCount) {
+-    std::vector<NetworkPollContract::CopiedDescriptor> descriptors;
+-    descriptors.reserve(descriptorCount);
+-    for (uint32_t i = 0; i < descriptorCount; ++i) {
+-        const uint32_t entry = outBuf + i * 12u;
+-        NetworkPollContract::CopiedDescriptor descriptor{};
+-        descriptor.wiiFd = Memory::Read32(entry);
+-        descriptor.events = NetworkPollContract::WiiEventsToNative(Memory::Read32(entry + 4u));
+-        if (descriptor.wiiFd < g_sockets.size()) {
+-            const WiiSocket& socket = g_sockets[descriptor.wiiFd];
+-            if (socket.native != kInvalidSocket) {
+-                descriptor.nativeFd = socket.native;
+-                descriptor.socketGeneration = socket.generation;
+-            }
+-        }
+-        descriptors.push_back(descriptor);
+-    }
+-    return descriptors;
+-}
+-
+-void WritePollResults(uint32_t outAddress,
+-                      const std::vector<NetworkPollContract::CopiedDescriptor>& descriptors) {
+-    for (size_t i = 0; i < descriptors.size(); ++i) {
+-        Memory::Write32(outAddress + static_cast<uint32_t>(i * 12u + 8u),
+-                        NetworkPollContract::NativeEventsToWii(descriptors[i].revents));
+-    }
+-}
+-
+-}  // namespace NetworkHle
+-
+-using namespace NetworkHle;
+-
+-extern "C" int32_t Network_HLE_OpenDevice(const char* path, uint32_t mode) {
+-    if (!path) {
+-        return -101;
+-    }
+-    if (!RuntimeConfigFile::NetworkEnabled(true)) {
+-        // The guest opens several /dev/net nodes at boot and retries; report the
+-        // reason online will not work exactly once.
+-        static bool reported = false;
+-        if (!reported) {
+-            reported = true;
+-            NetFail("networking is disabled in Config.toml; online play is unavailable");
+-        }
+-        return 0;
+-    }
+-    DeviceKind kind;
+-    if (std::strcmp(path, "/dev/net/kd/request") == 0) {
+-        kind = DeviceKind::KdRequest;
+-    } else if (std::strcmp(path, "/dev/net/kd/time") == 0) {
+-        kind = DeviceKind::KdTime;
+-    } else if (std::strcmp(path, "/dev/net/ncd/manage") == 0) {
+-        kind = DeviceKind::NcdManage;
+-    } else if (std::strcmp(path, "/dev/net/ip/top") == 0) {
+-        kind = DeviceKind::IpTop;
+-        EnsureSocketRuntime();
+-    } else if (std::strcmp(path, "/dev/net/ssl") == 0) {
+-        kind = DeviceKind::Ssl;
+-        EnsureSocketRuntime();
+-    } else {
+-        return 0;
+-    }
+-
+-    return AllocateDevice(kind);
+-}
+-
+-extern "C" bool Network_HLE_IsFd(uint32_t fd) {
+-    return GetDeviceKind(fd).has_value();
+-}
+-
+-extern "C" int32_t Network_HLE_Close(uint32_t fd) {
+-    if (!GetDeviceKind(fd)) {
+-        return -101;
+-    }
+-    RemoveDevice(fd);
+-    return 0;
+-}
+-
+-extern "C" int32_t Network_HLE_Ioctl(uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen,
+-                                      uint32_t outBuf, uint32_t outLen) {
+-    const auto device = GetDeviceKind(fd);
+-    if (!device) {
+-        return -101;
+-    }
+-    switch (*device) {
+-    case DeviceKind::KdRequest:
+-        return HandleKdIoctl(cmd, inBuf, inLen, outBuf, outLen);
+-    case DeviceKind::KdTime:
+-        return HandleKdTimeIoctl(cmd, inBuf, inLen, outBuf, outLen);
+-    case DeviceKind::IpTop:
+-        return HandleIpTopIoctl(cmd, inBuf, inLen, outBuf, outLen);
+-    case DeviceKind::NcdManage:
+-        return 0;
+-    case DeviceKind::Ssl:
+-        return 0;
+-    }
+-    return -101;
+-}
+-
+-extern "C" int32_t Network_HLE_Ioctlv(uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
+-                                       uint32_t vectorPtr) {
+-    const auto device = GetDeviceKind(fd);
+-    if (!device) {
+-        return -101;
+-    }
+-    // numIn/numOut are guest-controlled; sum in 64-bit so a wrap can't make
+-    // `vectors` shorter than numIn and run the iterator arithmetic below off
+-    // the end. Matches PrepareDeferredGetAddrInfo in network_deferred.cpp.
+-    const uint64_t vectorCount = static_cast<uint64_t>(numIn) + numOut;
+-    if (vectorCount > kMaxIoVectors || (vectorCount != 0 &&
+-        (!vectorPtr || !Memory::Contains(vectorPtr, static_cast<size_t>(vectorCount) * 8u)))) {
+-        return -SO_EINVAL;
+-    }
+-
+-    const std::vector<IoVector> vectors = ReadVectors(vectorPtr, static_cast<uint32_t>(vectorCount));
+-    const std::vector<IoVector> in(vectors.begin(), vectors.begin() + numIn);
+-    const std::vector<IoVector> out(vectors.begin() + numIn, vectors.end());
+-
+-    switch (*device) {
+-    case DeviceKind::NcdManage:
+-        return HandleNcdIoctlv(cmd, in, out);
+-    case DeviceKind::IpTop:
+-        return HandleIpTopIoctlv(cmd, in, out);
+-    case DeviceKind::KdRequest:
+-        return HandleKdIoctlv(cmd, in, out);
+-    case DeviceKind::KdTime: {
+-        const uint32_t inBuf = in.empty() ? 0 : in[0].address;
+-        const uint32_t inLen = in.empty() ? 0 : in[0].size;
+-        const uint32_t outBuf = out.empty() ? 0 : out[0].address;
+-        const uint32_t outLen = out.empty() ? 0 : out[0].size;
+-        return HandleKdTimeIoctl(cmd, inBuf, inLen, outBuf, outLen);
+-    }
+-    case DeviceKind::Ssl:
+-        return HandleSslIoctlv(cmd, in, out);
+-    }
+-    return -101;
+-}
++#include "network_internal.h"
++
++#include "console_identity.h"
++#include "hle/net/network.h"
++#include "runtime_config.h"
++#include "runtime_log.h"
++#include "runtime_product.h"
++
++namespace NetworkHle {
++
++bool RetroRewindProfileActive();
++
++static std::mutex g_mutex;
++static std::map<int32_t, DeviceKind> g_devices;
++static int32_t g_nextDeviceFd = 2000;
++
++const std::array<uint8_t, 6>& RuntimeMacAddress() {
++    return RuntimeConsoleIdentity::Current().mac;
++}
++
++uint64_t RuntimeGeneratedUserId() {
++    return 0x000000014D4B5752ull;
++}
++
++void ZeroMemoryRange(uint32_t addr, uint32_t size) {
++    if (!addr || !size) {
++        return;
++    }
++    for (uint32_t i = 0; i < size; ++i) {
++        Memory::Write8(addr + i, 0);
++    }
++}
++
++void CopyToGuest(uint32_t addr, const void* data, uint32_t size) {
++    if (!addr || !data || !size) {
++        return;
++    }
++    uint8_t* out = Memory::GetPointer(addr, size);
++    if (out) {
++        std::memcpy(out, data, size);
++    }
++}
++
++std::string ReadGuestString(uint32_t addr, uint32_t maxLen) {
++    std::string result;
++    if (!addr) {
++        return result;
++    }
++    for (uint32_t i = 0; i < maxLen; ++i) {
++        const char ch = static_cast<char>(Memory::Read8(addr + i));
++        if (ch == '\0') {
++            break;
++        }
++        result.push_back(ch);
++    }
++    return result;
++}
++
++std::string Lower(std::string_view text) {
++    return RuntimeHle::Lower(text);
++}
++
++bool RetroRewindProfileActive() {
++    return RuntimeProduct::IsRetroRewind();
++}
++
++bool StartsWith(std::string_view text, std::string_view prefix) {
++    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
++}
++
++// No host rewriting here: the Retro-WFC payload already redirects Nintendo
++// hostnames at its own resolver hooks before the name reaches this HLE.
++
++std::vector<IoVector> ReadVectors(uint32_t vectorPtr, uint32_t count) {
++    std::vector<IoVector> vectors;
++    vectors.reserve(count);
++    for (uint32_t i = 0; i < count; ++i) {
++        vectors.push_back(RuntimeHle::ReadIoVector(vectorPtr, i));
++    }
++    return vectors;
++}
++
++bool WriteReturn(uint32_t outBuf, uint32_t outLen, int32_t value) {
++    if (!outBuf || outLen < 4) {
++        return false;
++    }
++    Memory::Write32(outBuf, static_cast<uint32_t>(value));
++    return true;
++}
++
++bool WriteVectorReturn(const std::vector<IoVector>& out, size_t index, int32_t value) {
++    if (index >= out.size() || out[index].size < 4 || !out[index].address) {
++        return false;
++    }
++    Memory::Write32(out[index].address, static_cast<uint32_t>(value));
++    return true;
++}
++
++static int32_t AllocateDevice(DeviceKind kind) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    const int32_t fd = g_nextDeviceFd++;
++    g_devices.emplace(fd, kind);
++    return fd;
++}
++
++std::optional<DeviceKind> GetDeviceKind(uint32_t fd) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    auto it = g_devices.find(static_cast<int32_t>(fd));
++    if (it == g_devices.end()) {
++        return std::nullopt;
++    }
++    return it->second;
++}
++
++static bool RemoveDevice(uint32_t fd) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    return g_devices.erase(static_cast<int32_t>(fd)) != 0;
++}
++
++
++extern "C" int kartpad_perf_int(const char* key, int fallback) __attribute__((weak));
++
++void NetTrace(const char* format, ...) {
++    if (kartpad_perf_int == nullptr || kartpad_perf_int("net_trace", 0) != 1) {
++        return;
++    }
++    char buf[1024];
++    va_list args;
++    va_start(args, format);
++    vsnprintf(buf, sizeof(buf), format, args);
++    va_end(args);
++    RT_LOGF(RT_TAG_NET, "[trace] %s\n", buf);
++}
++
++void NetFail(const char* format, ...) {
++    char line[512];
++    std::va_list args;
++    va_start(args, format);
++    const int written = std::vsnprintf(line, sizeof(line), format, args);
++    va_end(args);
++    if (written < 0) {
++        return;
++    }
++    RT_LOGF(RT_TAG_NET, "%s\n", line);
++    std::fflush(stderr);
++}
++
++std::array<WiiSocket, kWiiSocketMax> g_sockets;
++int32_t g_lastSocketError = 0;
++static uint64_t g_nextSocketGeneration = 1;
++
++static uint64_t NextSocketGeneration() {
++    const uint64_t generation = g_nextSocketGeneration++;
++    if (g_nextSocketGeneration == 0) {
++        g_nextSocketGeneration = 1;
++    }
++    return generation;
++}
++
++bool EnsureSocketRuntime() {
++#ifdef _WIN32
++    static bool initialized = [] {
++        WSADATA data{};
++        const int result = WSAStartup(MAKEWORD(2, 2), &data);
++        if (result != 0) {
++            RT_LOGF(RT_TAG_NET, "WSAStartup failed: %d\n", result);
++            return false;
++        }
++        return true;
++    }();
++    return initialized;
++#else
++    return true;
++#endif
++}
++
++int NativeLastError() {
++#ifdef _WIN32
++    return WSAGetLastError();
++#else
++    return errno;
++#endif
++}
++
++// Dolphin: WiiSockMan::TranslateErrorCode (IOS/Network/Socket.cpp:42-86).
++// isReadWrite mirrors Dolphin's is_rw: a nonblocking connect/bind must still
++// report SO_EINPROGRESS on would-block while send/recv/accept report SO_EAGAIN.
++// Unmapped codes collapse to -1 rather than -SO_EINVAL, which would make
++// unrelated failures look like malformed requests to the SDK.
++int32_t TranslateSocketError(int err, bool isReadWrite) {
++#ifdef _WIN32
++    switch (err) {
++    case WSAEMSGSIZE:
++        return -1;
++    case WSAENOTSOCK:
++        return -SO_EBADF;
++    case WSAEADDRINUSE:
++        return -SO_EADDRINUSE;
++    case WSAECONNRESET:
++        return -SO_ECONNRESET;
++    case WSAEISCONN:
++        return -SO_EISCONN;
++    case WSAENOTCONN:
++        return -SO_ENOTCONN;
++    case WSAEINPROGRESS:
++        return -SO_EINPROGRESS;
++    case WSAEALREADY:
++        return -SO_EALREADY;
++    case WSAEACCES:
++        return -SO_EACCES;
++    case WSAECONNREFUSED:
++        return -SO_ECONNREFUSED;
++    case WSAENETUNREACH:
++        return -SO_ENETUNREACH;
++    case WSAEHOSTUNREACH:
++        return -SO_EHOSTUNREACH;
++    case WSAENOBUFS:
++        return -SO_ENOMEM;
++    case WSAENETRESET:
++        return -SO_ENETRESET;
++    case WSAEWOULDBLOCK:
++        return isReadWrite ? -SO_EAGAIN : -SO_EINPROGRESS;
++    default:
++        return -1;
++    }
++#else
++    switch (err) {
++    case EMSGSIZE:
++        return -1;
++    case EBADF:
++        return -SO_EBADF;
++    case EADDRINUSE:
++        return -SO_EADDRINUSE;
++    case ECONNRESET:
++        return -SO_ECONNRESET;
++    case EISCONN:
++        return -SO_EISCONN;
++    case ENOTCONN:
++        return -SO_ENOTCONN;
++    case EINPROGRESS:
++        return -SO_EINPROGRESS;
++    case EALREADY:
++        return -SO_EALREADY;
++    case EACCES:
++        return -SO_EACCES;
++    case ECONNREFUSED:
++        return -SO_ECONNREFUSED;
++    case ENETUNREACH:
++        return -SO_ENETUNREACH;
++    case EHOSTUNREACH:
++        return -SO_EHOSTUNREACH;
++    case ENOMEM:
++    case ENOBUFS:
++        return -SO_ENOMEM;
++    case ENETRESET:
++        return -SO_ENETRESET;
++#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
++    case EWOULDBLOCK:
++#endif
++    case EAGAIN:
++        return isReadWrite ? -SO_EAGAIN : -SO_EINPROGRESS;
++    default:
++        return -1;
++    }
++#endif
++}
++
++#ifdef _WIN32
++// Dolphin: WiiSockMan::GetNetErrorCode (IOS/Network/Socket.cpp:100-109). Winsock
++// reports WSAEINVAL rather than WSAEALREADY when a connect is already pending on
++// the socket (a Winsock 1.1 compatibility behaviour, also seen when a layered
++// provider hijacks ws2_32). Only the connect paths may apply this.
++int NormalizeConnectError(int err) {
++    return err == WSAEINVAL ? WSAEALREADY : err;
++}
++#else
++int NormalizeConnectError(int err) {
++    return err;
++}
++#endif
++
++int32_t SocketResult(int ret, bool isReadWrite) {
++    if (ret >= 0) {
++        g_lastSocketError = 0;
++        return ret;
++    }
++    g_lastSocketError = TranslateSocketError(NativeLastError(), isReadWrite);
++    return g_lastSocketError;
++}
++
++int32_t SocketErrorResult(int nativeErr, bool isReadWrite) {
++    g_lastSocketError = TranslateSocketError(nativeErr, isReadWrite);
++    return g_lastSocketError;
++}
++
++bool IsWouldBlockError(int err) {
++#ifdef _WIN32
++    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEALREADY;
++#else
++    return err == EWOULDBLOCK || err == EAGAIN || err == EINPROGRESS || err == EALREADY;
++#endif
++}
++
++// Mirrors Dolphin's WiiSocket::GetConnectingState (IOS/Network/Socket.cpp:751-826):
++// select() on write+except, never WSAPoll, since WSAPoll does not report a failed
++// connect and a refused/unreachable peer would stay "pending" forever. Returns >0
++// once settled, 0 while in flight, <0 if the probe itself failed.
++int ProbeConnectSettled(NativeSocket socket, int timeoutMs) {
++#ifdef _WIN32
++    fd_set writeFds;
++    fd_set exceptFds;
++    FD_ZERO(&writeFds);
++    FD_ZERO(&exceptFds);
++    FD_SET(socket, &writeFds);
++    FD_SET(socket, &exceptFds);
++    timeval limit{};
++    limit.tv_sec = timeoutMs / 1000;
++    limit.tv_usec = (timeoutMs % 1000) * 1000;
++    const int ret = select(0, nullptr, &writeFds, &exceptFds, timeoutMs < 0 ? nullptr : &limit);
++    if (ret <= 0) {
++        return ret;
++    }
++    return (FD_ISSET(socket, &writeFds) || FD_ISSET(socket, &exceptFds)) ? 1 : 0;
++#else
++    pollfd descriptor{};
++    descriptor.fd = socket;
++    descriptor.events = POLLOUT;
++    const int ret = poll(&descriptor, 1, timeoutMs);
++    if (ret <= 0) {
++        return ret;
++    }
++    return (descriptor.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) ? 1 : 0;
++#endif
++}
++
++// Dolphin confirms a settled connect with getsockopt(SO_ERROR) followed by
++// getpeername(); the second call is what rejects a socket that reported
++// writability without ever reaching ESTABLISHED.
++int32_t ClassifySettledConnect(NativeSocket socket) {
++    int socketError = 0;
++    socklen_t socketErrorLen = sizeof(socketError);
++    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError),
++                   &socketErrorLen) != 0) {
++        return TranslateSocketError(NativeLastError(), false);
++    }
++    if (socketError != 0) {
++        return TranslateSocketError(socketError, false);
++    }
++
++    sockaddr_in peer{};
++    socklen_t peerLen = sizeof(peer);
++    if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peerLen) != 0) {
++        return TranslateSocketError(NativeLastError(), false);
++    }
++    return 0;
++}
++
++static int32_t FinishNonBlockingConnect(NativeSocket socket, int timeoutMs) {
++    const int pollRet = ProbeConnectSettled(socket, timeoutMs);
++    if (pollRet <= 0) {
++        // Dolphin reports a connect that never settled as -SO_ENETUNREACH
++        // (IOS/Network/Socket.cpp:352-356), not -SO_ETIMEDOUT: ETIMEDOUT is not
++        // even reachable through its error table, so the SDK never handles it.
++        const int hostError = pollRet < 0 ? NativeLastError() : 0;
++        return pollRet == 0 ? -SO_ENETUNREACH : TranslateSocketError(hostError, false);
++    }
++    return ClassifySettledConnect(socket);
++}
++
++bool WaitForReadable(NativeSocket socket, int timeoutMs) {
++    if (timeoutMs <= 0) {
++        return false;
++    }
++
++    pollfd pfd{};
++    pfd.fd = socket;
++    pfd.events = POLLRDNORM;
++#ifdef _WIN32
++    const int ret = WSAPoll(&pfd, 1, timeoutMs);
++#else
++    const int ret = poll(&pfd, 1, timeoutMs);
++#endif
++    return ret > 0 && (pfd.revents & (POLLRDNORM | POLLIN | POLLERR | POLLHUP)) != 0;
++}
++
++void CloseNativeSocket(NativeSocket socket) {
++    if (socket == kInvalidSocket) {
++        return;
++    }
++#ifdef _WIN32
++    closesocket(socket);
++#else
++    close(socket);
++#endif
++}
++
++void SetNonBlocking(NativeSocket socket, bool enabled) {
++#ifdef _WIN32
++    u_long mode = enabled ? 1 : 0;
++    ioctlsocket(socket, FIONBIO, &mode);
++#else
++    int flags = fcntl(socket, F_GETFL, 0);
++    if (flags >= 0) {
++        if (enabled) {
++            flags |= O_NONBLOCK;
++        } else {
++            flags &= ~O_NONBLOCK;
++        }
++        fcntl(socket, F_SETFL, flags);
++    }
++#endif
++}
++
++
++
++static void ConfigureUdpSocket(NativeSocket socket, int type) {
++#ifdef _WIN32
++    if (type != SOCK_DGRAM) {
++        return;
++    }
++
++    BOOL disabled = FALSE;
++    DWORD bytesReturned = 0;
++    WSAIoctl(socket, SIO_UDP_CONNRESET, &disabled, sizeof(disabled),
++             nullptr, 0, &bytesReturned, nullptr, nullptr);
++#else
++    (void)socket;
++    (void)type;
++#endif
++}
++
++int32_t ReconnectWiiSocket(WiiSocket& socket, uint16_t port) {
++    if (!socket.hasPeerAddr || socket.type != SOCK_STREAM) {
++        return -SO_EINVAL;
++    }
++
++    NativeSocket native = ::socket(socket.af, socket.type, socket.protocol);
++    if (native == kInvalidSocket) {
++        return SocketResult(-1, false);
++    }
++    ConfigureUdpSocket(native, socket.type);
++
++    SetNonBlocking(native, true);
++    sockaddr_in addr = socket.peerAddr;
++    addr.sin_port = htons(port);
++    const int ret = connect(native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
++    const int nativeErr = ret < 0 ? NormalizeConnectError(NativeLastError()) : 0;
++    int32_t result = 0;
++    if (ret < 0 && IsWouldBlockError(nativeErr)) {
++        result = FinishNonBlockingConnect(native, 10000);
++    } else if (ret < 0) {
++        result = SocketErrorResult(nativeErr, false);
++    } else {
++        result = SocketResult(ret, false);
++    }
++    g_lastSocketError = result;
++    if (result != 0) {
++        CloseNativeSocket(native);
++        return result;
++    }
++
++    CloseNativeSocket(socket.native);
++    socket.native = native;
++    socket.generation = NextSocketGeneration();
++    socket.peerAddr = addr;
++    socket.peerPort = port;
++    socket.nonblocking = false;
++    SetNonBlocking(socket.native, false);
++    return 0;
++}
++
++int MapWiiAf(uint32_t af) {
++    if (af == kWiiAfInet) {
++        return AF_INET;
++    }
++#ifdef AF_INET6
++    if (af == kWiiAfInet6) {
++        return AF_INET6;
++    }
++#endif
++    return -1;
++}
++
++int MapNativeAfToWii(int af) {
++    if (af == AF_INET) {
++        return kWiiAfInet;
++    }
++#ifdef AF_INET6
++    if (af == AF_INET6) {
++        return kWiiAfInet6;
++    }
++#endif
++    return -1;
++}
++
++int MapWiiSocketType(uint32_t type) {
++    if (type == 0) {
++        return 0;
++    }
++    if (type == kWiiSockStream) {
++        return SOCK_STREAM;
++    }
++    if (type == kWiiSockDgram) {
++        return SOCK_DGRAM;
++    }
++#ifdef SOCK_RAW
++    if (type == kWiiSockRaw) {
++        return SOCK_RAW;
++    }
++#endif
++#ifdef SOCK_RDM
++    if (type == kWiiSockRdm) {
++        return SOCK_RDM;
++    }
++#endif
++#ifdef SOCK_SEQPACKET
++    if (type == kWiiSockSeqPacket) {
++        return SOCK_SEQPACKET;
++    }
++#endif
++    return -1;
++}
++
++int MapWiiAddrInfoFamily(uint32_t family) {
++    const int mapped = MapWiiAf(family);
++    // Dolphin passes unfamiliar addrinfo hint values through to the host
++    // resolver, which then returns the platform's EAI_FAMILY equivalent. Do
++    // not turn an invalid family into AF_INET and accidentally resolve it.
++    return mapped >= 0 ? mapped : static_cast<int>(family);
++}
++
++int MapWiiAddrInfoSocketType(uint32_t type) {
++    const int mapped = MapWiiSocketType(type);
++    // Wii and host socket type values match for the common types, but retain
++    // Dolphin's pass-through behavior for an unfamiliar hint so getaddrinfo
++    // can reject it instead of silently broadening the query.
++    return mapped >= 0 ? mapped : static_cast<int>(type);
++}
++
++uint32_t MapNativeSocketTypeToWii(int type) {
++    if (type == 0) {
++        return 0;
++    }
++    if (type == SOCK_STREAM) {
++        return kWiiSockStream;
++    }
++    if (type == SOCK_DGRAM) {
++        return kWiiSockDgram;
++    }
++#ifdef SOCK_RAW
++    if (type == SOCK_RAW) {
++        return kWiiSockRaw;
++    }
++#endif
++#ifdef SOCK_RDM
++    if (type == SOCK_RDM) {
++        return kWiiSockRdm;
++    }
++#endif
++#ifdef SOCK_SEQPACKET
++    if (type == SOCK_SEQPACKET) {
++        return kWiiSockSeqPacket;
++    }
++#endif
++    // Dolphin writes ai_socktype without coercion. Preserve an unfamiliar host
++    // value rather than silently changing it to SOCK_STREAM.
++    return static_cast<uint32_t>(type);
++}
++
++int32_t AddWiiSocket(NativeSocket native, int af, int type, int protocol) {
++    if (native == kInvalidSocket) {
++        return SocketResult(-1, false);
++    }
++    for (int i = 0; i < kWiiSocketMax; ++i) {
++        if (g_sockets[i].native == kInvalidSocket) {
++            ConfigureUdpSocket(native, type);
++            if (type == SOCK_DGRAM) {
++                // Dolphin: WiiSockMan::AddSocket - "Wii UDP sockets can use
++                // broadcast address by default" (IOS/Network/Socket.cpp:905-916).
++                // Without this a sendto() to a broadcast address fails with
++                // EACCES/WSAEACCES on the host but succeeds on hardware.
++                const int enableBroadcast = 1;
++                setsockopt(native, SOL_SOCKET, SO_BROADCAST,
++                           reinterpret_cast<const char*>(&enableBroadcast),
++                           sizeof(enableBroadcast));
++            }
++            SetNonBlocking(native, true);
++            // IOS keeps the host descriptor nonblocking while the guest flag starts cleared.
++            g_sockets[i] = {native, af, type, protocol, false};
++            g_sockets[i].generation = NextSocketGeneration();
++            return i;
++        }
++    }
++    CloseNativeSocket(native);
++    return -SO_EMFILE;
++}
++
++WiiSocket* GetWiiSocket(uint32_t fd) {
++    if (fd >= kWiiSocketMax || g_sockets[fd].native == kInvalidSocket) {
++        g_lastSocketError = -SO_EBADF;
++        return nullptr;
++    }
++    return &g_sockets[fd];
++}
++
++bool SocketIdentityIsCurrent(uint32_t wiiFd, NativeSocket nativeFd, uint64_t generation) {
++    if (wiiFd >= g_sockets.size()) {
++        return false;
++    }
++    const WiiSocket& socket = g_sockets[wiiFd];
++    return socket.native != kInvalidSocket && socket.native == nativeFd &&
++           socket.generation == generation;
++}
++
++bool CopiedPollSocketIsStillValid(const NetworkPollContract::CopiedDescriptor& descriptor) {
++    return SocketIdentityIsCurrent(descriptor.wiiFd, descriptor.nativeFd,
++                                   descriptor.socketGeneration);
++}
++
++bool ValidatePollRequest(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen,
++                         uint32_t& descriptorCount) {
++    descriptorCount = outLen / 12u;
++    return inBuf && outBuf && inLen >= 8u && descriptorCount != 0 &&
++           descriptorCount <= NetworkPollContract::kMaxDescriptors &&
++           Memory::Contains(inBuf, 8u) &&
++           Memory::Contains(outBuf, static_cast<size_t>(descriptorCount) * 12u);
++}
++
++std::vector<NetworkPollContract::CopiedDescriptor> CopyPollDescriptors(uint32_t outBuf,
++                                                                      uint32_t descriptorCount) {
++    std::vector<NetworkPollContract::CopiedDescriptor> descriptors;
++    descriptors.reserve(descriptorCount);
++    for (uint32_t i = 0; i < descriptorCount; ++i) {
++        const uint32_t entry = outBuf + i * 12u;
++        NetworkPollContract::CopiedDescriptor descriptor{};
++        descriptor.wiiFd = Memory::Read32(entry);
++        descriptor.events = NetworkPollContract::WiiEventsToNative(Memory::Read32(entry + 4u));
++        if (descriptor.wiiFd < g_sockets.size()) {
++            const WiiSocket& socket = g_sockets[descriptor.wiiFd];
++            if (socket.native != kInvalidSocket) {
++                descriptor.nativeFd = socket.native;
++                descriptor.socketGeneration = socket.generation;
++            }
++        }
++        descriptors.push_back(descriptor);
++    }
++    return descriptors;
++}
++
++void WritePollResults(uint32_t outAddress,
++                      const std::vector<NetworkPollContract::CopiedDescriptor>& descriptors) {
++    for (size_t i = 0; i < descriptors.size(); ++i) {
++        Memory::Write32(outAddress + static_cast<uint32_t>(i * 12u + 8u),
++                        NetworkPollContract::NativeEventsToWii(descriptors[i].revents));
++    }
++}
++
++}  // namespace NetworkHle
++
++#if defined(__SWITCH__)
++extern "C" uint32_t kartpad_socket_init_rc __attribute__((weak));
++#endif
++
++using namespace NetworkHle;
++
++extern "C" int32_t Network_HLE_OpenDevice(const char* path, uint32_t mode) {
++    if (!path) {
++        return -101;
++    }
++    if (!RuntimeConfigFile::NetworkEnabled(true)) {
++        // The guest opens several /dev/net nodes at boot and retries; report the
++        // reason online will not work exactly once.
++        static bool reported = false;
++        if (!reported) {
++            reported = true;
++            NetFail("networking is disabled in Config.toml; online play is unavailable");
++        }
++        return 0;
++    }
++    DeviceKind kind;
++    if (std::strcmp(path, "/dev/net/kd/request") == 0) {
++        kind = DeviceKind::KdRequest;
++    } else if (std::strcmp(path, "/dev/net/kd/time") == 0) {
++        kind = DeviceKind::KdTime;
++    } else if (std::strcmp(path, "/dev/net/ncd/manage") == 0) {
++        kind = DeviceKind::NcdManage;
++    } else if (std::strcmp(path, "/dev/net/ip/top") == 0) {
++        kind = DeviceKind::IpTop;
++        EnsureSocketRuntime();
++#if defined(__SWITCH__)
++        static bool loggedSocketInit = false;
++        if (!loggedSocketInit) {
++            loggedSocketInit = true;
++            NetFail("host BSD sockets: socketInitializeDefault rc=0x%x",
++                    &kartpad_socket_init_rc != nullptr ? kartpad_socket_init_rc : 0xFFFFFFFFu);
++        }
++#endif
++    } else if (std::strcmp(path, "/dev/net/ssl") == 0) {
++        kind = DeviceKind::Ssl;
++        EnsureSocketRuntime();
++    } else {
++        return 0;
++    }
++
++    const int32_t fd = AllocateDevice(kind);
++    NetTrace("open %s -> %d", path, fd);
++    return fd;
++}
++
++extern "C" bool Network_HLE_IsFd(uint32_t fd) {
++    return GetDeviceKind(fd).has_value();
++}
++
++extern "C" int32_t Network_HLE_Close(uint32_t fd) {
++    if (!GetDeviceKind(fd)) {
++        return -101;
++    }
++    RemoveDevice(fd);
++    return 0;
++}
++
++static int32_t NetworkIoctlImpl(uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen,
++                                 uint32_t outBuf, uint32_t outLen) {
++    const auto device = GetDeviceKind(fd);
++    if (!device) {
++        return -101;
++    }
++    switch (*device) {
++    case DeviceKind::KdRequest:
++        return HandleKdIoctl(cmd, inBuf, inLen, outBuf, outLen);
++    case DeviceKind::KdTime:
++        return HandleKdTimeIoctl(cmd, inBuf, inLen, outBuf, outLen);
++    case DeviceKind::IpTop:
++        return HandleIpTopIoctl(cmd, inBuf, inLen, outBuf, outLen);
++    case DeviceKind::NcdManage:
++        return 0;
++    case DeviceKind::Ssl:
++        return 0;
++    }
++    return -101;
++}
++
++static int32_t NetworkIoctlvImpl(uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
++                                  uint32_t vectorPtr) {
++    const auto device = GetDeviceKind(fd);
++    if (!device) {
++        return -101;
++    }
++    // numIn/numOut are guest-controlled; sum in 64-bit so a wrap can't make
++    // `vectors` shorter than numIn and run the iterator arithmetic below off
++    // the end. Matches PrepareDeferredGetAddrInfo in network_deferred.cpp.
++    const uint64_t vectorCount = static_cast<uint64_t>(numIn) + numOut;
++    if (vectorCount > kMaxIoVectors || (vectorCount != 0 &&
++        (!vectorPtr || !Memory::Contains(vectorPtr, static_cast<size_t>(vectorCount) * 8u)))) {
++        return -SO_EINVAL;
++    }
++
++    const std::vector<IoVector> vectors = ReadVectors(vectorPtr, static_cast<uint32_t>(vectorCount));
++    const std::vector<IoVector> in(vectors.begin(), vectors.begin() + numIn);
++    const std::vector<IoVector> out(vectors.begin() + numIn, vectors.end());
++
++    switch (*device) {
++    case DeviceKind::NcdManage:
++        return HandleNcdIoctlv(cmd, in, out);
++    case DeviceKind::IpTop:
++        return HandleIpTopIoctlv(cmd, in, out);
++    case DeviceKind::KdRequest:
++        return HandleKdIoctlv(cmd, in, out);
++    case DeviceKind::KdTime: {
++        const uint32_t inBuf = in.empty() ? 0 : in[0].address;
++        const uint32_t inLen = in.empty() ? 0 : in[0].size;
++        const uint32_t outBuf = out.empty() ? 0 : out[0].address;
++        const uint32_t outLen = out.empty() ? 0 : out[0].size;
++        return HandleKdTimeIoctl(cmd, inBuf, inLen, outBuf, outLen);
++    }
++    case DeviceKind::Ssl:
++        return HandleSslIoctlv(cmd, in, out);
++    }
++    return -101;
++}
++
++// perf.cfg `net_trace 1`: one line per IOS network call (device kind, command, result).
++static const char* NetDeviceName(uint32_t fd) {
++    const auto kind = GetDeviceKind(fd);
++    if (!kind) return "?";
++    switch (*kind) {
++    case DeviceKind::KdRequest: return "kd/request";
++    case DeviceKind::KdTime: return "kd/time";
++    case DeviceKind::NcdManage: return "ncd/manage";
++    case DeviceKind::IpTop: return "ip/top";
++    case DeviceKind::Ssl: return "ssl";
++    }
++    return "?";
++}
++
++extern "C" int32_t Network_HLE_Ioctl(uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen,
++                                      uint32_t outBuf, uint32_t outLen) {
++    const int32_t result = NetworkIoctlImpl(fd, cmd, inBuf, inLen, outBuf, outLen);
++    NetTrace("ioctl %s cmd=0x%x in=%u out=%u -> %d", NetDeviceName(fd), cmd, inLen, outLen, result);
++    return result;
++}
++
++extern "C" int32_t Network_HLE_Ioctlv(uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
++                                       uint32_t vectorPtr) {
++    const int32_t result = NetworkIoctlvImpl(fd, cmd, numIn, numOut, vectorPtr);
++    NetTrace("ioctlv %s cmd=0x%x nin=%u nout=%u -> %d", NetDeviceName(fd), cmd, numIn, numOut, result);
++    return result;
++}
+diff --git a/runtime/src/hle/net/network_deferred.cpp b/runtime/src/hle/net/network_deferred.cpp
+--- a/runtime/src/hle/net/network_deferred.cpp
++++ b/runtime/src/hle/net/network_deferred.cpp
+@@ -1,5 +1,7 @@
+ #include "network_internal.h"
+ 
++#include <optional>
++
+ #include "fiber_manager.h"
+ #include "hle/net/network.h"
+ #include "ppc_runtime.h"
+@@ -49,6 +51,7 @@
+ struct DeferredDnsWork {
+     DeferredDnsKind kind = DeferredDnsKind::GetHostByName;
+     DeferredNetworkRoute route{};
++    uint64_t workerId = 0;
+     std::string node;
+     std::string service;
+     bool hasHints = false;
+@@ -136,6 +139,7 @@
+     // thread, so unlike DNS worker completions they need no cross-thread lock.
+     std::vector<DeferredPollWork> pendingPolls;
+     std::vector<DeferredConnectWork> pendingConnects;
++    std::unordered_map<uint64_t, std::unique_ptr<std::thread>> pendingDnsWorkers;
+     std::mutex resultMutex;
+     std::unordered_map<uint64_t, int32_t> syncResults;
+     std::mutex schedulerThreadMutex;
+@@ -269,6 +273,9 @@
+ }
+ 
+ static bool LaunchDeferredDns(DeferredDnsWork work) {
++    DeferredNetworkStore& store = GetDeferredNetworkStore();
++    work.workerId = store.nextToken.fetch_add(1, std::memory_order_relaxed);
++
+     std::unique_ptr<std::thread> worker;
+     try {
+         worker = std::make_unique<std::thread>([work = std::move(work)]() mutable {
+@@ -301,24 +308,8 @@
+         return false;
+     }
+ 
+-    (void)NetworkDeferredContract::DetachOrRelease(
+-        std::move(worker), [](std::exception_ptr error) noexcept {
+-            try {
+-                if (error) {
+-                    std::rethrow_exception(error);
+-                }
+-            } catch (const std::exception& detachError) {
+-                RT_LOGF(RT_TAG_NET,
+-                             "failed to detach deferred DNS worker; "
+-                             "retaining running worker: %s\n",
+-                             detachError.what());
+-                return;
+-            } catch (...) {
+-            }
+-            RT_LOGF(RT_TAG_NET,
+-                         "failed to detach deferred DNS worker; "
+-                         "retaining running worker\n");
+-        });
++    std::lock_guard<std::mutex> lock(store.resultMutex);
++    store.pendingDnsWorkers[work.workerId] = std::move(worker);
+     return true;
+ }
+ 
+@@ -957,17 +948,39 @@
+     }
+     NoteDeferredNetworkSchedulerThread("completion pump");
+ 
+-    std::deque<DeferredDnsCompletion> ready;
+     DeferredNetworkStore& store = GetDeferredNetworkStore();
++    bool anyCompleted = false;
+     {
+         std::lock_guard<std::mutex> lock(store.completedMutex);
+-        ready.swap(store.completed);
++        anyCompleted = !store.completed.empty();
++    }
++    // An empty libstdc++ deque still allocates its map and first node, and this pump runs on
++    // every alarm-queue pass: constructing and swapping one per call was ~0.15% of a race.
++    // Completions are only ever appended, so one seen here is still there below.
++    std::optional<std::deque<DeferredDnsCompletion>> ready;
++    if (anyCompleted) {
++        ready.emplace();
++        std::lock_guard<std::mutex> lock(store.completedMutex);
++        ready->swap(store.completed);
+     }
+     bool handledAny = false;
+ 
+-    while (!ready.empty()) {
+-        DeferredDnsCompletion completion = std::move(ready.front());
+-        ready.pop_front();
++    while (ready && !ready->empty()) {
++        DeferredDnsCompletion completion = std::move(ready->front());
++        ready->pop_front();
++
++        std::unique_ptr<std::thread> workerToJoin;
++        {
++            std::lock_guard<std::mutex> lock(store.resultMutex);
++            auto it = store.pendingDnsWorkers.find(completion.work.workerId);
++            if (it != store.pendingDnsWorkers.end()) {
++                workerToJoin = std::move(it->second);
++                store.pendingDnsWorkers.erase(it);
++            }
++        }
++        if (workerToJoin && workerToJoin->joinable()) {
++            workerToJoin->join();
++        }
+ 
+         const DeferredNetworkRoute& route = completion.work.route;
+         if (route.kind == DeferredNetworkCompletionKind::SyncWaitQueue &&
+diff --git a/runtime/src/hle/net/network_internal.h b/runtime/src/hle/net/network_internal.h
+--- a/runtime/src/hle/net/network_internal.h
++++ b/runtime/src/hle/net/network_internal.h
+@@ -204,6 +204,7 @@
+ // Routine per-packet traffic must not be reported here. Host error codes are
+ // captured before the call, because std::fprintf may clobber errno.
+ void NetFail(const char* format, ...);
++void NetTrace(const char* format, ...);
+ bool EnsureSocketRuntime();
+ int NativeLastError();
+ int32_t TranslateSocketError(int err, bool isReadWrite = true);
+diff --git a/runtime/src/hle/net/network_socket.cpp b/runtime/src/hle/net/network_socket.cpp
+--- a/runtime/src/hle/net/network_socket.cpp
++++ b/runtime/src/hle/net/network_socket.cpp
+@@ -1,530 +1,553 @@
+-#include "network_internal.h"
+-
+-namespace NetworkHle {
+-
+-static int32_t NewWiiSocket(uint32_t af, uint32_t type, uint32_t protocol) {
+-    if (!EnsureSocketRuntime()) {
+-        return -SO_EINVAL;
+-    }
+-    const int nativeAf = MapWiiAf(af);
+-    const int nativeType = MapWiiSocketType(type);
+-    if (nativeAf < 0 || nativeType < 0) {
+-        return -SO_EINVAL;
+-    }
+-    NativeSocket s = ::socket(nativeAf, nativeType, protocol);
+-    const int hostError = s == kInvalidSocket ? NativeLastError() : 0;
+-    const int32_t wiiFd = AddWiiSocket(s, nativeAf, nativeType, static_cast<int>(protocol));
+-    if (wiiFd < 0) {
+-        NetFail("SO_SOCKET af=%u type=%u proto=%u failed host=%d wii=%d", af, type, protocol,
+-                hostError, wiiFd);
+-    }
+-    return wiiFd;
+-}
+-
+-static int32_t DeleteWiiSocket(uint32_t fd) {
+-    WiiSocket* s = GetWiiSocket(fd);
+-    if (!s) {
+-        return -SO_EBADF;
+-    }
+-    ClearSslSessionsForSocket(fd);
+-    CloseNativeSocket(s->native);
+-    *s = {};
+-    s->native = kInvalidSocket;
+-    // Dolphin fails everything still parked on the socket with -SO_ENOTCONN the
+-    // moment the descriptor closes. Leaving a blocking connect to notice on its
+-    // own kept the guest OSThread asleep until the next scheduler pump and then
+-    // reported -SO_EBADF instead.
+-    AbortPendingDeferredConnects(fd, -SO_ENOTCONN);
+-    return 0;
+-}
+-
+-// Dolphin: WiiSockMan::Clean (IOS/Network/Socket.h:278) destroys every WiiSocket,
+-// which closes its host descriptor and fails its pending operations. Going
+-// through DeleteWiiSocket keeps SSL sessions, buffered NAS writes and parked
+-// connects from surviving the sockets they were bound to.
+-void CleanupAllWiiSockets() {
+-    for (uint32_t fd = 0; fd < static_cast<uint32_t>(kWiiSocketMax); ++fd) {
+-        if (g_sockets[fd].native != kInvalidSocket) {
+-            DeleteWiiSocket(fd);
+-        }
+-    }
+-}
+-
+-struct WiiSockAddrIn {
+-    uint8_t len = 8;
+-    uint8_t family = kWiiAfInet;
+-    uint16_t port = 0;
+-    uint32_t addr = 0;
+-};
+-
+-sockaddr_in ReadWiiSockAddr(uint32_t addr) {
+-    sockaddr_in native{};
+-    native.sin_family = AF_INET;
+-    native.sin_port = htons(Memory::Read16(addr + 2));
+-    native.sin_addr.s_addr = htonl(Memory::Read32(addr + 4));
+-    return native;
+-}
+-
+-static void WriteWiiSockAddr(uint32_t addr, const sockaddr_in& native, uint32_t len) {
+-    if (!addr) {
+-        return;
+-    }
+-    Memory::Write8(addr, static_cast<uint8_t>(std::min<uint32_t>(len, 8)));
+-    Memory::Write8(addr + 1, kWiiAfInet);
+-    Memory::Write16(addr + 2, ntohs(native.sin_port));
+-    Memory::Write32(addr + 4, ntohl(native.sin_addr.s_addr));
+-}
+-
+-static int MapSockOptLevel(uint32_t level) {
+-    return level == 0xFFFF ? SOL_SOCKET : static_cast<int>(level);
+-}
+-
+-static int MapSockOptName(uint32_t optname) {
+-    switch (optname) {
+-    case 0x4:
+-        return SO_REUSEADDR;
+-    case 0x80:
+-        return SO_LINGER;
+-    case 0x100:
+-        return SO_OOBINLINE;
+-    case 0x1001:
+-        return SO_SNDBUF;
+-    case 0x1002:
+-        return SO_RCVBUF;
+-    case 0x1008:
+-        return SO_TYPE;
+-    case 0x1009:
+-        return SO_ERROR;
+-    default:
+-        return static_cast<int>(optname);
+-    }
+-}
+-
+-static in_addr ResolveDefaultInterfaceIp() {
+-    in_addr fallback{};
+-    fallback.s_addr = inet_addr("10.0.1.30");
+-    if (!EnsureSocketRuntime()) {
+-        return fallback;
+-    }
+-
+-    NativeSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+-    if (s == kInvalidSocket) {
+-        return fallback;
+-    }
+-
+-    sockaddr_in remote{};
+-    remote.sin_family = AF_INET;
+-    remote.sin_addr.s_addr = inet_addr("8.8.8.8");
+-    remote.sin_port = htons(53);
+-    connect(s, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+-
+-    sockaddr_in local{};
+-    socklen_t len = sizeof(local);
+-    if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) != 0) {
+-        CloseNativeSocket(s);
+-        return fallback;
+-    }
+-    CloseNativeSocket(s);
+-    return local.sin_addr;
+-}
+-
+-static int32_t HandleInetAton(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
+-    if (!inBuf || !outBuf || outLen < 4) {
+-        return 0;
+-    }
+-    const std::string host = ReadGuestString(inBuf, inLen ? inLen : 256);
+-    in_addr addr{};
+-    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
+-        // Hostnames are resolved only through the deferred boundary. Numeric
+-        // conversion is the sole direct path because inet_pton cannot block.
+-        return 0;
+-    }
+-    Memory::Write32(outBuf, ntohl(addr.s_addr));
+-    return 1;
+-}
+-
+-static int32_t HandleInetPton(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
+-    if (!inBuf || !outBuf || outLen < 8) {
+-        return 0;
+-    }
+-    const std::string address = ReadGuestString(inBuf, inLen ? inLen : 256);
+-    in_addr parsed{};
+-    if (inet_pton(AF_INET, address.c_str(), &parsed) != 1) {
+-        return 0;
+-    }
+-    Memory::Write32(outBuf + 4u, ntohl(parsed.s_addr));
+-    return 1;
+-}
+-
+-int32_t HandleIpTopIoctl(uint32_t cmd, uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
+-    switch (cmd) {
+-    case IOCTL_SO_INITINTERFACE:
+-    case IOCTL_SO_SETINTERFACE:
+-        return 0;
+-    case IOCTL_SO_SOCKET:
+-        if (!inBuf || inLen < 12) return -SO_EINVAL;
+-        return NewWiiSocket(Memory::Read32(inBuf), Memory::Read32(inBuf + 4), Memory::Read32(inBuf + 8));
+-    case IOCTL_SO_CLOSE:
+-        if (!inBuf || inLen < 4) return -SO_EINVAL;
+-        return DeleteWiiSocket(Memory::Read32(inBuf));
+-    case IOCTL_SO_BIND:
+-    case IOCTL_SO_CONNECT: {
+-        if (!inBuf || inLen < 16) return -SO_EINVAL;
+-        const uint32_t requestFd = Memory::Read32(inBuf);
+-        WiiSocket* s = GetWiiSocket(requestFd);
+-        if (!s) {
+-            return -SO_EBADF;
+-        }
+-        sockaddr_in addr = ReadWiiSockAddr(inBuf + 8);
+-        const int ret = (cmd == IOCTL_SO_BIND)
+-            ? bind(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))
+-            : connect(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+-        int32_t result = 0;
+-        if (cmd == IOCTL_SO_CONNECT && ret < 0) {
+-            // Nonblocking connects only (blocking ones go through
+-            // Network_HLE_StartIoctl*). Dolphin passes the raw error through here
+-            // (IOS/Network/Socket.cpp:344-346); the guest's connect loop needs to
+-            // see SO_EINPROGRESS/SO_EALREADY/SO_EISCONN as distinct states.
+-            result = SocketErrorResult(NormalizeConnectError(NativeLastError()), false);
+-        } else {
+-            result = SocketResult(ret, false);
+-        }
+-        if (cmd == IOCTL_SO_CONNECT && result == 0) {
+-            s->peerPort = ntohs(addr.sin_port);
+-            s->peerAddr = addr;
+-            s->hasPeerAddr = true;
+-        }
+-        return result;
+-    }
+-    case IOCTL_SO_FCNTL: {
+-        if (!inBuf || inLen < 12) return -SO_EINVAL;
+-        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
+-        if (!s) return -SO_EBADF;
+-        const uint32_t op = Memory::Read32(inBuf + 4);
+-        const uint32_t arg = Memory::Read32(inBuf + 8);
+-        if (op == 3) {
+-            return s->nonblocking ? 4 : 0;
+-        }
+-        if (op == 4) {
+-            s->nonblocking = (arg & 4) != 0;
+-            return 0;
+-        }
+-        return 0;
+-    }
+-    case IOCTL_SO_GETSOCKNAME:
+-    case IOCTL_SO_GETPEERNAME: {
+-        if (!inBuf || !outBuf || inLen < 4 || outLen < 8) return -SO_EINVAL;
+-        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
+-        if (!s) return -SO_EBADF;
+-        sockaddr_in addr{};
+-        socklen_t len = sizeof(addr);
+-        const int ret = (cmd == IOCTL_SO_GETSOCKNAME)
+-            ? getsockname(s->native, reinterpret_cast<sockaddr*>(&addr), &len)
+-            : getpeername(s->native, reinterpret_cast<sockaddr*>(&addr), &len);
+-        if (ret == 0) {
+-            WriteWiiSockAddr(outBuf, addr, static_cast<uint32_t>(len));
+-        }
+-        return SocketResult(ret, false);
+-    }
+-    case IOCTL_SO_GETSOCKOPT: {
+-        if (!outBuf || outLen < 0x14) return -SO_EINVAL;
+-        WiiSocket* s = GetWiiSocket(Memory::Read32(outBuf));
+-        if (!s) return -SO_EBADF;
+-        const int level = MapSockOptLevel(Memory::Read32(outBuf + 4));
+-        const int optname = MapSockOptName(Memory::Read32(outBuf + 8));
+-        int value = 0;
+-        socklen_t valueLen = sizeof(value);
+-        const int ret = getsockopt(s->native, level, optname, reinterpret_cast<char*>(&value), &valueLen);
+-        Memory::Write32(outBuf + 0x0C, static_cast<uint32_t>(valueLen));
+-        Memory::Write32(outBuf + 0x10, static_cast<uint32_t>(value));
+-        return SocketResult(ret, false);
+-    }
+-    case IOCTL_SO_SETSOCKOPT: {
+-        if (!inBuf || inLen < 0x10) return -SO_EINVAL;
+-        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
+-        if (!s) return -SO_EBADF;
+-        const int level = MapSockOptLevel(Memory::Read32(inBuf + 4));
+-        const int optname = MapSockOptName(Memory::Read32(inBuf + 8));
+-        const uint32_t optLen = std::min<uint32_t>(Memory::Read32(inBuf + 0x0C), inLen - 0x10);
+-        const char* optVal = reinterpret_cast<const char*>(Memory::GetPointer(inBuf + 0x10, optLen));
+-        return SocketResult(setsockopt(s->native, level, optname, optVal, static_cast<int>(optLen)), false);
+-    }
+-    case IOCTL_SO_LISTEN: {
+-        if (!inBuf || inLen < 8) return -SO_EINVAL;
+-        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
+-        if (!s) {
+-            return -SO_EBADF;
+-        }
+-        return SocketResult(listen(s->native, static_cast<int>(Memory::Read32(inBuf + 4))), false);
+-    }
+-    case IOCTL_SO_SHUTDOWN: {
+-        // Dolphin: WiiSocket::Shutdown (IOS/Network/Socket.cpp:164-212).
+-        if (!inBuf || inLen < 8) return -SO_EINVAL;
+-        const uint32_t wiiFd = Memory::Read32(inBuf);
+-        WiiSocket* s = GetWiiSocket(wiiFd);
+-        if (!s) return -SO_EBADF;
+-        const uint32_t how = Memory::Read32(inBuf + 4);
+-        if (how > 2) {
+-            return -SO_EINVAL;
+-        }
+-
+-        int socketType = 0;
+-        socklen_t socketTypeLen = sizeof(socketType);
+-        if (getsockopt(s->native, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socketType),
+-                       &socketTypeLen) != 0 ||
+-            (socketType != SOCK_STREAM && socketType != SOCK_DGRAM)) {
+-            return -SO_EBADF;
+-        }
+-        if (socketType == SOCK_DGRAM) {
+-            // The Wii does nothing and reports success for UDP. Passing this
+-            // through to the host returned ENOTCONN for an unconnected datagram
+-            // socket, which made the guest's teardown path bail out early and
+-            // leak the descriptor.
+-            return SO_SUCCESS;
+-        }
+-
+-        const int32_t result = SocketResult(shutdown(s->native, static_cast<int>(how)), false);
+-        if (how == 1 || how == 2) {
+-            // Dolphin aborts a pending blocking connect with -SO_ENETUNREACH
+-            // when the write half is shut down.
+-            AbortPendingDeferredConnects(wiiFd, -SO_ENETUNREACH);
+-        }
+-        return result;
+-    }
+-    case IOCTL_SO_POLL: {
+-        uint32_t descriptorCount = 0;
+-        if (!ValidatePollRequest(inBuf, inLen, outBuf, outLen, descriptorCount)) {
+-            return -SO_EINVAL;
+-        }
+-
+-        // Zero-timeout readiness probes intentionally take this direct path.
+-        // ProbeNow always passes timeout zero to the host API, so this cannot
+-        // stall the emulation thread. Finite and infinite waits are copied and
+-        // serviced by the scheduler queue instead.
+-        std::vector<NetworkPollContract::CopiedDescriptor> descriptors =
+-            CopyPollDescriptors(outBuf, descriptorCount);
+-        const int nativeResult =
+-            NetworkPollContract::ProbeNow(descriptors, CopiedPollSocketIsStillValid);
+-        const int32_t result = nativeResult < 0 ? SocketResult(nativeResult, false) : nativeResult;
+-        WritePollResults(outBuf, descriptors);
+-        return result;
+-    }
+-    case IOCTL_SO_GETHOSTID:
+-        return static_cast<int32_t>(ntohl(ResolveDefaultInterfaceIp().s_addr));
+-    case IOCTL_SO_GETHOSTBYNAME:
+-        // Valid hostname lookups are installed through the deferred boundary.
+-        // This defensive path handles only a malformed/unroutable entry call and
+-        // must never invoke the host resolver on the guest scheduler thread.
+-        NetFail("SO_GETHOSTBYNAME took the direct path (deferred boundary bypassed); "
+-                "name resolution failed");
+-        return -1;
+-    case IOCTL_SO_GETLASTERROR:
+-        return g_lastSocketError;
+-    case IOCTL_SO_INETATON:
+-        return HandleInetAton(inBuf, inLen, outBuf, outLen);
+-    case IOCTL_SO_INETPTON:
+-        return HandleInetPton(inBuf, inLen, outBuf, outLen);
+-    case IOCTL_SO_INETNTOP: {
+-        if (!inBuf || !outBuf || inLen < 12) return -SO_EINVAL;
+-        char text[32]{};
+-        std::snprintf(text, sizeof(text), "%u.%u.%u.%u", Memory::Read8(inBuf + 8), Memory::Read8(inBuf + 9),
+-                      Memory::Read8(inBuf + 10), Memory::Read8(inBuf + 11));
+-        const uint32_t size = std::min<uint32_t>(outLen ? outLen - 1 : 0, static_cast<uint32_t>(std::strlen(text)));
+-        CopyToGuest(outBuf, text, size);
+-        Memory::Write8(outBuf + size, 0);
+-        return 0;
+-    }
+-    default:
+-        // SO_ACCEPT (cmd 1) has no handler and lands here too.
+-        return -SO_EINVAL;
+-    }
+-}
+-
+-static int32_t HandleGetInterfaceOpt(const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
+-    if (in.empty() || out.empty() || in[0].size < 8) {
+-        return -SO_EINVAL;
+-    }
+-    const uint32_t param = Memory::Read32(in[0].address);
+-    const uint32_t opt = Memory::Read32(in[0].address + 4);
+-    uint32_t offset = 0;
+-    if (!out.empty() && out[0].size >= 8) {
+-        offset = Memory::Read32(out[0].address + 4);
+-    }
+-
+-    switch (opt) {
+-    case 0xb003:
+-        Memory::Write32(out[0].address, 0x08080808);
+-        if (out[0].size >= 8) {
+-            Memory::Write32(out[0].address + 4, 0x08080404);
+-        }
+-        return 0;
+-    case 0x1003:
+-        Memory::Write32(out[0].address, 0);
+-        return 0;
+-    case 0x1004: {
+-        const std::array<uint8_t, 6>& mac = RuntimeMacAddress();
+-        CopyToGuest(out[0].address, mac.data(), std::min<uint32_t>(out[0].size, mac.size()));
+-        return 0;
+-    }
+-    case 0x1005:
+-        Memory::Write32(out[0].address, 1);
+-        return 0;
+-    case 0x3001:
+-        Memory::Write32(out[0].address, 0x10);
+-        return 0;
+-    case 0x4002:
+-        Memory::Write32(out[0].address, 1);
+-        return 0;
+-    case 0x4003: {
+-        if (out.size() > 1 && out[1].address) {
+-            Memory::Write32(out[1].address, 0x0C);
+-        }
+-        const uint32_t hostOrderIp = ntohl(ResolveDefaultInterfaceIp().s_addr);
+-        Memory::Write32(out[0].address, hostOrderIp);
+-        if (out[0].size >= 12) {
+-            Memory::Write32(out[0].address + 4, 0xFFFFFF00);
+-            Memory::Write32(out[0].address + 8, (hostOrderIp & 0xFFFFFF00) | 0xFF);
+-        }
+-        return 0;
+-    }
+-    case 0x4005:
+-        Memory::Write32(out[0].address, 0x20);
+-        return 0;
+-    case 0x4006:
+-        if (out[0].size >= offset + 24) {
+-            Memory::Write32(out[0].address + offset, 0);
+-            Memory::Write32(out[0].address + offset + 4, 0);
+-            Memory::Write32(out[0].address + offset + 8, 0);
+-            Memory::Write32(out[0].address + offset + 12, 1);
+-            Memory::Write64(out[0].address + offset + 16, 0);
+-            offset += 24;
+-        }
+-        if (out.size() > 1 && out[1].address) {
+-            Memory::Write32(out[1].address, offset);
+-        }
+-        return 0;
+-    case 0x6003:
+-    case 0x600a:
+-    case 0x600c:
+-        Memory::Write32(out[0].address, 0x80);
+-        return 0;
+-    case 0xb002:
+-        Memory::Write32(out[0].address, 2);
+-        return 0;
+-    default:
+-        Memory::Write32(out[0].address, 0);
+-        return 0;
+-    }
+-}
+-
+-int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
+-    switch (cmd) {
+-    case IOCTLV_SO_STARTUP:
+-        EnsureSocketRuntime();
+-        return 0;
+-    case IOCTLV_SO_CLEANUP:
+-        CleanupAllWiiSockets();
+-        return 0;
+-    case IOCTLV_SO_GETINTERFACEOPT:
+-        return HandleGetInterfaceOpt(in, out);
+-    case IOCTLV_SO_SETINTERFACEOPT:
+-        return 0;
+-    case IOCTLV_SO_GETADDRINFO:
+-        // As with SO_GETHOSTBYNAME: resolution belongs to the deferred boundary.
+-        NetFail("SO_GETADDRINFO took the direct path (deferred boundary bypassed); "
+-                "name resolution failed");
+-        return SO_ERROR_HOST_NOT_FOUND;
+-    case IOCTLV_SO_SENDTO: {
+-        if (in.size() < 2) return -SO_EINVAL;
+-        const uint32_t fd = Memory::Read32(in[1].address);
+-        WiiSocket* s = GetWiiSocket(fd);
+-        if (!s) return -SO_EBADF;
+-        // Dolphin: "send/sendto only handles MSG_OOB" - flags &= SO_MSG_OOB
+-        // (IOS/Network/Socket.cpp:606-607). SO_MSG_PEEK (0x02) is a receive-only
+-        // flag; forwarding it to sendto() makes Winsock reject the whole call.
+-        uint32_t flags = Memory::Read32(in[1].address + 4) & 0x01;
+-        const uint32_t hasDest = Memory::Read32(in[1].address + 8);
+-        sockaddr_in dest{};
+-        sockaddr* destPtr = nullptr;
+-        socklen_t destLen = 0;
+-        if (hasDest) {
+-            dest = ReadWiiSockAddr(in[1].address + 0x0C);
+-            destPtr = reinterpret_cast<sockaddr*>(&dest);
+-            destLen = sizeof(dest);
+-        }
+-        const auto* data = Memory::GetPointer(in[0].address, in[0].size);
+-        std::vector<uint8_t> patched;
+-        const NasSslWriteAction nasAction = !destPtr
+-            ? PreparePlainNasTcpWrite(*s, data, in[0].size, patched)
+-            : NasSslWriteAction::PassThrough;
+-        if (nasAction == NasSslWriteAction::Buffered) {
+-            return static_cast<int32_t>(in[0].size);
+-        }
+-
+-        const bool patchedWrite = nasAction == NasSslWriteAction::Ready;
+-        const uint8_t* sendData = patchedWrite ? patched.data() : data;
+-        const uint32_t sendSize = patchedWrite ? static_cast<uint32_t>(patched.size()) : in[0].size;
+-        const int ret = sendto(s->native, reinterpret_cast<const char*>(sendData), static_cast<int>(sendSize),
+-                               static_cast<int>(flags), destPtr, destLen);
+-        const int hostError = ret < 0 ? NativeLastError() : 0;
+-        int32_t result = SocketResult(ret);
+-        if (patchedWrite && ret == static_cast<int>(sendSize)) {
+-            result = static_cast<int32_t>(in[0].size);
+-        }
+-        // A blocked send is routine; anything else aborts the connection, and
+-        // the SDK retries it, so only a change of error is reported.
+-        if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedSendError) {
+-            s->lastLoggedSendError = result;
+-            NetFail("send failed fd=%u size=%u host=%d wii=%d", fd, sendSize, hostError, result);
+-        }
+-        return result;
+-    }
+-    case IOCTLV_SO_RECVFROM: {
+-        if (in.empty() || out.empty()) return -SO_EINVAL;
+-        const uint32_t fd = Memory::Read32(in[0].address);
+-        WiiSocket* s = GetWiiSocket(fd);
+-        if (!s) return -SO_EBADF;
+-        const uint32_t rawFlags = Memory::Read32(in[0].address + 4);
+-        uint32_t flags = rawFlags & 0x03;
+-        const bool forceNonBlock = (rawFlags & 0x04u) != 0;
+-        char* data = reinterpret_cast<char*>(Memory::GetPointer(out[0].address, out[0].size));
+-        sockaddr_in from{};
+-        socklen_t fromLen = sizeof(from);
+-        sockaddr* fromPtr = out.size() > 1 && out[1].address && out[1].size >= 8 ? reinterpret_cast<sockaddr*>(&from) : nullptr;
+-        int ret = 0;
+-
+-        ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
+-                       fromPtr ? &fromLen : nullptr);
+-        int nativeErr = ret < 0 ? NativeLastError() : 0;
+-        // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
+-        // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
+-        // waiting here anyway stalled the whole emulation thread on every empty read.
+-        constexpr int kStreamRecvWaitMs = 250;
+-        const int streamWaitMs = (forceNonBlock || s->nonblocking) ? 0 : kStreamRecvWaitMs;
+-        const bool waited = ret < 0 && !fromPtr && s->type == SOCK_STREAM &&
+-            IsWouldBlockError(nativeErr) && WaitForReadable(s->native, streamWaitMs);
+-        if (waited) {
+-            ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), nullptr,
+-                           nullptr);
+-            // WaitForReadable also returns true for POLLERR/POLLHUP, so the retry
+-            // is where a reset connection surfaces; the first call's would-block
+-            // error must not be reused or the guest retries that socket forever.
+-            nativeErr = ret < 0 ? NativeLastError() : 0;
+-        }
+-
+-        if (ret >= 0 && fromPtr) {
+-            WriteWiiSockAddr(out[1].address, from, static_cast<uint32_t>(fromLen));
+-        }
+-        const int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(nativeErr);
+-        if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedRecvError) {
+-            s->lastLoggedRecvError = result;
+-            NetFail("recv failed fd=%u host=%d wii=%d", fd, nativeErr, result);
+-        }
+-        return result;
+-    }
+-    default:
+-        return -SO_EINVAL;
+-    }
+-}
+-
+-}  // namespace NetworkHle
++#include <vector>
++#include <cstring>
++#include "network_internal.h"
++
++namespace NetworkHle {
++
++static int32_t NewWiiSocket(uint32_t af, uint32_t type, uint32_t protocol) {
++    if (!EnsureSocketRuntime()) {
++        return -SO_EINVAL;
++    }
++    const int nativeAf = MapWiiAf(af);
++    const int nativeType = MapWiiSocketType(type);
++    if (nativeAf < 0 || nativeType < 0) {
++        return -SO_EINVAL;
++    }
++    NativeSocket s = ::socket(nativeAf, nativeType, protocol);
++    const int hostError = s == kInvalidSocket ? NativeLastError() : 0;
++    const int32_t wiiFd = AddWiiSocket(s, nativeAf, nativeType, static_cast<int>(protocol));
++    if (wiiFd < 0) {
++        NetFail("SO_SOCKET af=%u type=%u proto=%u failed host=%d wii=%d", af, type, protocol,
++                hostError, wiiFd);
++    }
++    return wiiFd;
++}
++
++static int32_t DeleteWiiSocket(uint32_t fd) {
++    WiiSocket* s = GetWiiSocket(fd);
++    if (!s) {
++        return -SO_EBADF;
++    }
++    ClearSslSessionsForSocket(fd);
++    CloseNativeSocket(s->native);
++    *s = {};
++    s->native = kInvalidSocket;
++    // Dolphin fails everything still parked on the socket with -SO_ENOTCONN the
++    // moment the descriptor closes. Leaving a blocking connect to notice on its
++    // own kept the guest OSThread asleep until the next scheduler pump and then
++    // reported -SO_EBADF instead.
++    AbortPendingDeferredConnects(fd, -SO_ENOTCONN);
++    return 0;
++}
++
++// Dolphin: WiiSockMan::Clean (IOS/Network/Socket.h:278) destroys every WiiSocket,
++// which closes its host descriptor and fails its pending operations. Going
++// through DeleteWiiSocket keeps SSL sessions, buffered NAS writes and parked
++// connects from surviving the sockets they were bound to.
++void CleanupAllWiiSockets() {
++    for (uint32_t fd = 0; fd < static_cast<uint32_t>(kWiiSocketMax); ++fd) {
++        if (g_sockets[fd].native != kInvalidSocket) {
++            DeleteWiiSocket(fd);
++        }
++    }
++}
++
++struct WiiSockAddrIn {
++    uint8_t len = 8;
++    uint8_t family = kWiiAfInet;
++    uint16_t port = 0;
++    uint32_t addr = 0;
++};
++
++sockaddr_in ReadWiiSockAddr(uint32_t addr) {
++    sockaddr_in native{};
++#if defined(__SWITCH__)
++    native.sin_len = sizeof(native);
++#endif
++    native.sin_family = AF_INET;
++    native.sin_port = htons(Memory::Read16(addr + 2));
++    native.sin_addr.s_addr = htonl(Memory::Read32(addr + 4));
++    return native;
++}
++
++static void WriteWiiSockAddr(uint32_t addr, const sockaddr_in& native, uint32_t len) {
++    if (!addr) {
++        return;
++    }
++    Memory::Write8(addr, static_cast<uint8_t>(std::min<uint32_t>(len, 8)));
++    Memory::Write8(addr + 1, kWiiAfInet);
++    Memory::Write16(addr + 2, ntohs(native.sin_port));
++    Memory::Write32(addr + 4, ntohl(native.sin_addr.s_addr));
++}
++
++static int MapSockOptLevel(uint32_t level) {
++    return level == 0xFFFF ? SOL_SOCKET : static_cast<int>(level);
++}
++
++static int MapSockOptName(uint32_t optname) {
++    switch (optname) {
++    case 0x4:
++        return SO_REUSEADDR;
++    case 0x80:
++        return SO_LINGER;
++    case 0x100:
++        return SO_OOBINLINE;
++    case 0x1001:
++        return SO_SNDBUF;
++    case 0x1002:
++        return SO_RCVBUF;
++    case 0x1008:
++        return SO_TYPE;
++    case 0x1009:
++        return SO_ERROR;
++    default:
++        return static_cast<int>(optname);
++    }
++}
++
++static in_addr ResolveDefaultInterfaceIp() {
++    in_addr fallback{};
++    fallback.s_addr = inet_addr("10.0.1.30");
++    if (!EnsureSocketRuntime()) {
++        return fallback;
++    }
++
++    NativeSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (s == kInvalidSocket) {
++        return fallback;
++    }
++
++    sockaddr_in remote{};
++#if defined(__SWITCH__)
++    remote.sin_len = sizeof(remote);
++#endif
++    remote.sin_family = AF_INET;
++    remote.sin_addr.s_addr = inet_addr("8.8.8.8");
++    remote.sin_port = htons(53);
++    connect(s, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
++
++    sockaddr_in local{};
++    socklen_t len = sizeof(local);
++    if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) != 0) {
++        CloseNativeSocket(s);
++        return fallback;
++    }
++    CloseNativeSocket(s);
++    return local.sin_addr;
++}
++
++static int32_t HandleInetAton(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
++    if (!inBuf || !outBuf || outLen < 4) {
++        return 0;
++    }
++    const std::string host = ReadGuestString(inBuf, inLen ? inLen : 256);
++    in_addr addr{};
++    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
++        // Hostnames are resolved only through the deferred boundary. Numeric
++        // conversion is the sole direct path because inet_pton cannot block.
++        return 0;
++    }
++    Memory::Write32(outBuf, ntohl(addr.s_addr));
++    return 1;
++}
++
++static int32_t HandleInetPton(uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
++    if (!inBuf || !outBuf || outLen < 8) {
++        return 0;
++    }
++    const std::string address = ReadGuestString(inBuf, inLen ? inLen : 256);
++    in_addr parsed{};
++    if (inet_pton(AF_INET, address.c_str(), &parsed) != 1) {
++        return 0;
++    }
++    Memory::Write32(outBuf + 4u, ntohl(parsed.s_addr));
++    return 1;
++}
++
++int32_t HandleIpTopIoctl(uint32_t cmd, uint32_t inBuf, uint32_t inLen, uint32_t outBuf, uint32_t outLen) {
++    switch (cmd) {
++    case IOCTL_SO_INITINTERFACE:
++    case IOCTL_SO_SETINTERFACE:
++        return 0;
++    case IOCTL_SO_SOCKET:
++        if (!inBuf || inLen < 12) return -SO_EINVAL;
++        return NewWiiSocket(Memory::Read32(inBuf), Memory::Read32(inBuf + 4), Memory::Read32(inBuf + 8));
++    case IOCTL_SO_CLOSE:
++        if (!inBuf || inLen < 4) return -SO_EINVAL;
++        return DeleteWiiSocket(Memory::Read32(inBuf));
++    case IOCTL_SO_BIND:
++    case IOCTL_SO_CONNECT: {
++        if (!inBuf || inLen < 16) return -SO_EINVAL;
++        const uint32_t requestFd = Memory::Read32(inBuf);
++        WiiSocket* s = GetWiiSocket(requestFd);
++        if (!s) {
++            return -SO_EBADF;
++        }
++        sockaddr_in addr = ReadWiiSockAddr(inBuf + 8);
++        const int ret = (cmd == IOCTL_SO_BIND)
++            ? bind(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))
++            : connect(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
++        int32_t result = 0;
++        if (cmd == IOCTL_SO_CONNECT && ret < 0) {
++            // Nonblocking connects only (blocking ones go through
++            // Network_HLE_StartIoctl*). Dolphin passes the raw error through here
++            // (IOS/Network/Socket.cpp:344-346); the guest's connect loop needs to
++            // see SO_EINPROGRESS/SO_EALREADY/SO_EISCONN as distinct states.
++            result = SocketErrorResult(NormalizeConnectError(NativeLastError()), false);
++        } else {
++            result = SocketResult(ret, false);
++        }
++        if (cmd == IOCTL_SO_CONNECT && result == 0) {
++            s->peerPort = ntohs(addr.sin_port);
++            s->peerAddr = addr;
++            s->hasPeerAddr = true;
++        }
++        return result;
++    }
++    case IOCTL_SO_FCNTL: {
++        if (!inBuf || inLen < 12) return -SO_EINVAL;
++        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
++        if (!s) return -SO_EBADF;
++        const uint32_t op = Memory::Read32(inBuf + 4);
++        const uint32_t arg = Memory::Read32(inBuf + 8);
++        if (op == 3) {
++            return s->nonblocking ? 4 : 0;
++        }
++        if (op == 4) {
++            s->nonblocking = (arg & 4) != 0;
++            return 0;
++        }
++        return 0;
++    }
++    case IOCTL_SO_GETSOCKNAME:
++    case IOCTL_SO_GETPEERNAME: {
++        if (!inBuf || !outBuf || inLen < 4 || outLen < 8) return -SO_EINVAL;
++        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
++        if (!s) return -SO_EBADF;
++        sockaddr_in addr{};
++        socklen_t len = sizeof(addr);
++        const int ret = (cmd == IOCTL_SO_GETSOCKNAME)
++            ? getsockname(s->native, reinterpret_cast<sockaddr*>(&addr), &len)
++            : getpeername(s->native, reinterpret_cast<sockaddr*>(&addr), &len);
++        if (ret == 0) {
++            WriteWiiSockAddr(outBuf, addr, static_cast<uint32_t>(len));
++        }
++        return SocketResult(ret, false);
++    }
++    case IOCTL_SO_GETSOCKOPT: {
++        if (!outBuf || outLen < 0x14) return -SO_EINVAL;
++        WiiSocket* s = GetWiiSocket(Memory::Read32(outBuf));
++        if (!s) return -SO_EBADF;
++        const int level = MapSockOptLevel(Memory::Read32(outBuf + 4));
++        const int optname = MapSockOptName(Memory::Read32(outBuf + 8));
++        int value = 0;
++        socklen_t valueLen = sizeof(value);
++        const int ret = getsockopt(s->native, level, optname, reinterpret_cast<char*>(&value), &valueLen);
++        Memory::Write32(outBuf + 0x0C, static_cast<uint32_t>(valueLen));
++        Memory::Write32(outBuf + 0x10, static_cast<uint32_t>(value));
++        return SocketResult(ret, false);
++    }
++    case IOCTL_SO_SETSOCKOPT: {
++        if (!inBuf || inLen < 0x10) return -SO_EINVAL;
++        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
++        if (!s) return -SO_EBADF;
++        const int level = MapSockOptLevel(Memory::Read32(inBuf + 4));
++        const int optname = MapSockOptName(Memory::Read32(inBuf + 8));
++        const uint32_t optLen = std::min<uint32_t>(Memory::Read32(inBuf + 0x0C), inLen - 0x10);
++        const char* optVal = reinterpret_cast<const char*>(Memory::GetPointer(inBuf + 0x10, optLen));
++        return SocketResult(setsockopt(s->native, level, optname, optVal, static_cast<int>(optLen)), false);
++    }
++    case IOCTL_SO_LISTEN: {
++        if (!inBuf || inLen < 8) return -SO_EINVAL;
++        WiiSocket* s = GetWiiSocket(Memory::Read32(inBuf));
++        if (!s) {
++            return -SO_EBADF;
++        }
++        return SocketResult(listen(s->native, static_cast<int>(Memory::Read32(inBuf + 4))), false);
++    }
++    case IOCTL_SO_SHUTDOWN: {
++        // Dolphin: WiiSocket::Shutdown (IOS/Network/Socket.cpp:164-212).
++        if (!inBuf || inLen < 8) return -SO_EINVAL;
++        const uint32_t wiiFd = Memory::Read32(inBuf);
++        WiiSocket* s = GetWiiSocket(wiiFd);
++        if (!s) return -SO_EBADF;
++        const uint32_t how = Memory::Read32(inBuf + 4);
++        if (how > 2) {
++            return -SO_EINVAL;
++        }
++
++        int socketType = 0;
++        socklen_t socketTypeLen = sizeof(socketType);
++        if (getsockopt(s->native, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socketType),
++                       &socketTypeLen) != 0 ||
++            (socketType != SOCK_STREAM && socketType != SOCK_DGRAM)) {
++            return -SO_EBADF;
++        }
++        if (socketType == SOCK_DGRAM) {
++            // The Wii does nothing and reports success for UDP. Passing this
++            // through to the host returned ENOTCONN for an unconnected datagram
++            // socket, which made the guest's teardown path bail out early and
++            // leak the descriptor.
++            return SO_SUCCESS;
++        }
++
++        const int32_t result = SocketResult(shutdown(s->native, static_cast<int>(how)), false);
++        if (how == 1 || how == 2) {
++            // Dolphin aborts a pending blocking connect with -SO_ENETUNREACH
++            // when the write half is shut down.
++            AbortPendingDeferredConnects(wiiFd, -SO_ENETUNREACH);
++        }
++        return result;
++    }
++    case IOCTL_SO_POLL: {
++        uint32_t descriptorCount = 0;
++        if (!ValidatePollRequest(inBuf, inLen, outBuf, outLen, descriptorCount)) {
++            return -SO_EINVAL;
++        }
++
++        // Zero-timeout readiness probes intentionally take this direct path.
++        // ProbeNow always passes timeout zero to the host API, so this cannot
++        // stall the emulation thread. Finite and infinite waits are copied and
++        // serviced by the scheduler queue instead.
++        std::vector<NetworkPollContract::CopiedDescriptor> descriptors =
++            CopyPollDescriptors(outBuf, descriptorCount);
++        const int nativeResult =
++            NetworkPollContract::ProbeNow(descriptors, CopiedPollSocketIsStillValid);
++        const int32_t result = nativeResult < 0 ? SocketResult(nativeResult, false) : nativeResult;
++        WritePollResults(outBuf, descriptors);
++        return result;
++    }
++    case IOCTL_SO_GETHOSTID:
++        return static_cast<int32_t>(ntohl(ResolveDefaultInterfaceIp().s_addr));
++    case IOCTL_SO_GETHOSTBYNAME:
++        // Valid hostname lookups are installed through the deferred boundary.
++        // This defensive path handles only a malformed/unroutable entry call and
++        // must never invoke the host resolver on the guest scheduler thread.
++        NetFail("SO_GETHOSTBYNAME took the direct path (deferred boundary bypassed); "
++                "name resolution failed");
++        return -1;
++    case IOCTL_SO_GETLASTERROR:
++        return g_lastSocketError;
++    case IOCTL_SO_INETATON:
++        return HandleInetAton(inBuf, inLen, outBuf, outLen);
++    case IOCTL_SO_INETPTON:
++        return HandleInetPton(inBuf, inLen, outBuf, outLen);
++    case IOCTL_SO_INETNTOP: {
++        if (!inBuf || !outBuf || inLen < 12) return -SO_EINVAL;
++        char text[32]{};
++        std::snprintf(text, sizeof(text), "%u.%u.%u.%u", Memory::Read8(inBuf + 8), Memory::Read8(inBuf + 9),
++                      Memory::Read8(inBuf + 10), Memory::Read8(inBuf + 11));
++        const uint32_t size = std::min<uint32_t>(outLen ? outLen - 1 : 0, static_cast<uint32_t>(std::strlen(text)));
++        CopyToGuest(outBuf, text, size);
++        Memory::Write8(outBuf + size, 0);
++        return 0;
++    }
++    default:
++        // SO_ACCEPT (cmd 1) has no handler and lands here too.
++        return -SO_EINVAL;
++    }
++}
++
++static int32_t HandleGetInterfaceOpt(const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
++    if (in.empty() || out.empty() || in[0].size < 8) {
++        return -SO_EINVAL;
++    }
++    const uint32_t param = Memory::Read32(in[0].address);
++    const uint32_t opt = Memory::Read32(in[0].address + 4);
++    uint32_t offset = 0;
++    if (!out.empty() && out[0].size >= 8) {
++        offset = Memory::Read32(out[0].address + 4);
++    }
++
++    switch (opt) {
++    case 0xb003:
++        Memory::Write32(out[0].address, 0x08080808);
++        if (out[0].size >= 8) {
++            Memory::Write32(out[0].address + 4, 0x08080404);
++        }
++        return 0;
++    case 0x1003:
++        Memory::Write32(out[0].address, 0);
++        return 0;
++    case 0x1004: {
++        const std::array<uint8_t, 6>& mac = RuntimeMacAddress();
++        CopyToGuest(out[0].address, mac.data(), std::min<uint32_t>(out[0].size, mac.size()));
++        return 0;
++    }
++    case 0x1005:
++        Memory::Write32(out[0].address, 1);
++        return 0;
++    case 0x3001:
++        Memory::Write32(out[0].address, 0x10);
++        return 0;
++    case 0x4002:
++        Memory::Write32(out[0].address, 1);
++        return 0;
++    case 0x4003: {
++        if (out.size() > 1 && out[1].address) {
++            Memory::Write32(out[1].address, 0x0C);
++        }
++        const uint32_t hostOrderIp = ntohl(ResolveDefaultInterfaceIp().s_addr);
++        Memory::Write32(out[0].address, hostOrderIp);
++        if (out[0].size >= 12) {
++            Memory::Write32(out[0].address + 4, 0xFFFFFF00);
++            Memory::Write32(out[0].address + 8, (hostOrderIp & 0xFFFFFF00) | 0xFF);
++        }
++        return 0;
++    }
++    case 0x4005:
++        Memory::Write32(out[0].address, 0x20);
++        return 0;
++    case 0x4006:
++        if (out[0].size >= offset + 24) {
++            Memory::Write32(out[0].address + offset, 0);
++            Memory::Write32(out[0].address + offset + 4, 0);
++            Memory::Write32(out[0].address + offset + 8, 0);
++            Memory::Write32(out[0].address + offset + 12, 1);
++            Memory::Write64(out[0].address + offset + 16, 0);
++            offset += 24;
++        }
++        if (out.size() > 1 && out[1].address) {
++            Memory::Write32(out[1].address, offset);
++        }
++        return 0;
++    case 0x6003:
++    case 0x600a:
++    case 0x600c:
++        Memory::Write32(out[0].address, 0x80);
++        return 0;
++    case 0xb002:
++        Memory::Write32(out[0].address, 2);
++        return 0;
++    default:
++        Memory::Write32(out[0].address, 0);
++        return 0;
++    }
++}
++
++int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
++    switch (cmd) {
++    case IOCTLV_SO_STARTUP:
++        EnsureSocketRuntime();
++        return 0;
++    case IOCTLV_SO_CLEANUP:
++        CleanupAllWiiSockets();
++        return 0;
++    case IOCTLV_SO_GETINTERFACEOPT:
++        return HandleGetInterfaceOpt(in, out);
++    case IOCTLV_SO_SETINTERFACEOPT:
++        return 0;
++    case IOCTLV_SO_GETADDRINFO:
++        // As with SO_GETHOSTBYNAME: resolution belongs to the deferred boundary.
++        NetFail("SO_GETADDRINFO took the direct path (deferred boundary bypassed); "
++                "name resolution failed");
++        return SO_ERROR_HOST_NOT_FOUND;
++    case IOCTLV_SO_SENDTO: {
++        if (in.size() < 2) return -SO_EINVAL;
++        const uint32_t fd = Memory::Read32(in[1].address);
++        WiiSocket* s = GetWiiSocket(fd);
++        if (!s) return -SO_EBADF;
++        // Dolphin: "send/sendto only handles MSG_OOB" - flags &= SO_MSG_OOB
++        // (IOS/Network/Socket.cpp:606-607). SO_MSG_PEEK (0x02) is a receive-only
++        // flag; forwarding it to sendto() makes Winsock reject the whole call.
++        uint32_t flags = Memory::Read32(in[1].address + 4) & 0x01;
++        const uint32_t hasDest = Memory::Read32(in[1].address + 8);
++        sockaddr_in dest{};
++        sockaddr* destPtr = nullptr;
++        socklen_t destLen = 0;
++        if (hasDest) {
++            dest = ReadWiiSockAddr(in[1].address + 0x0C);
++            destPtr = reinterpret_cast<sockaddr*>(&dest);
++            destLen = sizeof(dest);
++        }
++        const auto* data = Memory::GetPointer(in[0].address, in[0].size);
++        std::vector<uint8_t> patched;
++        const NasSslWriteAction nasAction = !destPtr
++            ? PreparePlainNasTcpWrite(*s, data, in[0].size, patched)
++            : NasSslWriteAction::PassThrough;
++        if (nasAction == NasSslWriteAction::Buffered) {
++            return static_cast<int32_t>(in[0].size);
++        }
++
++        const bool patchedWrite = nasAction == NasSslWriteAction::Ready;
++        const uint8_t* sendData = patchedWrite ? patched.data() : data;
++        const uint32_t sendSize = patchedWrite ? static_cast<uint32_t>(patched.size()) : in[0].size;
++        const int ret = sendto(s->native, reinterpret_cast<const char*>(sendData), static_cast<int>(sendSize),
++                               static_cast<int>(flags), destPtr, destLen);
++        const int hostError = ret < 0 ? NativeLastError() : 0;
++        int32_t result = SocketResult(ret);
++        if (patchedWrite && ret == static_cast<int>(sendSize)) {
++            result = static_cast<int32_t>(in[0].size);
++        }
++        // A blocked send is routine; anything else aborts the connection, and
++        // the SDK retries it, so only a change of error is reported.
++        if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedSendError) {
++            s->lastLoggedSendError = result;
++            NetFail("send failed fd=%u size=%u host=%d wii=%d", fd, sendSize, hostError, result);
++        }
++        return result;
++    }
++    case IOCTLV_SO_RECVFROM: {
++        if (in.empty() || out.empty()) return -SO_EINVAL;
++        const uint32_t fd = Memory::Read32(in[0].address);
++        WiiSocket* s = GetWiiSocket(fd);
++        if (!s) return -SO_EBADF;
++        const uint32_t rawFlags = Memory::Read32(in[0].address + 4);
++        uint32_t flags = rawFlags & 0x03;
++        const bool forceNonBlock = (rawFlags & 0x04u) != 0;
++        char* guestData = reinterpret_cast<char*>(Memory::GetPointer(out[0].address, out[0].size));
++#if defined(__SWITCH__)
++        // Horizon's bsd service cannot write into the guest-RAM alias mapping (recv returned
++        // EFAULT, errno 14, and Retro WFC reported error 20100): receive into ordinary heap
++        // memory and copy into the guest buffer.
++        thread_local std::vector<char> recvBounce;
++        if (recvBounce.size() < out[0].size) recvBounce.resize(out[0].size);
++        char* data = guestData ? recvBounce.data() : nullptr;
++#else
++        char* data = guestData;
++#endif
++        sockaddr_in from{};
++        socklen_t fromLen = sizeof(from);
++        sockaddr* fromPtr = out.size() > 1 && out[1].address && out[1].size >= 8 ? reinterpret_cast<sockaddr*>(&from) : nullptr;
++        int ret = 0;
++
++        ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
++                       fromPtr ? &fromLen : nullptr);
++        int nativeErr = ret < 0 ? NativeLastError() : 0;
++        // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
++        // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
++        // waiting here anyway stalled the whole emulation thread on every empty read.
++        constexpr int kStreamRecvWaitMs = 250;
++        const int streamWaitMs = (forceNonBlock || s->nonblocking) ? 0 : kStreamRecvWaitMs;
++        const bool waited = ret < 0 && !fromPtr && s->type == SOCK_STREAM &&
++            IsWouldBlockError(nativeErr) && WaitForReadable(s->native, streamWaitMs);
++        if (waited) {
++            ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), nullptr,
++                           nullptr);
++            // WaitForReadable also returns true for POLLERR/POLLHUP, so the retry
++            // is where a reset connection surfaces; the first call's would-block
++            // error must not be reused or the guest retries that socket forever.
++            nativeErr = ret < 0 ? NativeLastError() : 0;
++        }
++
++#if defined(__SWITCH__)
++        if (ret > 0 && guestData) {
++            std::memcpy(guestData, data, static_cast<size_t>(ret));
++        }
++#endif
++        if (ret >= 0 && fromPtr) {
++            WriteWiiSockAddr(out[1].address, from, static_cast<uint32_t>(fromLen));
++        }
++        const int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(nativeErr);
++        if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedRecvError) {
++            s->lastLoggedRecvError = result;
++            NetFail("recv failed fd=%u host=%d wii=%d", fd, nativeErr, result);
++        }
++        return result;
++    }
++    default:
++        return -SO_EINVAL;
++    }
++}
++
++}  // namespace NetworkHle
+diff --git a/runtime/src/hle/net/network_ssl.cpp b/runtime/src/hle/net/network_ssl.cpp
+--- a/runtime/src/hle/net/network_ssl.cpp
++++ b/runtime/src/hle/net/network_ssl.cpp
+@@ -1,733 +1,968 @@
+-#include "network_internal.h"
+-
+-namespace NetworkHle {
+-
+-enum SslError {
+-    SSL_OK = 0,
+-    SSL_ERR_FAILED = -1,
+-    SSL_ERR_RAGAIN = -2,
+-    SSL_ERR_WAGAIN = -3,
+-    SSL_ERR_SYSCALL = -5,
+-    SSL_ERR_ZERO = -6,
+-    SSL_ERR_ID = -8,
+-    SSL_ERR_VCOMMONNAME = -9,
+-};
+-
+-enum SslIoctlv {
+-    IOCTLV_NET_SSL_NEW = 0x01,
+-    IOCTLV_NET_SSL_CONNECT = 0x02,
+-    IOCTLV_NET_SSL_DOHANDSHAKE = 0x03,
+-    IOCTLV_NET_SSL_READ = 0x04,
+-    IOCTLV_NET_SSL_WRITE = 0x05,
+-    IOCTLV_NET_SSL_SHUTDOWN = 0x06,
+-    IOCTLV_NET_SSL_SETCLIENTCERT = 0x07,
+-    IOCTLV_NET_SSL_SETCLIENTCERTDEFAULT = 0x08,
+-    IOCTLV_NET_SSL_REMOVECLIENTCERT = 0x09,
+-    IOCTLV_NET_SSL_SETROOTCA = 0x0A,
+-    IOCTLV_NET_SSL_SETROOTCADEFAULT = 0x0B,
+-    IOCTLV_NET_SSL_DOHANDSHAKEEX = 0x0C,
+-    IOCTLV_NET_SSL_SETBUILTINROOTCA = 0x0D,
+-    IOCTLV_NET_SSL_SETBUILTINCLIENTCERT = 0x0E,
+-    IOCTLV_NET_SSL_DISABLEVERIFYOPTIONFORDEBUG = 0x0F,
+-    IOCTLV_NET_SSL_DEBUGGETVERSION = 0x14,
+-    IOCTLV_NET_SSL_DEBUGGETTIME = 0x15,
+-};
+-
+-constexpr int kMaxSslSessions = 4;
+-
+-struct SslSession {
+-    bool active = false;
+-    bool handshaked = false;
+-    bool plaintextWfc = false;
+-    uint32_t socketFd = UINT32_MAX;
+-    NativeSocket native = kInvalidSocket;
+-    std::string hostname;
+-    std::vector<uint8_t> nasWriteBuffer;
+-    std::vector<uint8_t> decrypted;
+-    std::vector<uint8_t> encryptedExtra;
+-    // Failure-report one-shots; cleared with the session by ClearSslSession. The
+-    // handshake re-runs on every read/write, so a failing one repeats forever.
+-    bool loggedHandshakeFail = false;
+-    int32_t lastLoggedReadError = 0;
+-    int32_t lastLoggedWriteError = 0;
+-#ifdef _WIN32
+-    bool haveCred = false;
+-    bool haveContext = false;
+-    CredHandle cred{};
+-    CtxtHandle context{};
+-    SecPkgContext_StreamSizes sizes{};
+-#endif
+-};
+-
+-static std::array<SslSession, kMaxSslSessions> g_sslSessions;
+-
+-// Logging wrapper around the platform handshake implementation; see below.
+-static int32_t SslHandshake(SslSession& ssl);
+-
+-static bool IsRetroNasSslHost(std::string_view hostname) {
+-    if (!RetroRewindProfileActive()) {
+-        return false;
+-    }
+-    const std::string lowered = Lower(hostname);
+-    return StartsWith(lowered, "nas.") || StartsWith(lowered, "naswii.");
+-}
+-
+-static bool IsRetroPlaintextSslHost(std::string_view hostname) {
+-    if (IsRetroNasSslHost(hostname)) {
+-        return true;
+-    }
+-    if (!RetroRewindProfileActive()) {
+-        return false;
+-    }
+-
+-    const std::string lowered = Lower(hostname);
+-    return StartsWith(lowered, "sake.gs.") ||
+-           lowered.find(".sake.gs.") != std::string::npos ||
+-           StartsWith(lowered, "gamestats.gs.") ||
+-           lowered.find(".gamestats.gs.") != std::string::npos ||
+-           StartsWith(lowered, "gamestats2.gs.") ||
+-           lowered.find(".gamestats2.gs.") != std::string::npos ||
+-           StartsWith(lowered, "race.gs.") ||
+-           lowered.find(".race.gs.") != std::string::npos;
+-}
+-
+-static std::optional<size_t> ParseHttpContentLength(std::string_view headers) {
+-    std::optional<size_t> parsedLength;
+-    size_t lineStart = 0;
+-    while (lineStart <= headers.size()) {
+-        const size_t lineEnd = headers.find("\r\n", lineStart);
+-        const std::string_view line = headers.substr(
+-            lineStart, lineEnd == std::string_view::npos ? headers.size() - lineStart : lineEnd - lineStart);
+-        const size_t colon = line.find(':');
+-        if (colon != std::string_view::npos && Lower(line.substr(0, colon)) == "content-length") {
+-            size_t valueStart = colon + 1;
+-            while (valueStart < line.size() && (line[valueStart] == ' ' || line[valueStart] == '\t')) {
+-                ++valueStart;
+-            }
+-            size_t valueEnd = line.size();
+-            while (valueEnd > valueStart && (line[valueEnd - 1] == ' ' || line[valueEnd - 1] == '\t')) {
+-                --valueEnd;
+-            }
+-            size_t value = 0;
+-            const auto [end, error] = std::from_chars(
+-                line.data() + valueStart, line.data() + valueEnd, value, 10);
+-            if (error != std::errc{} || end != line.data() + valueEnd ||
+-                (parsedLength && *parsedLength != value)) {
+-                return std::nullopt;
+-            }
+-            parsedLength = value;
+-        }
+-        if (lineEnd == std::string_view::npos) {
+-            break;
+-        }
+-        lineStart = lineEnd + 2;
+-    }
+-    return parsedLength;
+-}
+-
+-// The Retro-WFC server rejects a NAS "POST /ac" auth body split across TCP
+-// segments, so buffer guest chunks until Content-Length is satisfied, then
+-// flush as one write. Flush at 16 KiB if it never terminates, and immediately
+-// if Content-Length can't be parsed.
+-static NasSslWriteAction AccumulateNasRequest(std::vector<uint8_t>& buffer, const uint8_t* data,
+-                                              uint32_t size, std::vector<uint8_t>& patched) {
+-    buffer.insert(buffer.end(), data, data + size);
+-    if (buffer.size() > 16 * 1024) {
+-        patched.swap(buffer);
+-        buffer.clear();
+-        return NasSslWriteAction::Ready;
+-    }
+-
+-    const std::string accumulated(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+-    const size_t headerEnd = accumulated.find("\r\n\r\n");
+-    if (headerEnd == std::string::npos) {
+-        return NasSslWriteAction::Buffered;
+-    }
+-
+-    const std::optional<size_t> contentLength =
+-        ParseHttpContentLength(std::string_view(accumulated).substr(0, headerEnd));
+-    if (!contentLength) {
+-        patched.swap(buffer);
+-        buffer.clear();
+-        return NasSslWriteAction::Ready;
+-    }
+-
+-    const size_t requestSize = headerEnd + 4 + *contentLength;
+-    if (accumulated.size() < requestSize) {
+-        return NasSslWriteAction::Buffered;
+-    }
+-
+-    patched.assign(buffer.begin(), buffer.begin() + requestSize);
+-    if (accumulated.size() > requestSize) {
+-        patched.insert(patched.end(), buffer.begin() + requestSize, buffer.end());
+-    }
+-    buffer.clear();
+-    return NasSslWriteAction::Ready;
+-}
+-
+-static bool StartsNasAuthRequest(const uint8_t* data, uint32_t size) {
+-    return size >= 9 && std::memcmp(data, "POST /ac ", 9) == 0;
+-}
+-
+-// SSL route: the session carries the hostname the guest asked for, so the NAS
+-// host is identified by name. Deliberately not IsRetroNasSslHost - the SSL write
+-// path re-assembles NAS auth regardless of which profile is active.
+-static NasSslWriteAction PrepareNasSslWrite(SslSession& ssl, const uint8_t* data, uint32_t size,
+-                                            std::vector<uint8_t>& patched) {
+-    if (!data || size == 0) {
+-        return NasSslWriteAction::PassThrough;
+-    }
+-    const std::string loweredHost = Lower(ssl.hostname);
+-    const bool isNasHost = StartsWith(loweredHost, "nas.") || StartsWith(loweredHost, "naswii.");
+-    if (!isNasHost || (!StartsNasAuthRequest(data, size) && ssl.nasWriteBuffer.empty())) {
+-        return NasSslWriteAction::PassThrough;
+-    }
+-    return AccumulateNasRequest(ssl.nasWriteBuffer, data, size, patched);
+-}
+-
+-// Plain-TCP route: a rerouted 443->80 NAS connection has no hostname on the
+-// socket, so the peer port and the stream type are what identify it.
+-NasSslWriteAction PreparePlainNasTcpWrite(WiiSocket& socket, const uint8_t* data, uint32_t size,
+-                                                 std::vector<uint8_t>& patched) {
+-    if (!data || size == 0 || socket.type != SOCK_STREAM || socket.peerPort != 80) {
+-        return NasSslWriteAction::PassThrough;
+-    }
+-    if (!StartsNasAuthRequest(data, size) && socket.nasWriteBuffer.empty()) {
+-        return NasSslWriteAction::PassThrough;
+-    }
+-    return AccumulateNasRequest(socket.nasWriteBuffer, data, size, patched);
+-}
+-
+-static bool WriteSslReturn(const std::vector<IoVector>& in, int32_t value) {
+-    if (in.empty() || !in[0].address || in[0].size < 4) {
+-        return false;
+-    }
+-    Memory::Write32(in[0].address, static_cast<uint32_t>(value));
+-    return true;
+-}
+-
+-static int ReadSslId(const std::vector<IoVector>& out) {
+-    if (out.empty() || !out[0].address || out[0].size < 4) {
+-        return -1;
+-    }
+-    return static_cast<int>(Memory::Read32(out[0].address)) - 1;
+-}
+-
+-static bool IsSslIdValid(int id) {
+-    return id >= 0 && id < kMaxSslSessions && g_sslSessions[id].active;
+-}
+-
+-#ifdef _WIN32
+-static bool IsSecuritySuccess(SECURITY_STATUS status) {
+-    return status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED || status == SEC_I_INCOMPLETE_CREDENTIALS;
+-}
+-
+-static bool SendAll(NativeSocket socket, const uint8_t* data, size_t size) {
+-    size_t offset = 0;
+-    while (offset < size) {
+-        const int chunk = static_cast<int>(std::min<size_t>(size - offset, 64 * 1024));
+-        const int ret = send(socket, reinterpret_cast<const char*>(data + offset), chunk, 0);
+-        if (ret <= 0) {
+-            // Reported by the SSL_WRITE / handshake caller as SSL_ERR_SYSCALL.
+-            return false;
+-        }
+-        offset += static_cast<size_t>(ret);
+-    }
+-    return true;
+-}
+-
+-static int RecvBlocking(NativeSocket socket, std::vector<uint8_t>& buffer) {
+-    std::array<uint8_t, 16 * 1024> temp{};
+-    const int ret = recv(socket, reinterpret_cast<char*>(temp.data()), static_cast<int>(temp.size()), 0);
+-    if (ret > 0) {
+-        buffer.insert(buffer.end(), temp.begin(), temp.begin() + ret);
+-    }
+-    return ret;
+-}
+-
+-static void KeepExtraBuffer(std::vector<uint8_t>& dest, const SecBuffer& buffer) {
+-    dest.clear();
+-    if (buffer.BufferType == SECBUFFER_EXTRA && buffer.pvBuffer && buffer.cbBuffer) {
+-        const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
+-        dest.assign(begin, begin + buffer.cbBuffer);
+-    }
+-}
+-
+-static void ClearSslSession(SslSession& ssl) {
+-    if (ssl.haveContext) {
+-        DeleteSecurityContext(&ssl.context);
+-    }
+-    if (ssl.haveCred) {
+-        FreeCredentialsHandle(&ssl.cred);
+-    }
+-    ssl = {};
+-}
+-
+-static int32_t EnsureSslCredentials(SslSession& ssl) {
+-    if (ssl.haveCred) {
+-        return SSL_OK;
+-    }
+-
+-    SCHANNEL_CRED cred{};
+-    cred.dwVersion = SCHANNEL_CRED_VERSION;
+-    cred.dwFlags = SCH_USE_STRONG_CRYPTO | SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
+-
+-    TimeStamp expiry{};
+-    const SECURITY_STATUS status = AcquireCredentialsHandleA(
+-        nullptr, const_cast<LPSTR>(UNISP_NAME_A), SECPKG_CRED_OUTBOUND, nullptr, &cred, nullptr, nullptr,
+-        &ssl.cred, &expiry);
+-    if (status != SEC_E_OK) {
+-        return SSL_ERR_FAILED;
+-    }
+-    ssl.haveCred = true;
+-    return SSL_OK;
+-}
+-
+-static int32_t SslHandshakeImpl(SslSession& ssl) {
+-    if (ssl.plaintextWfc) {
+-        ssl.handshaked = true;
+-        return SSL_OK;
+-    }
+-
+-    const int32_t credRet = EnsureSslCredentials(ssl);
+-    if (credRet != SSL_OK) {
+-        return credRet;
+-    }
+-    if (ssl.native == kInvalidSocket) {
+-        return SSL_ERR_SYSCALL;
+-    }
+-    if (ssl.handshaked) {
+-        return SSL_OK;
+-    }
+-
+-    DWORD attrs = 0;
+-    TimeStamp expiry{};
+-    std::vector<uint8_t> incoming = std::move(ssl.encryptedExtra);
+-    ssl.encryptedExtra.clear();
+-    constexpr DWORD flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+-                            ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_EXTENDED_ERROR;
+-
+-    for (int step = 0; step < 128; ++step) {
+-        SecBuffer outBuffer{};
+-        outBuffer.BufferType = SECBUFFER_TOKEN;
+-        SecBufferDesc outDesc{};
+-        outDesc.ulVersion = SECBUFFER_VERSION;
+-        outDesc.cBuffers = 1;
+-        outDesc.pBuffers = &outBuffer;
+-
+-        SecBuffer inBuffers[2]{};
+-        SecBufferDesc inDesc{};
+-        SecBufferDesc* inDescPtr = nullptr;
+-        if (!incoming.empty()) {
+-            inBuffers[0].BufferType = SECBUFFER_TOKEN;
+-            inBuffers[0].pvBuffer = incoming.data();
+-            inBuffers[0].cbBuffer = static_cast<unsigned long>(incoming.size());
+-            inBuffers[1].BufferType = SECBUFFER_EMPTY;
+-            inDesc.ulVersion = SECBUFFER_VERSION;
+-            inDesc.cBuffers = 2;
+-            inDesc.pBuffers = inBuffers;
+-            inDescPtr = &inDesc;
+-        }
+-
+-        const SECURITY_STATUS status = InitializeSecurityContextA(
+-            &ssl.cred, ssl.haveContext ? &ssl.context : nullptr,
+-            ssl.hostname.empty() ? nullptr : const_cast<char*>(ssl.hostname.c_str()), flags, 0, SECURITY_NATIVE_DREP,
+-            inDescPtr, 0, &ssl.context, &outDesc, &attrs, &expiry);
+-        if (status != SEC_E_INVALID_HANDLE) {
+-            ssl.haveContext = true;
+-        }
+-
+-        if (outBuffer.pvBuffer && outBuffer.cbBuffer) {
+-            const bool sent = SendAll(ssl.native, static_cast<const uint8_t*>(outBuffer.pvBuffer), outBuffer.cbBuffer);
+-            FreeContextBuffer(outBuffer.pvBuffer);
+-            if (!sent) {
+-                return SSL_ERR_SYSCALL;
+-            }
+-        }
+-
+-        if (status == SEC_E_OK) {
+-            if (inDescPtr) {
+-                KeepExtraBuffer(ssl.encryptedExtra, inBuffers[1]);
+-            }
+-            const SECURITY_STATUS sizeStatus =
+-                QueryContextAttributesA(&ssl.context, SECPKG_ATTR_STREAM_SIZES, &ssl.sizes);
+-            if (sizeStatus != SEC_E_OK) {
+-                return SSL_ERR_FAILED;
+-            }
+-            ssl.handshaked = true;
+-            return SSL_OK;
+-        }
+-
+-        if (status == SEC_E_INCOMPLETE_MESSAGE) {
+-            const int ret = RecvBlocking(ssl.native, incoming);
+-            if (ret == 0) {
+-                return SSL_ERR_ZERO;
+-            }
+-            if (ret < 0) {
+-                return SSL_ERR_RAGAIN;
+-            }
+-            continue;
+-        }
+-
+-        if (status == SEC_I_CONTINUE_NEEDED || status == SEC_I_INCOMPLETE_CREDENTIALS) {
+-            std::vector<uint8_t> extra;
+-            if (inDescPtr) {
+-                KeepExtraBuffer(extra, inBuffers[1]);
+-            }
+-            incoming = std::move(extra);
+-            const int ret = RecvBlocking(ssl.native, incoming);
+-            if (ret == 0) {
+-                return SSL_ERR_ZERO;
+-            }
+-            if (ret < 0) {
+-                return SSL_ERR_RAGAIN;
+-            }
+-            continue;
+-        }
+-
+-        return status == SEC_E_WRONG_PRINCIPAL ? SSL_ERR_VCOMMONNAME : SSL_ERR_FAILED;
+-    }
+-
+-    return SSL_ERR_FAILED;
+-}
+-
+-static int32_t SslWrite(SslSession& ssl, const uint8_t* data, uint32_t size) {
+-    if (!data || size == 0) {
+-        return SSL_ERR_ZERO;
+-    }
+-    const int32_t handshakeRet = SslHandshake(ssl);
+-    if (handshakeRet != SSL_OK) {
+-        return handshakeRet;
+-    }
+-
+-    if (ssl.plaintextWfc) {
+-        return SendAll(ssl.native, data, size) ? static_cast<int32_t>(size) : SSL_ERR_SYSCALL;
+-    }
+-
+-    uint32_t total = 0;
+-    while (total < size) {
+-        const uint32_t chunk = std::min<uint32_t>(size - total, ssl.sizes.cbMaximumMessage);
+-        std::vector<uint8_t> packet(ssl.sizes.cbHeader + chunk + ssl.sizes.cbTrailer);
+-        std::memcpy(packet.data() + ssl.sizes.cbHeader, data + total, chunk);
+-
+-        SecBuffer buffers[4]{};
+-        buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+-        buffers[0].pvBuffer = packet.data();
+-        buffers[0].cbBuffer = ssl.sizes.cbHeader;
+-        buffers[1].BufferType = SECBUFFER_DATA;
+-        buffers[1].pvBuffer = packet.data() + ssl.sizes.cbHeader;
+-        buffers[1].cbBuffer = chunk;
+-        buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+-        buffers[2].pvBuffer = packet.data() + ssl.sizes.cbHeader + chunk;
+-        buffers[2].cbBuffer = ssl.sizes.cbTrailer;
+-        buffers[3].BufferType = SECBUFFER_EMPTY;
+-
+-        SecBufferDesc desc{};
+-        desc.ulVersion = SECBUFFER_VERSION;
+-        desc.cBuffers = 4;
+-        desc.pBuffers = buffers;
+-
+-        const SECURITY_STATUS status = EncryptMessage(&ssl.context, 0, &desc, 0);
+-        if (status != SEC_E_OK) {
+-            return SSL_ERR_FAILED;
+-        }
+-
+-        const size_t encryptedSize =
+-            static_cast<size_t>(buffers[0].cbBuffer) + buffers[1].cbBuffer + buffers[2].cbBuffer;
+-        if (!SendAll(ssl.native, packet.data(), encryptedSize)) {
+-            return SSL_ERR_SYSCALL;
+-        }
+-        total += chunk;
+-    }
+-    return static_cast<int32_t>(total);
+-}
+-
+-static int32_t SslRead(SslSession& ssl, uint8_t* out, uint32_t size) {
+-    if (!out || size == 0) {
+-        return SSL_ERR_ZERO;
+-    }
+-    const int32_t handshakeRet = SslHandshake(ssl);
+-    if (handshakeRet != SSL_OK) {
+-        return handshakeRet;
+-    }
+-
+-    if (ssl.plaintextWfc) {
+-        const int ret = recv(ssl.native, reinterpret_cast<char*>(out), static_cast<int>(size), 0);
+-        if (ret == 0) {
+-            return SSL_ERR_ZERO;
+-        }
+-        if (ret < 0) {
+-            return SSL_ERR_RAGAIN;
+-        }
+-        return ret;
+-    }
+-
+-    while (ssl.decrypted.empty()) {
+-        std::vector<uint8_t> encrypted = std::move(ssl.encryptedExtra);
+-        ssl.encryptedExtra.clear();
+-        if (encrypted.empty()) {
+-            const int ret = RecvBlocking(ssl.native, encrypted);
+-            if (ret == 0) {
+-                return SSL_ERR_ZERO;
+-            }
+-            if (ret < 0) {
+-                return SSL_ERR_RAGAIN;
+-            }
+-        }
+-
+-        for (;;) {
+-            SecBuffer buffers[4]{};
+-            buffers[0].BufferType = SECBUFFER_DATA;
+-            buffers[0].pvBuffer = encrypted.data();
+-            buffers[0].cbBuffer = static_cast<unsigned long>(encrypted.size());
+-            buffers[1].BufferType = SECBUFFER_EMPTY;
+-            buffers[2].BufferType = SECBUFFER_EMPTY;
+-            buffers[3].BufferType = SECBUFFER_EMPTY;
+-
+-            SecBufferDesc desc{};
+-            desc.ulVersion = SECBUFFER_VERSION;
+-            desc.cBuffers = 4;
+-            desc.pBuffers = buffers;
+-
+-            const SECURITY_STATUS status = DecryptMessage(&ssl.context, &desc, 0, nullptr);
+-            if (status == SEC_E_INCOMPLETE_MESSAGE) {
+-                const int ret = RecvBlocking(ssl.native, encrypted);
+-                if (ret == 0) {
+-                    return SSL_ERR_ZERO;
+-                }
+-                if (ret < 0) {
+-                    return SSL_ERR_RAGAIN;
+-                }
+-                continue;
+-            }
+-            if (status == SEC_I_CONTEXT_EXPIRED) {
+-                return SSL_ERR_ZERO;
+-            }
+-            if (!IsSecuritySuccess(status) && status != SEC_I_RENEGOTIATE) {
+-                return SSL_ERR_FAILED;
+-            }
+-
+-            for (const SecBuffer& buffer : buffers) {
+-                if (buffer.BufferType == SECBUFFER_DATA && buffer.pvBuffer && buffer.cbBuffer) {
+-                    const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
+-                    ssl.decrypted.insert(ssl.decrypted.end(), begin, begin + buffer.cbBuffer);
+-                } else if (buffer.BufferType == SECBUFFER_EXTRA && buffer.pvBuffer && buffer.cbBuffer) {
+-                    const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
+-                    ssl.encryptedExtra.assign(begin, begin + buffer.cbBuffer);
+-                }
+-            }
+-            break;
+-        }
+-    }
+-
+-    const uint32_t copied = std::min<uint32_t>(size, static_cast<uint32_t>(ssl.decrypted.size()));
+-    std::memcpy(out, ssl.decrypted.data(), copied);
+-    ssl.decrypted.erase(ssl.decrypted.begin(), ssl.decrypted.begin() + copied);
+-    return copied == 0 ? SSL_ERR_ZERO : static_cast<int32_t>(copied);
+-}
+-#else
+-static void ClearSslSession(SslSession& ssl) {
+-    ssl = {};
+-}
+-
+-static int32_t SslHandshakeImpl(SslSession&) {
+-    return SSL_ERR_FAILED;
+-}
+-
+-static int32_t SslWrite(SslSession&, const uint8_t*, uint32_t) {
+-    return SSL_ERR_FAILED;
+-}
+-
+-static int32_t SslRead(SslSession&, uint8_t*, uint32_t) {
+-    return SSL_ERR_FAILED;
+-}
+-#endif
+-
+-// The handshake runs on every SSL read/write, so a failure repeats for as long
+-// as the session lives; report only the first one.
+-static int32_t SslHandshake(SslSession& ssl) {
+-    const int32_t result = SslHandshakeImpl(ssl);
+-    if (result != SSL_OK && !ssl.loggedHandshakeFail) {
+-        ssl.loggedHandshakeFail = true;
+-        NetFail("ssl handshake FAILED host=%s ssl_err=%d",
+-                ssl.hostname.empty() ? "?" : ssl.hostname.c_str(), result);
+-    }
+-    return result;
+-}
+-
+-void ClearSslSessionsForSocket(uint32_t fd) {
+-    for (SslSession& ssl : g_sslSessions) {
+-        if (ssl.active && ssl.socketFd == fd) {
+-            ClearSslSession(ssl);
+-        }
+-    }
+-}
+-
+-int32_t HandleSslIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
+-
+-    switch (cmd) {
+-    case IOCTLV_NET_SSL_NEW: {
+-        // out[0] carries the verify option. Its value is not consulted - every
+-        // certificate check is delegated to Schannel with
+-        // SCH_CRED_MANUAL_CRED_VALIDATION - but it is still read so that a
+-        // request pointing outside guest memory faults here as it always has.
+-        if (!out.empty() && out[0].address && out[0].size >= 4) {
+-            (void)Memory::Read32(out[0].address);
+-        }
+-        std::string hostname = out.size() > 1 ? ReadGuestString(out[1].address, out[1].size) : "";
+-
+-        for (int i = 0; i < kMaxSslSessions; ++i) {
+-            if (!g_sslSessions[i].active) {
+-                ClearSslSession(g_sslSessions[i]);
+-                g_sslSessions[i].active = true;
+-                g_sslSessions[i].hostname = hostname;
+-                WriteSslReturn(in, i + 1);
+-                return 0;
+-            }
+-        }
+-        WriteSslReturn(in, SSL_ERR_FAILED);
+-        NetFail("SSL_NEW host=%s FAILED: all %d session slots in use",
+-                hostname.empty() ? "?" : hostname.c_str(), kMaxSslSessions);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_CONNECT: {
+-        const int sslId = ReadSslId(out);
+-        if (!IsSslIdValid(sslId)) {
+-            WriteSslReturn(in, SSL_ERR_ID);
+-            return 0;
+-        }
+-        if (out.size() < 2 || !out[1].address || out[1].size < 4) {
+-            WriteSslReturn(in, SSL_ERR_FAILED);
+-            return 0;
+-        }
+-        const uint32_t socketFd = Memory::Read32(out[1].address);
+-        WiiSocket* socket = GetWiiSocket(socketFd);
+-        if (!socket) {
+-            WriteSslReturn(in, SSL_ERR_SYSCALL);
+-            return 0;
+-        }
+-
+-        SslSession& ssl = g_sslSessions[sslId];
+-        ssl.socketFd = socketFd;
+-        ssl.native = socket->native;
+-        ssl.plaintextWfc = false;
+-        socket->nonblocking = false;
+-        SetNonBlocking(socket->native, false);
+-        if (IsRetroPlaintextSslHost(ssl.hostname) && socket->peerPort == 443) {
+-            const int32_t reroute = ReconnectWiiSocket(*socket, 80);
+-            if (reroute != 0) {
+-                WriteSslReturn(in, SSL_ERR_SYSCALL);
+-                NetFail("SSL_CONNECT host=%s 443->80 plaintext reroute FAILED wii=%d",
+-                        ssl.hostname.c_str(), reroute);
+-                return 0;
+-            }
+-            ssl.native = socket->native;
+-            ssl.plaintextWfc = true;
+-        }
+-#ifdef _WIN32
+-        const int timeoutMs = 15000;
+-        setsockopt(socket->native, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+-        setsockopt(socket->native, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+-#endif
+-        WriteSslReturn(in, SSL_OK);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_DOHANDSHAKE:
+-    case IOCTLV_NET_SSL_DOHANDSHAKEEX: {
+-        const int sslId = ReadSslId(out);
+-        WriteSslReturn(in, IsSslIdValid(sslId) ? SslHandshake(g_sslSessions[sslId]) : SSL_ERR_ID);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_WRITE: {
+-        const int sslId = ReadSslId(out);
+-        if (!IsSslIdValid(sslId)) {
+-            WriteSslReturn(in, SSL_ERR_ID);
+-            return 0;
+-        }
+-        if (out.size() < 2 || !out[1].address) {
+-            WriteSslReturn(in, SSL_ERR_FAILED);
+-            return 0;
+-        }
+-        const auto* data = Memory::GetPointer(out[1].address, out[1].size);
+-        std::vector<uint8_t> patched;
+-        const NasSslWriteAction nasAction = PrepareNasSslWrite(g_sslSessions[sslId], data, out[1].size, patched);
+-        if (nasAction == NasSslWriteAction::Buffered) {
+-            WriteSslReturn(in, static_cast<int32_t>(out[1].size));
+-            return 0;
+-        }
+-
+-        const bool patchedSslWrite = nasAction == NasSslWriteAction::Ready;
+-
+-        const uint8_t* writeData = patchedSslWrite ? patched.data() : data;
+-        const uint32_t writeSize = patchedSslWrite ? static_cast<uint32_t>(patched.size()) : out[1].size;
+-        SslSession& writeSession = g_sslSessions[sslId];
+-        int32_t result = SslWrite(writeSession, writeData, writeSize);
+-        if (patchedSslWrite && result == static_cast<int32_t>(writeSize)) {
+-            result = static_cast<int32_t>(out[1].size);
+-        }
+-        // SSL_ERR_WAGAIN is a retry, not a failure; the SDK re-issues the write,
+-        // so only a change of error is reported.
+-        if (result < 0 && result != SSL_ERR_WAGAIN && result != writeSession.lastLoggedWriteError) {
+-            writeSession.lastLoggedWriteError = result;
+-            NetFail("SSL_WRITE host=%s size=%u FAILED ssl_err=%d",
+-                    writeSession.hostname.empty() ? "?" : writeSession.hostname.c_str(), writeSize,
+-                    result);
+-        }
+-        WriteSslReturn(in, result);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_READ: {
+-        const int sslId = ReadSslId(out);
+-        if (!IsSslIdValid(sslId)) {
+-            WriteSslReturn(in, SSL_ERR_ID);
+-            return 0;
+-        }
+-        if (in.size() < 2 || !in[1].address) {
+-            WriteSslReturn(in, SSL_ERR_FAILED);
+-            return 0;
+-        }
+-        auto* data = Memory::GetPointer(in[1].address, in[1].size);
+-        SslSession& readSession = g_sslSessions[sslId];
+-        const int32_t result = SslRead(readSession, data, in[1].size);
+-        if (result < 0 && result != SSL_ERR_RAGAIN && result != readSession.lastLoggedReadError) {
+-            readSession.lastLoggedReadError = result;
+-            NetFail("SSL_READ host=%s FAILED ssl_err=%d%s",
+-                    readSession.hostname.empty() ? "?" : readSession.hostname.c_str(), result,
+-                    result == SSL_ERR_ZERO ? " (peer closed)" : "");
+-        }
+-        WriteSslReturn(in, result);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_SHUTDOWN: {
+-        const int sslId = ReadSslId(out);
+-        if (!IsSslIdValid(sslId)) {
+-            WriteSslReturn(in, SSL_ERR_ID);
+-            return 0;
+-        }
+-        ClearSslSession(g_sslSessions[sslId]);
+-        WriteSslReturn(in, SSL_OK);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_SETCLIENTCERT:
+-    case IOCTLV_NET_SSL_SETCLIENTCERTDEFAULT:
+-    case IOCTLV_NET_SSL_REMOVECLIENTCERT:
+-    case IOCTLV_NET_SSL_SETROOTCA:
+-    case IOCTLV_NET_SSL_SETROOTCADEFAULT:
+-    case IOCTLV_NET_SSL_SETBUILTINROOTCA:
+-    case IOCTLV_NET_SSL_SETBUILTINCLIENTCERT:
+-    case IOCTLV_NET_SSL_DISABLEVERIFYOPTIONFORDEBUG: {
+-        const int sslId = ReadSslId(out);
+-        WriteSslReturn(in, IsSslIdValid(sslId) ? SSL_OK : SSL_ERR_ID);
+-        return 0;
+-    }
+-    case IOCTLV_NET_SSL_DEBUGGETVERSION:
+-    case IOCTLV_NET_SSL_DEBUGGETTIME:
+-        WriteSslReturn(in, SSL_OK);
+-        return 0;
+-    default:
+-        WriteSslReturn(in, SSL_ERR_FAILED);
+-        return 0;
+-    }
+-}
+-
+-}  // namespace NetworkHle
++#include <vector>
++#include <cstring>
++#include "network_internal.h"
++
++#ifdef __SWITCH__
++#include <switch.h>
++#include <sys/time.h>
++#endif
++
++namespace NetworkHle {
++
++enum SslError {
++    SSL_OK = 0,
++    SSL_ERR_FAILED = -1,
++    SSL_ERR_RAGAIN = -2,
++    SSL_ERR_WAGAIN = -3,
++    SSL_ERR_SYSCALL = -5,
++    SSL_ERR_ZERO = -6,
++    SSL_ERR_ID = -8,
++    SSL_ERR_VCOMMONNAME = -9,
++};
++
++enum SslIoctlv {
++    IOCTLV_NET_SSL_NEW = 0x01,
++    IOCTLV_NET_SSL_CONNECT = 0x02,
++    IOCTLV_NET_SSL_DOHANDSHAKE = 0x03,
++    IOCTLV_NET_SSL_READ = 0x04,
++    IOCTLV_NET_SSL_WRITE = 0x05,
++    IOCTLV_NET_SSL_SHUTDOWN = 0x06,
++    IOCTLV_NET_SSL_SETCLIENTCERT = 0x07,
++    IOCTLV_NET_SSL_SETCLIENTCERTDEFAULT = 0x08,
++    IOCTLV_NET_SSL_REMOVECLIENTCERT = 0x09,
++    IOCTLV_NET_SSL_SETROOTCA = 0x0A,
++    IOCTLV_NET_SSL_SETROOTCADEFAULT = 0x0B,
++    IOCTLV_NET_SSL_DOHANDSHAKEEX = 0x0C,
++    IOCTLV_NET_SSL_SETBUILTINROOTCA = 0x0D,
++    IOCTLV_NET_SSL_SETBUILTINCLIENTCERT = 0x0E,
++    IOCTLV_NET_SSL_DISABLEVERIFYOPTIONFORDEBUG = 0x0F,
++    IOCTLV_NET_SSL_DEBUGGETVERSION = 0x14,
++    IOCTLV_NET_SSL_DEBUGGETTIME = 0x15,
++};
++
++constexpr int kMaxSslSessions = 4;
++
++struct SslSession {
++    bool active = false;
++    bool handshaked = false;
++    bool plaintextWfc = false;
++    uint32_t socketFd = UINT32_MAX;
++    NativeSocket native = kInvalidSocket;
++    std::string hostname;
++    std::vector<uint8_t> nasWriteBuffer;
++    std::vector<uint8_t> decrypted;
++    std::vector<uint8_t> encryptedExtra;
++    // Failure-report one-shots; cleared with the session by ClearSslSession. The
++    // handshake re-runs on every read/write, so a failing one repeats forever.
++    bool loggedHandshakeFail = false;
++    int32_t lastLoggedReadError = 0;
++    int32_t lastLoggedWriteError = 0;
++#ifdef _WIN32
++    bool haveCred = false;
++    bool haveContext = false;
++    CredHandle cred{};
++    CtxtHandle context{};
++    SecPkgContext_StreamSizes sizes{};
++#elif defined(__SWITCH__)
++    bool haveSslRuntime = false;
++    bool haveSslContext = false;
++    bool haveSslConnection = false;
++    bool haveSslSocket = false;
++    bool haveTrustedRoots = false;
++    SslContext hosContext{};
++    SslConnection hosConnection{};
++    NativeSocket hosSocket = kInvalidSocket;
++    Result lastHosError = 0;
++#endif
++};
++
++static std::array<SslSession, kMaxSslSessions> g_sslSessions;
++
++// Logging wrapper around the platform handshake implementation; see below.
++static int32_t SslHandshake(SslSession& ssl);
++
++static bool IsRetroNasSslHost(std::string_view hostname) {
++    if (!RetroRewindProfileActive()) {
++        return false;
++    }
++    const std::string lowered = Lower(hostname);
++    return StartsWith(lowered, "nas.") || StartsWith(lowered, "naswii.");
++}
++
++static bool IsRetroPlaintextSslHost(std::string_view hostname) {
++    if (IsRetroNasSslHost(hostname)) {
++        return true;
++    }
++    if (!RetroRewindProfileActive()) {
++        return false;
++    }
++
++    const std::string lowered = Lower(hostname);
++    return StartsWith(lowered, "sake.gs.") ||
++           lowered.find(".sake.gs.") != std::string::npos ||
++           StartsWith(lowered, "gamestats.gs.") ||
++           lowered.find(".gamestats.gs.") != std::string::npos ||
++           StartsWith(lowered, "gamestats2.gs.") ||
++           lowered.find(".gamestats2.gs.") != std::string::npos ||
++           StartsWith(lowered, "race.gs.") ||
++           lowered.find(".race.gs.") != std::string::npos;
++}
++
++static std::optional<size_t> ParseHttpContentLength(std::string_view headers) {
++    std::optional<size_t> parsedLength;
++    size_t lineStart = 0;
++    while (lineStart <= headers.size()) {
++        const size_t lineEnd = headers.find("\r\n", lineStart);
++        const std::string_view line = headers.substr(
++            lineStart, lineEnd == std::string_view::npos ? headers.size() - lineStart : lineEnd - lineStart);
++        const size_t colon = line.find(':');
++        if (colon != std::string_view::npos && Lower(line.substr(0, colon)) == "content-length") {
++            size_t valueStart = colon + 1;
++            while (valueStart < line.size() && (line[valueStart] == ' ' || line[valueStart] == '\t')) {
++                ++valueStart;
++            }
++            size_t valueEnd = line.size();
++            while (valueEnd > valueStart && (line[valueEnd - 1] == ' ' || line[valueEnd - 1] == '\t')) {
++                --valueEnd;
++            }
++            size_t value = 0;
++            const auto [end, error] = std::from_chars(
++                line.data() + valueStart, line.data() + valueEnd, value, 10);
++            if (error != std::errc{} || end != line.data() + valueEnd ||
++                (parsedLength && *parsedLength != value)) {
++                return std::nullopt;
++            }
++            parsedLength = value;
++        }
++        if (lineEnd == std::string_view::npos) {
++            break;
++        }
++        lineStart = lineEnd + 2;
++    }
++    return parsedLength;
++}
++
++// The Retro-WFC server rejects a NAS "POST /ac" auth body split across TCP
++// segments, so buffer guest chunks until Content-Length is satisfied, then
++// flush as one write. Flush at 16 KiB if it never terminates, and immediately
++// if Content-Length can't be parsed.
++static NasSslWriteAction AccumulateNasRequest(std::vector<uint8_t>& buffer, const uint8_t* data,
++                                              uint32_t size, std::vector<uint8_t>& patched) {
++    buffer.insert(buffer.end(), data, data + size);
++    if (buffer.size() > 16 * 1024) {
++        patched.swap(buffer);
++        buffer.clear();
++        return NasSslWriteAction::Ready;
++    }
++
++    const std::string accumulated(reinterpret_cast<const char*>(buffer.data()), buffer.size());
++    const size_t headerEnd = accumulated.find("\r\n\r\n");
++    if (headerEnd == std::string::npos) {
++        return NasSslWriteAction::Buffered;
++    }
++
++    const std::optional<size_t> contentLength =
++        ParseHttpContentLength(std::string_view(accumulated).substr(0, headerEnd));
++    if (!contentLength) {
++        patched.swap(buffer);
++        buffer.clear();
++        return NasSslWriteAction::Ready;
++    }
++
++    const size_t requestSize = headerEnd + 4 + *contentLength;
++    if (accumulated.size() < requestSize) {
++        return NasSslWriteAction::Buffered;
++    }
++
++    patched.assign(buffer.begin(), buffer.begin() + requestSize);
++    if (accumulated.size() > requestSize) {
++        patched.insert(patched.end(), buffer.begin() + requestSize, buffer.end());
++    }
++    buffer.clear();
++    return NasSslWriteAction::Ready;
++}
++
++static bool StartsNasAuthRequest(const uint8_t* data, uint32_t size) {
++    return size >= 9 && std::memcmp(data, "POST /ac ", 9) == 0;
++}
++
++// SSL route: the session carries the hostname the guest asked for, so the NAS
++// host is identified by name. Deliberately not IsRetroNasSslHost - the SSL write
++// path re-assembles NAS auth regardless of which profile is active.
++static NasSslWriteAction PrepareNasSslWrite(SslSession& ssl, const uint8_t* data, uint32_t size,
++                                            std::vector<uint8_t>& patched) {
++    if (!data || size == 0) {
++        return NasSslWriteAction::PassThrough;
++    }
++    const std::string loweredHost = Lower(ssl.hostname);
++    const bool isNasHost = StartsWith(loweredHost, "nas.") || StartsWith(loweredHost, "naswii.");
++    if (!isNasHost || (!StartsNasAuthRequest(data, size) && ssl.nasWriteBuffer.empty())) {
++        return NasSslWriteAction::PassThrough;
++    }
++    return AccumulateNasRequest(ssl.nasWriteBuffer, data, size, patched);
++}
++
++// Plain-TCP route: a rerouted 443->80 NAS connection has no hostname on the
++// socket, so the peer port and the stream type are what identify it.
++NasSslWriteAction PreparePlainNasTcpWrite(WiiSocket& socket, const uint8_t* data, uint32_t size,
++                                                 std::vector<uint8_t>& patched) {
++    if (!data || size == 0 || socket.type != SOCK_STREAM || socket.peerPort != 80) {
++        return NasSslWriteAction::PassThrough;
++    }
++    if (!StartsNasAuthRequest(data, size) && socket.nasWriteBuffer.empty()) {
++        return NasSslWriteAction::PassThrough;
++    }
++    return AccumulateNasRequest(socket.nasWriteBuffer, data, size, patched);
++}
++
++static bool WriteSslReturn(const std::vector<IoVector>& in, int32_t value) {
++    if (in.empty() || !in[0].address || in[0].size < 4) {
++        return false;
++    }
++    Memory::Write32(in[0].address, static_cast<uint32_t>(value));
++    return true;
++}
++
++static int ReadSslId(const std::vector<IoVector>& out) {
++    if (out.empty() || !out[0].address || out[0].size < 4) {
++        return -1;
++    }
++    return static_cast<int>(Memory::Read32(out[0].address)) - 1;
++}
++
++static bool IsSslIdValid(int id) {
++    return id >= 0 && id < kMaxSslSessions && g_sslSessions[id].active;
++}
++
++#ifdef _WIN32
++static bool IsSecuritySuccess(SECURITY_STATUS status) {
++    return status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED || status == SEC_I_INCOMPLETE_CREDENTIALS;
++}
++
++static bool SendAll(NativeSocket socket, const uint8_t* data, size_t size) {
++    size_t offset = 0;
++    while (offset < size) {
++        const int chunk = static_cast<int>(std::min<size_t>(size - offset, 64 * 1024));
++        const int ret = send(socket, reinterpret_cast<const char*>(data + offset), chunk, 0);
++        if (ret <= 0) {
++            // Reported by the SSL_WRITE / handshake caller as SSL_ERR_SYSCALL.
++            return false;
++        }
++        offset += static_cast<size_t>(ret);
++    }
++    return true;
++}
++
++static int RecvBlocking(NativeSocket socket, std::vector<uint8_t>& buffer) {
++    std::array<uint8_t, 16 * 1024> temp{};
++    const int ret = recv(socket, reinterpret_cast<char*>(temp.data()), static_cast<int>(temp.size()), 0);
++    if (ret > 0) {
++        buffer.insert(buffer.end(), temp.begin(), temp.begin() + ret);
++    }
++    return ret;
++}
++
++static void KeepExtraBuffer(std::vector<uint8_t>& dest, const SecBuffer& buffer) {
++    dest.clear();
++    if (buffer.BufferType == SECBUFFER_EXTRA && buffer.pvBuffer && buffer.cbBuffer) {
++        const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
++        dest.assign(begin, begin + buffer.cbBuffer);
++    }
++}
++
++static void ClearSslSession(SslSession& ssl) {
++    if (ssl.haveContext) {
++        DeleteSecurityContext(&ssl.context);
++    }
++    if (ssl.haveCred) {
++        FreeCredentialsHandle(&ssl.cred);
++    }
++    ssl = {};
++}
++
++static int32_t EnsureSslCredentials(SslSession& ssl) {
++    if (ssl.haveCred) {
++        return SSL_OK;
++    }
++
++    SCHANNEL_CRED cred{};
++    cred.dwVersion = SCHANNEL_CRED_VERSION;
++    // Leave certificate validation to Schannel. SCH_CRED_MANUAL_CRED_VALIDATION
++    // suppresses that validation and requires an explicit CertGetCertificateChain
++    // implementation, which this HLE does not provide. The target hostname passed
++    // to InitializeSecurityContextA below is therefore checked together with the
++    // server certificate chain.
++    cred.dwFlags = SCH_USE_STRONG_CRYPTO | SCH_CRED_NO_DEFAULT_CREDS |
++                   SCH_CRED_AUTO_CRED_VALIDATION;
++
++    TimeStamp expiry{};
++    const SECURITY_STATUS status = AcquireCredentialsHandleA(
++        nullptr, const_cast<LPSTR>(UNISP_NAME_A), SECPKG_CRED_OUTBOUND, nullptr, &cred, nullptr, nullptr,
++        &ssl.cred, &expiry);
++    if (status != SEC_E_OK) {
++        return SSL_ERR_FAILED;
++    }
++    ssl.haveCred = true;
++    return SSL_OK;
++}
++
++static int32_t SslHandshakeImpl(SslSession& ssl) {
++    if (ssl.plaintextWfc) {
++        ssl.handshaked = true;
++        return SSL_OK;
++    }
++
++    // Schannel can authenticate a certificate chain without authenticating a
++    // server identity when no target name is supplied. Refuse that ambiguous
++    // mode rather than accepting a certificate for an unrelated endpoint.
++    if (ssl.hostname.empty()) {
++        return SSL_ERR_VCOMMONNAME;
++    }
++
++    const int32_t credRet = EnsureSslCredentials(ssl);
++    if (credRet != SSL_OK) {
++        return credRet;
++    }
++    if (ssl.native == kInvalidSocket) {
++        return SSL_ERR_SYSCALL;
++    }
++    if (ssl.handshaked) {
++        return SSL_OK;
++    }
++
++    DWORD attrs = 0;
++    TimeStamp expiry{};
++    std::vector<uint8_t> incoming = std::move(ssl.encryptedExtra);
++    ssl.encryptedExtra.clear();
++    constexpr DWORD flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
++                            ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_EXTENDED_ERROR;
++
++    for (int step = 0; step < 128; ++step) {
++        SecBuffer outBuffer{};
++        outBuffer.BufferType = SECBUFFER_TOKEN;
++        SecBufferDesc outDesc{};
++        outDesc.ulVersion = SECBUFFER_VERSION;
++        outDesc.cBuffers = 1;
++        outDesc.pBuffers = &outBuffer;
++
++        SecBuffer inBuffers[2]{};
++        SecBufferDesc inDesc{};
++        SecBufferDesc* inDescPtr = nullptr;
++        if (!incoming.empty()) {
++            inBuffers[0].BufferType = SECBUFFER_TOKEN;
++            inBuffers[0].pvBuffer = incoming.data();
++            inBuffers[0].cbBuffer = static_cast<unsigned long>(incoming.size());
++            inBuffers[1].BufferType = SECBUFFER_EMPTY;
++            inDesc.ulVersion = SECBUFFER_VERSION;
++            inDesc.cBuffers = 2;
++            inDesc.pBuffers = inBuffers;
++            inDescPtr = &inDesc;
++        }
++
++        const SECURITY_STATUS status = InitializeSecurityContextA(
++            &ssl.cred, ssl.haveContext ? &ssl.context : nullptr,
++            const_cast<char*>(ssl.hostname.c_str()), flags, 0, SECURITY_NATIVE_DREP,
++            inDescPtr, 0, &ssl.context, &outDesc, &attrs, &expiry);
++        if (status != SEC_E_INVALID_HANDLE) {
++            ssl.haveContext = true;
++        }
++
++        if (outBuffer.pvBuffer && outBuffer.cbBuffer) {
++            const bool sent = SendAll(ssl.native, static_cast<const uint8_t*>(outBuffer.pvBuffer), outBuffer.cbBuffer);
++            FreeContextBuffer(outBuffer.pvBuffer);
++            if (!sent) {
++                return SSL_ERR_SYSCALL;
++            }
++        }
++
++        if (status == SEC_E_OK) {
++            if (inDescPtr) {
++                KeepExtraBuffer(ssl.encryptedExtra, inBuffers[1]);
++            }
++            const SECURITY_STATUS sizeStatus =
++                QueryContextAttributesA(&ssl.context, SECPKG_ATTR_STREAM_SIZES, &ssl.sizes);
++            if (sizeStatus != SEC_E_OK) {
++                return SSL_ERR_FAILED;
++            }
++            ssl.handshaked = true;
++            return SSL_OK;
++        }
++
++        if (status == SEC_E_INCOMPLETE_MESSAGE) {
++            const int ret = RecvBlocking(ssl.native, incoming);
++            if (ret == 0) {
++                return SSL_ERR_ZERO;
++            }
++            if (ret < 0) {
++                return SSL_ERR_RAGAIN;
++            }
++            continue;
++        }
++
++        if (status == SEC_I_CONTINUE_NEEDED || status == SEC_I_INCOMPLETE_CREDENTIALS) {
++            std::vector<uint8_t> extra;
++            if (inDescPtr) {
++                KeepExtraBuffer(extra, inBuffers[1]);
++            }
++            incoming = std::move(extra);
++            const int ret = RecvBlocking(ssl.native, incoming);
++            if (ret == 0) {
++                return SSL_ERR_ZERO;
++            }
++            if (ret < 0) {
++                return SSL_ERR_RAGAIN;
++            }
++            continue;
++        }
++
++        return status == SEC_E_WRONG_PRINCIPAL ? SSL_ERR_VCOMMONNAME : SSL_ERR_FAILED;
++    }
++
++    return SSL_ERR_FAILED;
++}
++
++static int32_t SslWrite(SslSession& ssl, const uint8_t* data, uint32_t size) {
++    if (!data || size == 0) {
++        return SSL_ERR_ZERO;
++    }
++    const int32_t handshakeRet = SslHandshake(ssl);
++    if (handshakeRet != SSL_OK) {
++        return handshakeRet;
++    }
++
++    if (ssl.plaintextWfc) {
++        return SendAll(ssl.native, data, size) ? static_cast<int32_t>(size) : SSL_ERR_SYSCALL;
++    }
++
++    uint32_t total = 0;
++    while (total < size) {
++        const uint32_t chunk = std::min<uint32_t>(size - total, ssl.sizes.cbMaximumMessage);
++        std::vector<uint8_t> packet(ssl.sizes.cbHeader + chunk + ssl.sizes.cbTrailer);
++        std::memcpy(packet.data() + ssl.sizes.cbHeader, data + total, chunk);
++
++        SecBuffer buffers[4]{};
++        buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
++        buffers[0].pvBuffer = packet.data();
++        buffers[0].cbBuffer = ssl.sizes.cbHeader;
++        buffers[1].BufferType = SECBUFFER_DATA;
++        buffers[1].pvBuffer = packet.data() + ssl.sizes.cbHeader;
++        buffers[1].cbBuffer = chunk;
++        buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
++        buffers[2].pvBuffer = packet.data() + ssl.sizes.cbHeader + chunk;
++        buffers[2].cbBuffer = ssl.sizes.cbTrailer;
++        buffers[3].BufferType = SECBUFFER_EMPTY;
++
++        SecBufferDesc desc{};
++        desc.ulVersion = SECBUFFER_VERSION;
++        desc.cBuffers = 4;
++        desc.pBuffers = buffers;
++
++        const SECURITY_STATUS status = EncryptMessage(&ssl.context, 0, &desc, 0);
++        if (status != SEC_E_OK) {
++            return SSL_ERR_FAILED;
++        }
++
++        const size_t encryptedSize =
++            static_cast<size_t>(buffers[0].cbBuffer) + buffers[1].cbBuffer + buffers[2].cbBuffer;
++        if (!SendAll(ssl.native, packet.data(), encryptedSize)) {
++            return SSL_ERR_SYSCALL;
++        }
++        total += chunk;
++    }
++    return static_cast<int32_t>(total);
++}
++
++static int32_t SslRead(SslSession& ssl, uint8_t* out, uint32_t size) {
++    if (!out || size == 0) {
++        return SSL_ERR_ZERO;
++    }
++    const int32_t handshakeRet = SslHandshake(ssl);
++    if (handshakeRet != SSL_OK) {
++        return handshakeRet;
++    }
++
++    if (ssl.plaintextWfc) {
++        const int ret = recv(ssl.native, reinterpret_cast<char*>(out), static_cast<int>(size), 0);
++        if (ret == 0) {
++            return SSL_ERR_ZERO;
++        }
++        if (ret < 0) {
++            return SSL_ERR_RAGAIN;
++        }
++        return ret;
++    }
++
++    while (ssl.decrypted.empty()) {
++        std::vector<uint8_t> encrypted = std::move(ssl.encryptedExtra);
++        ssl.encryptedExtra.clear();
++        if (encrypted.empty()) {
++            const int ret = RecvBlocking(ssl.native, encrypted);
++            if (ret == 0) {
++                return SSL_ERR_ZERO;
++            }
++            if (ret < 0) {
++                return SSL_ERR_RAGAIN;
++            }
++        }
++
++        for (;;) {
++            SecBuffer buffers[4]{};
++            buffers[0].BufferType = SECBUFFER_DATA;
++            buffers[0].pvBuffer = encrypted.data();
++            buffers[0].cbBuffer = static_cast<unsigned long>(encrypted.size());
++            buffers[1].BufferType = SECBUFFER_EMPTY;
++            buffers[2].BufferType = SECBUFFER_EMPTY;
++            buffers[3].BufferType = SECBUFFER_EMPTY;
++
++            SecBufferDesc desc{};
++            desc.ulVersion = SECBUFFER_VERSION;
++            desc.cBuffers = 4;
++            desc.pBuffers = buffers;
++
++            const SECURITY_STATUS status = DecryptMessage(&ssl.context, &desc, 0, nullptr);
++            if (status == SEC_E_INCOMPLETE_MESSAGE) {
++                const int ret = RecvBlocking(ssl.native, encrypted);
++                if (ret == 0) {
++                    return SSL_ERR_ZERO;
++                }
++                if (ret < 0) {
++                    return SSL_ERR_RAGAIN;
++                }
++                continue;
++            }
++            if (status == SEC_I_CONTEXT_EXPIRED) {
++                return SSL_ERR_ZERO;
++            }
++            if (!IsSecuritySuccess(status) && status != SEC_I_RENEGOTIATE) {
++                return SSL_ERR_FAILED;
++            }
++
++            for (const SecBuffer& buffer : buffers) {
++                if (buffer.BufferType == SECBUFFER_DATA && buffer.pvBuffer && buffer.cbBuffer) {
++                    const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
++                    ssl.decrypted.insert(ssl.decrypted.end(), begin, begin + buffer.cbBuffer);
++                } else if (buffer.BufferType == SECBUFFER_EXTRA && buffer.pvBuffer && buffer.cbBuffer) {
++                    const auto* begin = static_cast<const uint8_t*>(buffer.pvBuffer);
++                    ssl.encryptedExtra.assign(begin, begin + buffer.cbBuffer);
++                }
++            }
++            break;
++        }
++    }
++
++    const uint32_t copied = std::min<uint32_t>(size, static_cast<uint32_t>(ssl.decrypted.size()));
++    std::memcpy(out, ssl.decrypted.data(), copied);
++    ssl.decrypted.erase(ssl.decrypted.begin(), ssl.decrypted.begin() + copied);
++    return copied == 0 ? SSL_ERR_ZERO : static_cast<int32_t>(copied);
++}
++#elif defined(__SWITCH__)
++// Keep the guest BSD descriptor owned by WiiSocket. libnx's socket wrapper
++// translates its newlib descriptor to the descriptor understood by ssl.
++static void CloseSwitchSslObjects(SslSession& ssl) {
++    if (ssl.hosSocket != kInvalidSocket) {
++        CloseNativeSocket(ssl.hosSocket);
++        ssl.hosSocket = kInvalidSocket;
++    }
++    if (ssl.haveSslConnection) sslConnectionClose(&ssl.hosConnection);
++    if (ssl.haveSslContext) sslContextClose(&ssl.hosContext);
++    if (ssl.haveSslRuntime) sslExit();
++    ssl.haveSslConnection = false;
++    ssl.haveSslContext = false;
++    ssl.haveSslRuntime = false;
++    ssl.haveSslSocket = false;
++    ssl.haveTrustedRoots = false;
++    ssl.handshaked = false;
++}
++
++static void ClearSslSession(SslSession& ssl) {
++    CloseSwitchSslObjects(ssl);
++    ssl = {};
++}
++
++static int32_t SwitchSslFailure(SslSession& ssl, const char* operation, Result result) {
++    if (ssl.lastHosError != result) {
++        ssl.lastHosError = result;
++        NetFail("HOS SSL %s host=%s result=0x%08X", operation,
++                ssl.hostname.empty() ? "?" : ssl.hostname.c_str(), result);
++    }
++    return SSL_ERR_SYSCALL;
++}
++
++static Result ImportSwitchTrustedRoots(SslSession& ssl) {
++    uint32_t allCertificates = static_cast<uint32_t>(SslCaCertificateId_All);
++    uint32_t bufferSize = 0;
++    Result result = sslGetCertificateBufSize(&allCertificates, 1, &bufferSize);
++    if (R_FAILED(result)) return result;
++    if (bufferSize == 0 || bufferSize > 16u * 1024u * 1024u)
++        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
++    std::vector<uint8_t> buffer(bufferSize);
++    uint32_t count = 0;
++    result = sslGetCertificates(buffer.data(), bufferSize, &allCertificates, 1, &count);
++    if (R_FAILED(result)) return result;
++    if (count > bufferSize / sizeof(SslBuiltInCertificateInfo))
++        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
++    const auto* certificates = reinterpret_cast<const SslBuiltInCertificateInfo*>(buffer.data());
++    uint32_t imported = 0;
++    for (uint32_t i = 0; i < count; ++i) {
++        const auto& certificate = certificates[i];
++        // Do not make a revoked, removed or explicitly untrusted platform root
++        // trusted merely because its bytes remain accessible in the service.
++        if (certificate.status != SslTrustedCertStatus_EnabledTrusted) continue;
++        const auto begin = reinterpret_cast<uintptr_t>(buffer.data());
++        const auto end = begin + buffer.size();
++        const auto address = reinterpret_cast<uintptr_t>(certificate.cert_data);
++        if (address < begin || address >= end || certificate.cert_size > end - address)
++            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
++        result = sslContextImportServerPki(&ssl.hosContext, certificate.cert_data,
++            static_cast<uint32_t>(certificate.cert_size), SslCertificateFormat_Der, nullptr);
++        if (R_FAILED(result)) return result;
++        ++imported;
++    }
++    if (imported == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
++    return 0;
++}
++
++static int32_t SslHandshakeImpl(SslSession& ssl) {
++    if (ssl.native == kInvalidSocket || !EnsureSocketRuntime()) return SSL_ERR_SYSCALL;
++    if (ssl.handshaked) return SSL_OK;
++    if (ssl.plaintextWfc) {
++        ssl.handshaked = true;
++        return SSL_OK;
++    }
++    if (ssl.hostname.empty() || ssl.hostname.size() >= 0xff) return SSL_ERR_FAILED;
++
++    Result result = 0;
++    if (!ssl.haveSslRuntime) {
++        result = sslInitialize(1);
++        if (R_FAILED(result)) return SwitchSslFailure(ssl, "initialize", result);
++        ssl.haveSslRuntime = true;
++    }
++    if (!ssl.haveSslContext) {
++        result = sslCreateContext(&ssl.hosContext, SslVersion_Auto);
++        if (R_FAILED(result)) return SwitchSslFailure(ssl, "create context", result);
++        ssl.haveSslContext = true;
++    }
++    if (!ssl.haveTrustedRoots) {
++        result = ImportSwitchTrustedRoots(ssl);
++        if (R_FAILED(result)) {
++            const auto failure = SwitchSslFailure(ssl, "platform trust store", result);
++            CloseSwitchSslObjects(ssl);
++            return failure;
++        }
++        ssl.haveTrustedRoots = true;
++    }
++    if (!ssl.haveSslConnection) {
++        result = sslContextCreateConnection(&ssl.hosContext, &ssl.hosConnection);
++        if (R_FAILED(result)) return SwitchSslFailure(ssl, "create connection", result);
++        ssl.haveSslConnection = true;
++    }
++    if (!ssl.haveSslSocket) {
++        result = sslConnectionSetOption(&ssl.hosConnection, SslOptionType_DoNotCloseSocket, true);
++        if (R_FAILED(result)) return SwitchSslFailure(ssl, "socket ownership", result);
++        errno = 0;
++        ssl.hosSocket = socketSslConnectionSetSocketDescriptor(&ssl.hosConnection, ssl.native);
++        // ENOENT means successful attachment without a returned duplicate when
++        // DoNotCloseSocket is enabled; the libnx wrapper documents this case.
++        if (ssl.hosSocket == kInvalidSocket && errno != ENOENT) {
++            NetFail("HOS SSL attach host=%s errno=%d", ssl.hostname.c_str(), errno);
++            CloseSwitchSslObjects(ssl);
++            return SSL_ERR_SYSCALL;
++        }
++        ssl.haveSslSocket = true;
++    }
++    result = sslConnectionSetHostName(&ssl.hosConnection, ssl.hostname.c_str(),
++                                      static_cast<uint32_t>(ssl.hostname.size() + 1));
++    if (R_FAILED(result)) return SwitchSslFailure(ssl, "hostname", result);
++    result = sslConnectionSetVerifyOption(&ssl.hosConnection,
++        SslVerifyOption_PeerCa | SslVerifyOption_HostName | SslVerifyOption_DateCheck);
++    if (R_FAILED(result)) return SwitchSslFailure(ssl, "verification options", result);
++    result = sslConnectionSetIoMode(&ssl.hosConnection, SslIoMode_Blocking);
++    if (R_FAILED(result)) return SwitchSslFailure(ssl, "I/O mode", result);
++    // Use the platform certificate store and TLS implementation. This retains
++    // the native service's bounded I/O timeout on every supported HOS version.
++    result = sslConnectionDoHandshake(&ssl.hosConnection, nullptr, nullptr, nullptr, 0);
++    if (R_FAILED(result)) return SwitchSslFailure(ssl, "handshake", result);
++    ssl.handshaked = true;
++    ssl.lastHosError = 0;
++    return SSL_OK;
++}
++
++static int32_t SslWrite(SslSession& ssl, const uint8_t* guestData, uint32_t size) {
++    if (size == 0) return 0;
++    const int32_t result = SslHandshake(ssl);
++    if (result != SSL_OK) return result;
++    if (guestData == nullptr) return SSL_ERR_FAILED;
++    // Copy out of the guest-RAM alias mapping before handing it to the bsd/ssl services.
++    thread_local std::vector<uint8_t> writeBounce;
++    writeBounce.assign(guestData, guestData + size);
++    const uint8_t* data = writeBounce.data();
++    uint32_t total = 0;
++    while (total < size) {
++        uint32_t transferred = 0;
++        if (ssl.plaintextWfc) {
++            const auto written = send(ssl.native, data + total, size - total, 0);
++            if (written < 0) {
++                if (errno == EINTR) continue;
++                return total ? static_cast<int32_t>(total) :
++                    (IsWouldBlockError(errno) ? SSL_ERR_WAGAIN : SSL_ERR_SYSCALL);
++            }
++            transferred = static_cast<uint32_t>(written);
++        } else {
++            const Result nativeResult = sslConnectionWrite(&ssl.hosConnection,
++                data + total, size - total, &transferred);
++            if (R_FAILED(nativeResult)) {
++                const auto failure = SwitchSslFailure(ssl, "write", nativeResult);
++                return total ? static_cast<int32_t>(total) : failure;
++            }
++        }
++        if (transferred == 0) return total ? static_cast<int32_t>(total) : SSL_ERR_ZERO;
++        total += transferred;
++    }
++    return static_cast<int32_t>(total);
++}
++
++static int32_t SslRead(SslSession& ssl, uint8_t* out, uint32_t size) {
++    if (size == 0) return 0;
++    const int32_t result = SslHandshake(ssl);
++    if (result != SSL_OK) return result;
++    if (ssl.plaintextWfc) {
++        for (;;) {
++            const auto count = recv(ssl.native, out, size, 0);
++            if (count > 0) return static_cast<int32_t>(count);
++            if (count == 0) return SSL_ERR_ZERO;
++            if (errno == EINTR) continue;
++            return IsWouldBlockError(errno) ? SSL_ERR_RAGAIN : SSL_ERR_SYSCALL;
++        }
++    }
++    uint32_t transferred = 0;
++    const Result nativeResult = sslConnectionRead(&ssl.hosConnection, out, size, &transferred);
++    if (R_FAILED(nativeResult)) return SwitchSslFailure(ssl, "read", nativeResult);
++    return transferred == 0 ? SSL_ERR_ZERO : static_cast<int32_t>(transferred);
++}
++#else
++static void ClearSslSession(SslSession& ssl) {
++    ssl = {};
++}
++
++static int32_t SslHandshakeImpl(SslSession&) {
++    return SSL_ERR_FAILED;
++}
++
++static int32_t SslWrite(SslSession&, const uint8_t*, uint32_t) {
++    return SSL_ERR_FAILED;
++}
++
++static int32_t SslRead(SslSession&, uint8_t*, uint32_t) {
++    return SSL_ERR_FAILED;
++}
++#endif
++
++// The handshake runs on every SSL read/write, so a failure repeats for as long
++// as the session lives; report only the first one.
++static int32_t SslHandshake(SslSession& ssl) {
++    const int32_t result = SslHandshakeImpl(ssl);
++    if (result != SSL_OK && !ssl.loggedHandshakeFail) {
++        ssl.loggedHandshakeFail = true;
++        NetFail("ssl handshake FAILED host=%s ssl_err=%d",
++                ssl.hostname.empty() ? "?" : ssl.hostname.c_str(), result);
++    }
++    return result;
++}
++
++void ClearSslSessionsForSocket(uint32_t fd) {
++    for (SslSession& ssl : g_sslSessions) {
++        if (ssl.active && ssl.socketFd == fd) {
++            ClearSslSession(ssl);
++        }
++    }
++}
++
++int32_t HandleSslIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
++
++    switch (cmd) {
++    case IOCTLV_NET_SSL_NEW: {
++        // out[0] carries the guest verify option. Host TLS verification is
++        // always enforced by Schannel, but still read this value so a request
++        // pointing outside guest memory faults here as it always has.
++        if (!out.empty() && out[0].address && out[0].size >= 4) {
++            (void)Memory::Read32(out[0].address);
++        }
++        std::string hostname = out.size() > 1 ? ReadGuestString(out[1].address, out[1].size) : "";
++
++        for (int i = 0; i < kMaxSslSessions; ++i) {
++            if (!g_sslSessions[i].active) {
++                ClearSslSession(g_sslSessions[i]);
++                g_sslSessions[i].active = true;
++                g_sslSessions[i].hostname = hostname;
++                WriteSslReturn(in, i + 1);
++                return 0;
++            }
++        }
++        WriteSslReturn(in, SSL_ERR_FAILED);
++        NetFail("SSL_NEW host=%s FAILED: all %d session slots in use",
++                hostname.empty() ? "?" : hostname.c_str(), kMaxSslSessions);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_CONNECT: {
++        const int sslId = ReadSslId(out);
++        if (!IsSslIdValid(sslId)) {
++            WriteSslReturn(in, SSL_ERR_ID);
++            return 0;
++        }
++        if (out.size() < 2 || !out[1].address || out[1].size < 4) {
++            WriteSslReturn(in, SSL_ERR_FAILED);
++            return 0;
++        }
++        const uint32_t socketFd = Memory::Read32(out[1].address);
++        WiiSocket* socket = GetWiiSocket(socketFd);
++        if (!socket) {
++            WriteSslReturn(in, SSL_ERR_SYSCALL);
++            return 0;
++        }
++
++        SslSession& ssl = g_sslSessions[sslId];
++#ifdef __SWITCH__
++        CloseSwitchSslObjects(ssl);
++#endif
++        ssl.socketFd = socketFd;
++        ssl.native = socket->native;
++        ssl.plaintextWfc = false;
++        socket->nonblocking = false;
++        SetNonBlocking(socket->native, false);
++        if (IsRetroPlaintextSslHost(ssl.hostname) && socket->peerPort == 443) {
++            const int32_t reroute = ReconnectWiiSocket(*socket, 80);
++            if (reroute != 0) {
++                WriteSslReturn(in, SSL_ERR_SYSCALL);
++                NetFail("SSL_CONNECT host=%s 443->80 plaintext reroute FAILED wii=%d",
++                        ssl.hostname.c_str(), reroute);
++                return 0;
++            }
++            ssl.native = socket->native;
++            ssl.plaintextWfc = true;
++        }
++#ifdef _WIN32
++        const int timeoutMs = 15000;
++        setsockopt(socket->native, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
++        setsockopt(socket->native, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
++#elif defined(__SWITCH__)
++        // These bound the POSIX plaintext compatibility path; native TLS uses
++        // the SSL service's own timeout rather than the BSD socket timeout.
++        const timeval timeout{15, 0};
++        setsockopt(socket->native, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++        setsockopt(socket->native, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++#endif
++        WriteSslReturn(in, SSL_OK);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_DOHANDSHAKE:
++    case IOCTLV_NET_SSL_DOHANDSHAKEEX: {
++        const int sslId = ReadSslId(out);
++        WriteSslReturn(in, IsSslIdValid(sslId) ? SslHandshake(g_sslSessions[sslId]) : SSL_ERR_ID);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_WRITE: {
++        const int sslId = ReadSslId(out);
++        if (!IsSslIdValid(sslId)) {
++            WriteSslReturn(in, SSL_ERR_ID);
++            return 0;
++        }
++        if (out.size() < 2 || !out[1].address) {
++            WriteSslReturn(in, SSL_ERR_FAILED);
++            return 0;
++        }
++        const auto* data = Memory::GetPointer(out[1].address, out[1].size);
++        std::vector<uint8_t> patched;
++        const NasSslWriteAction nasAction = PrepareNasSslWrite(g_sslSessions[sslId], data, out[1].size, patched);
++        if (nasAction == NasSslWriteAction::Buffered) {
++            WriteSslReturn(in, static_cast<int32_t>(out[1].size));
++            return 0;
++        }
++
++        const bool patchedSslWrite = nasAction == NasSslWriteAction::Ready;
++
++        const uint8_t* writeData = patchedSslWrite ? patched.data() : data;
++        const uint32_t writeSize = patchedSslWrite ? static_cast<uint32_t>(patched.size()) : out[1].size;
++        SslSession& writeSession = g_sslSessions[sslId];
++        int32_t result = SslWrite(writeSession, writeData, writeSize);
++        if (patchedSslWrite && result == static_cast<int32_t>(writeSize)) {
++            result = static_cast<int32_t>(out[1].size);
++        }
++        // SSL_ERR_WAGAIN is a retry, not a failure; the SDK re-issues the write,
++        // so only a change of error is reported.
++        if (result < 0 && result != SSL_ERR_WAGAIN && result != writeSession.lastLoggedWriteError) {
++            writeSession.lastLoggedWriteError = result;
++            NetFail("SSL_WRITE host=%s size=%u FAILED ssl_err=%d",
++                    writeSession.hostname.empty() ? "?" : writeSession.hostname.c_str(), writeSize,
++                    result);
++        }
++        WriteSslReturn(in, result);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_READ: {
++        const int sslId = ReadSslId(out);
++        if (!IsSslIdValid(sslId)) {
++            WriteSslReturn(in, SSL_ERR_ID);
++            return 0;
++        }
++        if (in.size() < 2 || !in[1].address) {
++            WriteSslReturn(in, SSL_ERR_FAILED);
++            return 0;
++        }
++        auto* guestData = Memory::GetPointer(in[1].address, in[1].size);
++        SslSession& readSession = g_sslSessions[sslId];
++#if defined(__SWITCH__)
++        // Same as plain recv: the ssl service cannot write into the guest-RAM alias mapping.
++        thread_local std::vector<uint8_t> sslBounce;
++        if (sslBounce.size() < in[1].size) sslBounce.resize(in[1].size);
++        auto* data = guestData ? sslBounce.data() : nullptr;
++#else
++        auto* data = guestData;
++#endif
++        const int32_t result = SslRead(readSession, data, in[1].size);
++#if defined(__SWITCH__)
++        if (result > 0 && guestData) {
++            std::memcpy(guestData, data, static_cast<size_t>(result));
++        }
++#endif
++        if (result < 0 && result != SSL_ERR_RAGAIN && result != readSession.lastLoggedReadError) {
++            readSession.lastLoggedReadError = result;
++            NetFail("SSL_READ host=%s FAILED ssl_err=%d%s",
++                    readSession.hostname.empty() ? "?" : readSession.hostname.c_str(), result,
++                    result == SSL_ERR_ZERO ? " (peer closed)" : "");
++        }
++        WriteSslReturn(in, result);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_SHUTDOWN: {
++        const int sslId = ReadSslId(out);
++        if (!IsSslIdValid(sslId)) {
++            WriteSslReturn(in, SSL_ERR_ID);
++            return 0;
++        }
++        ClearSslSession(g_sslSessions[sslId]);
++        WriteSslReturn(in, SSL_OK);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_SETCLIENTCERT:
++    case IOCTLV_NET_SSL_SETCLIENTCERTDEFAULT:
++    case IOCTLV_NET_SSL_REMOVECLIENTCERT:
++    case IOCTLV_NET_SSL_SETROOTCA:
++    case IOCTLV_NET_SSL_SETROOTCADEFAULT:
++    case IOCTLV_NET_SSL_SETBUILTINROOTCA:
++    case IOCTLV_NET_SSL_SETBUILTINCLIENTCERT:
++    case IOCTLV_NET_SSL_DISABLEVERIFYOPTIONFORDEBUG: {
++        const int sslId = ReadSslId(out);
++        WriteSslReturn(in, IsSslIdValid(sslId) ? SSL_OK : SSL_ERR_ID);
++        return 0;
++    }
++    case IOCTLV_NET_SSL_DEBUGGETVERSION:
++    case IOCTLV_NET_SSL_DEBUGGETTIME:
++        WriteSslReturn(in, SSL_OK);
++        return 0;
++    default:
++        WriteSslReturn(in, SSL_ERR_FAILED);
++        return 0;
++    }
++}
++
++}  // namespace NetworkHle

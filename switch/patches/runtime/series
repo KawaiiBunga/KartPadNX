@@ -1,0 +1,11 @@
+01-runtime-platform.patch
+02-runtime-cpu.patch
+03-runtime-os.patch
+04-runtime-storage.patch
+05-runtime-audio.patch
+06-runtime-gx.patch
+07-runtime-input.patch
+08-runtime-net.patch
+09-aurora-gx.patch
+10-aurora-graphics.patch
+11-aurora-input.patch

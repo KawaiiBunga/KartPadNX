@@ -1,0 +1,7 @@
+# Scripts and patches run in the Linux build container, so they keep LF on every checkout.
+*.sh text eol=lf
+*.py text eol=lf
+*.patch text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+switch/patches/runtime/series text eol=lf
