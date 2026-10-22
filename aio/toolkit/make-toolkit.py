@@ -2,6 +2,7 @@
 """Assemble the AIO builder toolkit from this checkout (run on the developer machine).
 
   python aio/toolkit/make-toolkit.py --out aio/out/toolkit [--build-root DIR] [--zip] [--no-pgo] [--no-seeds]
+                                     [--prebuilt-data DIR [--bundle KartPadNX-Builder.data]]
 
 The toolkit holds everything the user-side build needs that is not on a public download
 server and not derived from the user's disc. It is laid out as a small copy of this
@@ -24,6 +25,8 @@ repository so the builder scripts resolve their usual paths:
   private/deko-training/        shader / pipeline seeds packed into the game RomFS
   private/self-build/.../base_common_shard_map.json
                                 frozen shard membership (function addresses only)
+  aio-prebuilt/libs/, cmake/    with --prebuilt-data: the game-independent targets compiled
+                                by make-prebuilt.py and the CMake configure seed
 
 It never copies translated game code, disc files, game NROs or Retro Rewind files; a final
 scan refuses the toolkit if any such file slipped in.
@@ -33,6 +36,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -127,6 +131,10 @@ def main():
     ap.add_argument('--build-root', type=Path, default=REPO,
                     help='checkout that holds the Docker build outputs (build/, private/) and the fetched '
                          'upstreams (ref/dawn, ref/SDL, ref/upstream); sources always come from this repo')
+    ap.add_argument('--prebuilt-data', type=Path, default=None,
+                    help='also run make-prebuilt.py with this AIO work folder (the player then compiles '
+                         'only the translated game)')
+    ap.add_argument('--bundle', default=None, help='with --prebuilt-data: KartPadNX-Builder.data to take the tools from')
     args = ap.parse_args()
     BLD = args.build_root.resolve()
     out = args.out.resolve()
@@ -234,6 +242,14 @@ def main():
                 'files': tk.files, 'bytes': tk.bytes, 'pgo': not args.no_pgo, 'seeds': not args.no_seeds}
     (out / 'aio-toolkit.json').write_text(json.dumps(manifest, indent=2))
     print(f'toolkit: {tk.files} files, {tk.bytes / 1e6:.0f} MB in {out} ({time.time() - t0:.0f}s)')
+
+    if args.prebuilt_data:
+        cmd = [sys.executable, str(Path(__file__).with_name('make-prebuilt.py')),
+               '--toolkit', str(out), '--data', str(args.prebuilt_data)]
+        if args.bundle:
+            cmd += ['--bundle', args.bundle]
+        if subprocess.run(cmd).returncode:
+            sys.exit('make-prebuilt.py failed')
 
     if args.zip:
         zpath = out.with_suffix('.zip')

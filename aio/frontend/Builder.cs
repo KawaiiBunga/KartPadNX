@@ -58,7 +58,7 @@ namespace KartPadNX
         readonly string exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
         TextBox discBox, outBox, dataBox, logBox;
-        CheckBox rrBox, rrSdBox;
+        CheckBox rrBox;
         NumericUpDown jobsBox;
         Button buildButton, cancelButton, openButton;
         ProgressBar bar;
@@ -92,23 +92,18 @@ namespace KartPadNX
             layout.SetColumnSpan(intro, 3);
 
             discBox = AddPathRow(layout, 1, "Disc image", "Choose your .iso / .wbfs / .rvz", BrowseDisc);
-            outBox = AddPathRow(layout, 2, "Output folder", null, delegate { BrowseFolder(outBox); });
+            outBox = AddPathRow(layout, 2, "SD card folder", null, delegate { BrowseFolder(outBox); });
             dataBox = AddPathRow(layout, 3, "Work folder", null, delegate { BrowseFolder(dataBox); });
 
-            rrBox = new CheckBox { Text = "Also build Retro Rewind (downloads its pinned update and the Retro WFC payload)", AutoSize = true, Checked = true };
+            // Building Retro Rewind also puts its matching files (from Retro Rewind's full pack) in
+            // the SD card folder, so the game and the files on the card are always the same version.
+            rrBox = new CheckBox
+            {
+                Text = "Build Retro Rewind too (also downloads Retro Rewind's own files, about 2 GB the first time)",
+                AutoSize = true, Checked = true
+            };
             layout.Controls.Add(rrBox, 1, 4);
             layout.SetColumnSpan(rrBox, 2);
-
-            // The update zip the build uses carries only Code.pul's changes; the SD card needs the
-            // whole RetroRewind6 folder of the same version, from Retro Rewind's full pack.
-            rrSdBox = new CheckBox
-            {
-                Text = "Also download the Retro Rewind SD files (the matching RetroRewind6 folder, about 1.9 GB)",
-                AutoSize = true, Checked = true, Margin = new Padding(20, 0, 3, 3)
-            };
-            layout.Controls.Add(rrSdBox, 1, 5);
-            layout.SetColumnSpan(rrSdBox, 2);
-            rrBox.CheckedChanged += delegate { rrSdBox.Enabled = rrBox.Checked && buildButton.Enabled; };
 
             var jobsLabel = new Label { Text = "Compile jobs", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 8, 0) };
             jobsBox = new NumericUpDown { Minimum = 0, Maximum = 64, Value = 0, Width = 60 };
@@ -128,8 +123,8 @@ namespace KartPadNX
             buildButton.Click += delegate { StartBuild(); };
             cancelButton = new Button { Text = "Cancel", Width = 90, Height = 30, Enabled = false };
             cancelButton.Click += delegate { CancelBuild(); };
-            openButton = new Button { Text = "Open output folder", Width = 150, Height = 30, Enabled = false };
-            openButton.Click += delegate { if (outputPath != null) Process.Start("explorer.exe", "/select,\"" + outputPath + "\""); };
+            openButton = new Button { Text = "Open SD card folder", Width = 150, Height = 30, Enabled = false };
+            openButton.Click += delegate { if (outputPath != null) Process.Start("explorer.exe", "\"" + outBox.Text.Trim() + "\""); };
             buttons.Controls.Add(buildButton);
             buttons.Controls.Add(cancelButton);
             buttons.Controls.Add(openButton);
@@ -206,7 +201,7 @@ namespace KartPadNX
 
         void LoadSettings()
         {
-            outBox.Text = Path.Combine(exeDir, "output");
+            outBox.Text = Path.Combine(exeDir, "SD card");
             dataBox.Text = DefaultWorkFolder();
             try
             {
@@ -220,7 +215,6 @@ namespace KartPadNX
                     else if (k == "out") outBox.Text = v;
                     else if (k == "data") dataBox.Text = v;
                     else if (k == "rr") rrBox.Checked = v == "1";
-                    else if (k == "rrsd") rrSdBox.Checked = v == "1";
                     else if (k == "jobs") { int j; if (int.TryParse(v, out j) && j >= 0 && j <= 64) jobsBox.Value = j; }
                 }
             }
@@ -233,7 +227,7 @@ namespace KartPadNX
             {
                 File.WriteAllLines(SettingsPath, new[] {
                     "disc=" + discBox.Text, "out=" + outBox.Text, "data=" + dataBox.Text,
-                    "rr=" + (rrBox.Checked ? "1" : "0"), "rrsd=" + (rrSdBox.Checked ? "1" : "0"), "jobs=" + jobsBox.Value });
+                    "rr=" + (rrBox.Checked ? "1" : "0"), "jobs=" + jobsBox.Value });
             }
             catch { }
         }
@@ -407,22 +401,22 @@ namespace KartPadNX
             if (!File.Exists(disc)) { MessageBox.Show(this, "Choose your disc image first.", Text); return; }
             if (outDir.Length == 0 || data.Length == 0) { MessageBox.Show(this, "Choose the output and work folders.", Text); return; }
             try { data = Path.GetFullPath(data); dataBox.Text = data; } catch { }
-            bool rr = rrBox.Checked, rrSd = rr && rrSdBox.Checked;
-            if (!CheckSystem(data, outDir, rrSd)) return;
+            bool rr = rrBox.Checked;
+            if (!CheckSystem(data, outDir, rr)) return;
             SaveSettings();
             cancelled = false;
             outputPath = null;
             logBox.Clear();
             SetRunning(true);
             int jobs = (int)jobsBox.Value;
-            var t = new Thread(delegate() { BuildThread(disc, outDir, data, rr, rrSd, jobs); });
+            var t = new Thread(delegate() { BuildThread(disc, outDir, data, rr, jobs); });
             t.IsBackground = true;
             t.Start();
         }
 
         // Requirements of the downloaded tools (.NET 8, Python 3.14, LLVM: 64-bit Windows 10+)
         // and of the build itself (disk, memory, path). Hard limits stop; soft ones ask.
-        bool CheckSystem(string data, string outDir, bool rrSd)
+        bool CheckSystem(string data, string outDir, bool rr)
         {
             if (!Environment.Is64BitOperatingSystem)
             { MessageBox.Show(this, "KartPad-NX Builder needs 64-bit Windows 10 or 11.", Text); return false; }
@@ -444,26 +438,25 @@ namespace KartPadNX
             {
                 Directory.CreateDirectory(data);
                 long free = new DriveInfo(Path.GetPathRoot(data)).AvailableFreeSpace;
-                // The Retro Rewind full pack (1.9 GB) is kept in the work folder's downloads.
-                long need = (rrSd ? 12L : 10L) << 30;
+                // The work folder keeps the extracted disc, the build and, for Retro Rewind, its
+                // full pack (1.9 GB) in downloads.
+                long need = (rr ? 12L : 9L) << 30;
                 if (free < need && MessageBox.Show(this, string.Format(
-                        "The work folder's drive has {0:N1} GB free; a build needs about {1} GB (7 GB with only the base game).\n\nTry anyway?",
+                        "The work folder's drive has {0:N1} GB free; a build needs about {1} GB.\n\nTry anyway?",
                         free / (double)(1L << 30), need >> 30), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
             }
             catch (Exception ex) { MessageBox.Show(this, "Cannot use the work folder: " + ex.Message, Text); return false; }
 
-            if (rrSd)
+            // The SD card folder gets the game files (2.7 GB) and, for Retro Rewind, its files (2.2 GB).
+            try
             {
-                try
-                {
-                    string root = Path.GetPathRoot(Path.GetFullPath(outDir));
-                    long free = new DriveInfo(root).AvailableFreeSpace;
-                    if (free < (5L << 29) && MessageBox.Show(this, string.Format(
-                            "The output folder's drive has {0:N1} GB free; the Retro Rewind SD files need about 2.2 GB.\n\nTry anyway?",
-                            free / (double)(1L << 30)), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
-                }
-                catch { }   // e.g. a network share: the pipeline reports a real problem
+                long free = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(outDir))).AvailableFreeSpace;
+                long need = rr ? (5L << 30) : (3L << 30);
+                if (free < need && MessageBox.Show(this, string.Format(
+                        "The SD card folder's drive has {0:N1} GB free; its files need about {1} GB.\n\nTry anyway?",
+                        free / (double)(1L << 30), need >> 30), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return false;
             }
+            catch { }   // e.g. a network share: the pipeline reports a real problem
 
             var m = new MemoryStatus { Length = (uint)Marshal.SizeOf(typeof(MemoryStatus)) };
             if (GlobalMemoryStatusEx(ref m) && m.TotalPhys < (7UL << 30) && MessageBox.Show(this, string.Format(
@@ -477,12 +470,11 @@ namespace KartPadNX
             buildButton.Enabled = !running;
             cancelButton.Enabled = running;
             discBox.Enabled = outBox.Enabled = dataBox.Enabled = rrBox.Enabled = jobsBox.Enabled = !running;
-            rrSdBox.Enabled = !running && rrBox.Checked;
             if (running) openButton.Enabled = false;
             SetThreadExecutionState(running ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) : ES_CONTINUOUS);
         }
 
-        void BuildThread(string disc, string outDir, string data, bool rr, bool rrSd, int jobs)
+        void BuildThread(string disc, string outDir, string data, bool rr, int jobs)
         {
             int rc = -1;
             try
@@ -504,7 +496,6 @@ namespace KartPadNX
                 args.Append(" --exe-dir ").Append(Q(exeDir)).Append(" --shim ").Append(Q(shim));
                 if (BundleStart() >= 0) args.Append(" --bundle ").Append(Q(bundlePath));
                 if (rr) args.Append(" --rr");
-                if (rrSd) args.Append(" --rr-sd");
                 if (jobs > 0) args.Append(" --jobs ").Append(jobs);
                 var psi = new ProcessStartInfo(python, args.ToString())
                 {
@@ -636,8 +627,8 @@ namespace KartPadNX
                 if (ev.TryGetValue("done", out v) && v is bool && (bool)v)
                 {
                     outputPath = (string)ev["output"];
-                    stageLabel.Text = "Done: " + outputPath;
-                    detailLabel.Text = "Copy the output folder's contents (except INSTALL.txt) to your SD card. See INSTALL.txt there.";
+                    stageLabel.Text = "Done";
+                    detailLabel.Text = "Copy everything in the SD card folder to the root of your SD card, then start MKW Launcher.";
                     bar.Style = ProgressBarStyle.Continuous;
                 }
             });

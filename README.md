@@ -14,7 +14,8 @@ or grab any version from the [Releases page](https://github.com/KawaiiBunga/Kart
 
 You need:
 
-- A Windows 10 or 11 PC (64-bit), about 10 GB free and 8 GB of RAM
+- A Windows 10 or 11 PC (64-bit), about 15 GB free and 8 GB of RAM
+- About 5 GB free on your SD card
 - Your own Mario Kart Wii disc image: **PAL (RMCP01), revision 0**, as `.iso`, `.wbfs` or `.rvz`
 - A Switch running homebrew
 
@@ -24,25 +25,22 @@ You need:
    because it isn't signed: click **More info**, then **Run anyway**.
 2. Pick your disc image, leave **Retro Rewind** ticked if you want it, and click **Build**.
    The first build takes 30 to 60 minutes. Nothing gets installed on your PC.
-3. When it's done, copy the `switch` folder from the output folder to the root of your SD
-   card, and put your disc image in `sd:/iso`.
-4. On the Switch, open the Homebrew Menu by holding **R** while starting a game, launch
-   **MKW Launcher**, and import your disc under **Game Files**.
+3. When it's done, copy everything in the **SD card** folder to the root of your SD card.
+4. On the Switch, open the Homebrew Menu by holding **R** while starting a game, and start
+   **MKW Launcher**. That's it, there's nothing to import.
 
-### Retro Rewind
+The SD card folder has the launcher with both games inside, your game files already
+extracted, and Retro Rewind's own files in the exact version that was built.
 
-Retro Rewind needs its own files on the SD card, and they have to be the exact version the
-builder built. Leave **Also download the Retro Rewind SD files** ticked (about 1.9 GB) and the
-builder puts the right ones in the output folder as `RetroRewind6`. Copy that folder to the
-root of your SD card too, then import it under **Game Files**.
-
-If you untick it, download the **full pack** of the version named in `INSTALL.txt` from
-[rwfc.net](https://rwfc.net), copy its `RetroRewind6` folder to `sd:/RetroRewind6`, and import
-it under **Game Files**. The folder has to contain `xml/RetroRewind6.xml`. If the launcher
-says that file is missing, you copied an update instead of the full pack.
+### Retro Rewind updates
 
 When Retro Rewind updates, wait until the new version is supported here, then click **Build**
-again. Only Retro Rewind gets rebuilt, and the `RetroRewind6` folder is updated too.
+again and copy the SD card folder over again. Only Retro Rewind gets rebuilt, and its files
+come out matching the game.
+
+Don't update Retro Rewind on the SD card by itself (with Wheel Wizard, or by copying a new
+`RetroRewind6` folder over). The game has Retro Rewind's code built in, so a different version
+on the card won't line up with it.
 
 ### If something goes wrong
 

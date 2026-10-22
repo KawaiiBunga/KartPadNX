@@ -544,3 +544,7 @@ if(KARTPAD_PGO_PROFILE AND KARTPAD_PGO_ALL)
     endif()
   endforeach()
 endif()
+
+# AIO builder only (off by default): take the game-independent targets from prebuilt objects.
+# Last, so every target's settings are final when they are compared.
+include("${CMAKE_CURRENT_LIST_DIR}/Prebuilt.cmake")

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""KartPad-NX AIO builder pipeline: the user's disc image in, mkw-launcher.nro out.
+"""KartPad-NX AIO builder pipeline: the user's disc image in, a ready SD card folder out.
 
-  python kpnx_aio.py --data DIR --disc IMAGE --out DIR [--rr [--rr-sd]] [--jobs N]
+  python kpnx_aio.py --data DIR --disc IMAGE --out DIR [--rr] [--jobs N]
                      [--toolkit ZIP|URL] [--manifest tools.json] [--shim nxshim.exe]
+
+--out gets exactly what goes on the SD card (switch/mkw-launcher.nro, the extracted game in
+switch/kartpad/data, and with --rr Retro Rewind in switch/kartpad/retro-rewind), so nothing
+has to be imported on the Switch.
 
 Runs on Windows with nothing installed. Every tool is a pinned, hash-checked portable
 download kept under --data (see tools.json). Stages are resumable: each records what it was
@@ -15,7 +19,10 @@ built from in <data>/state and is skipped when nothing changed.
   transform  the repo's source passes over the translation
   build      CMake + Ninja + clang -> game NROs
   launcher   both games zstd-packed into the launcher RomFS -> <out>/switch/mkw-launcher.nro
-  rr-sd      with --rr-sd: the built version's full Retro Rewind pack -> <out>/RetroRewind6
+  sd-game    (in the background) the disc's sys/ and files/ plus the extraction manifest
+             -> <out>/switch/kartpad/data
+  rr-sd      with --rr: the built version's full Retro Rewind pack
+             -> <out>/switch/kartpad/retro-rewind/RetroRewind6
 
 Lines starting with "@@" are JSON progress events for the frontend; everything else is log.
 """
@@ -27,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -619,7 +627,7 @@ def stage_disc(state, run, disc):
         raise Failure(f'disc image not found: {disc}')
     out = run.ws / 'private/self-build/disc'
     key = f'{disc.resolve()}:{disc.stat().st_size}:{int(disc.stat().st_mtime)}'
-    if state.done('disc', key) and (out / 'sys/main.dol').is_file():
+    if state.done('disc', key) and (out / 'sys/main.dol').is_file() and (out / 'sys/fst.bin').is_file():
         return
     stage('disc', 'Reading your disc image')
     if out.exists():
@@ -631,13 +639,7 @@ def stage_disc(state, run, disc):
     if sha256_file(dol) != EXPECT_DOL or sha256_file(rel) != EXPECT_REL:
         raise Failure('This is not the supported game version. KartPad-NX needs Mario Kart Wii '
                       'PAL (RMCP01), revision 0.')
-    # Only main.dol and StaticR.rel feed the translation; the console reads the game data from
-    # its own extraction, so keep just those two files.
-    for p in sorted(out.rglob('*'), key=lambda p: len(p.parts), reverse=True):
-        if p.is_file() and p not in (dol, rel):
-            p.unlink()
-        elif p.is_dir() and not any(p.iterdir()):
-            p.rmdir()
+    # main.dol and StaticR.rel feed the translation; sys/ and files/ also go to the SD card.
     log('disc OK: Mario Kart Wii PAL rev0')
     state.mark('disc', key)
 
@@ -823,12 +825,32 @@ def transform(run, profile):
         run.python(s + '.py', tr / 'build_shards')
 
 
-def configure_and_build(run, profile, jobs):
+def configure_seed(run, bdir):
+    """What aio/toolkit/make-prebuilt.py recorded from a configure with the same pinned tools:
+    the results of the compiler checks (zstd's and fmt's flag probes, FindThreads; each is a
+    try-compile of ~5 s on Windows) as an initial cache, and CMake's compiler identification
+    files for a new build tree. Returns the extra CMake arguments."""
+    seed = run.ws / 'aio-prebuilt/cmake'
+    if not (seed / 'seed.json').is_file():
+        return []
+    meta = json.loads((seed / 'seed.json').read_text(encoding='utf-8'))
+    if {n: run.t.key(n) for n in meta['tools']} != meta['tools']:
+        log('configure seed: recorded with other tool versions; CMake runs every check')
+        return []
+    if not (bdir / 'CMakeCache.txt').is_file():
+        dest = bdir / 'CMakeFiles' / meta['cmake_files']
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in meta['compiler_files']:
+            text = (seed / name).read_text(encoding='utf-8').replace('@TOOLS@', fwd(run.t.root))
+            (dest / name).write_text(text, encoding='utf-8')
+    return ['-C', seed / 'checks.cmake']
+
+
+def cmake_configure_cmd(run, profile, bdir, tr):
+    """The game's CMake configure command; aio/toolkit/make-prebuilt.py uses it too, so the
+    prebuilt objects are compiled with exactly these settings."""
     p = PROFILES[profile]
     ws, t = run.ws, run.t
-    bdir = ws / p['build']
-    tr = ws / p['translation']
-    run.python('integrate-deko.py')
     pgo_args = []
     marker = ws / 'private/pgo' / p['pgo']
     if not marker.is_file():
@@ -862,6 +884,22 @@ def configure_and_build(run, profile, jobs):
            '-DFETCHCONTENT_FULLY_DISCONNECTED=ON', '-DFETCHCONTENT_QUIET=ON']
     for d in FETCH_DEPS:
         cmd.append(f'-DFETCHCONTENT_SOURCE_DIR_{d.upper()}={fwd(ws / "aio-prebuilt/deps" / (d + "-src"))}')
+    return cmd
+
+
+def configure_and_build(run, profile, jobs):
+    p = PROFILES[profile]
+    ws, t = run.ws, run.t
+    bdir = ws / p['build']
+    llvm = t.llvm / 'bin'
+    run.python('integrate-deko.py')
+    cmd = cmake_configure_cmd(run, profile, bdir, ws / p['translation'])
+    cmd += configure_seed(run, bdir)
+    # Game-independent libraries compiled once by make-prebuilt.py; only the translated game
+    # is compiled here (switch/cmake/Prebuilt.cmake).
+    prebuilt = ws / 'aio-prebuilt/libs' / profile
+    if (prebuilt / 'prebuilt.cmake').is_file():
+        cmd.append(f'-DKARTPAD_PREBUILT_LIBS_DIR={fwd(prebuilt)}')
     run.run(cmd)
     run.run([t.cmake, '--build', bdir, '--target', 'kartpad_full_nro', '--parallel', jobs],
             progress=ninja_progress(p['app']), quiet=True)
@@ -914,70 +952,136 @@ def pack_launcher(run, nros, out_dir):
     return dest
 
 
-INSTALL_TEXT = """KartPad-NX - built {when} from your own disc
-=====================================================
+INSTALL_TEXT = """KartPadNX, built {when} from your own disc
 
-1. Copy everything in this folder except INSTALL.txt to the root of your Switch SD card:
+Copy everything in this folder to the root of your Switch SD card. If Windows asks, replace
+the files that are already there.
 
-       sd:/switch/mkw-launcher.nro
-       sd:/iso/<your disc>.wbfs or .iso   (copy your disc image there{iso_note}){rr_line}
-
-2. Start the MKW Launcher from the Homebrew Menu in application mode (hold R while starting a
-   game), not from the album applet.
-
-3. In the launcher, open Game Files and import the disc. This only has to be done once.
+    switch/mkw-launcher.nro                        the launcher, with {games}
+    switch/kartpad/data/                           your game files
+{rr_line}
+Then open the Homebrew Menu (hold R while starting any game) and start MKW Launcher.
+There's nothing to import.
 {rr_text}
-These files contain code translated from your own copy of the game. They are for you only:
-do not share them.
+These files are made from your own copy of the game. They're for you only: please don't
+share them.
 
-Included games: {games}
 mkw-launcher.nro sha256: {sha}
 """
 
-RR_LINE = """
-       sd:/RetroRewind6/                  (Retro Rewind {rr}'s own files)"""
+RR_LINE = "    switch/kartpad/retro-rewind/RetroRewind6/      Retro Rewind {rr}\n"
 
 RR_TEXT_INCLUDED = """
-4. For Retro Rewind, import the RetroRewind6 folder in the launcher's Game Files screen. It is
-   version {rr}, the version this build was made for.
+When Retro Rewind updates, run the builder again and copy this folder over again. The game
+and the Retro Rewind files always come out matching.
 """
 
-RR_TEXT = """
-4. Retro Rewind also needs its own files, version {rr} (the version this build was made for).{why}
-   Download the FULL Retro Rewind {rr} pack from rwfc.net (not the small update zip), copy its
-   RetroRewind6 folder (the one that contains xml/RetroRewind6.xml) to sd:/RetroRewind6, and
-   import it in the launcher's Game Files screen.
+RR_TEXT_MISSING = """
+Retro Rewind {rr}'s own files couldn't be included: no full pack is approved for this version
+yet. Download the full {rr} pack from rwfc.net and copy its RetroRewind6 folder (the one with
+xml/RetroRewind6.xml inside) to switch/kartpad/retro-rewind/RetroRewind6 on the SD card.
 """
 
-RR_NO_FULL_PACK = """
-   This builder could not download them for you: no full pack is approved for this version."""
+# ------------------------------------------------------------------- SD game files ---
+# The game reads the extracted disc from sdmc:/switch/kartpad/data and starts only when
+# .kartpad-extraction-complete is there (switch/src/runtime_host_switch.cpp). The builder
+# writes the same tree and manifest the console's extractor would
+# (switch/src/runtime/disc_extractor.cpp), so nothing has to be imported on the Switch.
+
+MANIFEST_MAGIC = 'KARTPAD-DVD-EXTRACT-V1'
+FNV_OFFSET, FNV_PRIME, MASK64 = 14695981039346656037, 1099511628211, (1 << 64) - 1
 
 
-def stage_sd_disc(run, disc, out_dir):
-    """The launcher imports .wbfs/.iso only; write other formats (RVZ, WIA, ...) as an ISO."""
-    if Path(disc).suffix.lower() in ('.iso', '.wbfs'):
-        return False
-    dest = Path(out_dir) / 'iso' / 'RMCP01.iso'
-    if dest.is_file() and dest.stat().st_size > 0:
-        return True
-    stage('sd-disc', 'Writing an ISO copy of your disc for the SD card')
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + '.part')
-    run.run([run.t.nodtool, 'convert', disc, part])
-    os.replace(part, dest)
-    return True
+def fnv1a(data, h=FNV_OFFSET):
+    for x in data:
+        h = ((h ^ x) * FNV_PRIME) & MASK64
+    return h
+
+
+def _low_priority():
+    try:
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+    except Exception:
+        pass
+
+
+def _fnv_file(path):
+    h = FNV_OFFSET
+    with open(path, 'rb') as f:
+        while chunk := f.read(1 << 20):
+            h = fnv1a(chunk, h)
+    return h
+
+
+def fst_files(fst):
+    """(path, size) of every file in a Wii FST, in FST order: the order the extractor writes
+    its manifest lines."""
+    count = struct.unpack_from('>I', fst, 8)[0]
+    names = 12 * count
+    stack, out = [(count, '')], []
+    for i in range(1, count):
+        while i >= stack[-1][0]:
+            stack.pop()
+        word, _, value = struct.unpack_from('>III', fst, 12 * i)
+        start = names + (word & 0xFFFFFF)
+        name = fst[start:fst.index(b'\0', start)].decode('ascii')
+        path = f'{stack[-1][1]}/{name}' if stack[-1][1] else name
+        if word >> 24:
+            stack.append((value, path))
+        else:
+            out.append((path, value))
+    return out
+
+
+def sd_game_files(state, run, out_dir, disc_key):
+    """<out>/switch/kartpad/data: sys/ and files/ from the extracted disc plus the completion
+    manifest. Runs in the background during translation and compiling; the per-file FNV
+    hashes (about 12 CPU-minutes in Python) are spread over low-priority processes."""
+    src = run.ws / 'private/self-build/disc'
+    live = Path(out_dir) / 'switch/kartpad/data'
+    key = f'{live.resolve()}|{disc_key}'
+    if state.done('sd-game', key) and (live / '.kartpad-extraction-complete').is_file():
+        return
+    state.clear('sd-game')
+    fst = (src / 'sys/fst.bin').read_bytes()
+    files = fst_files(fst)
+    for path, size in files:
+        if (src / 'files' / path).stat().st_size != size:
+            raise Failure(f'extracted file {path} does not match its size in the disc table')
+    workers = max(1, min(4, (os.cpu_count() or 2) // 3))
+    with concurrent.futures.ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
+        hashes = pool.map(_fnv_file, [str(src / 'files' / p) for p, _ in files], chunksize=8)
+        part = live.with_name('data.part')
+        if part.exists():
+            shutil.rmtree(part)
+        for sub in ('sys', 'files'):
+            shutil.copytree(src / sub, part / sub)
+        lines = [MANIFEST_MAGIC, 'fst %x' % fnv1a(fst)]
+        lines += ['file %d %x' % (size, h) for (_, size), h in zip(files, hashes)]
+    (part / '.kartpad-extraction-complete').write_text('\n'.join(lines) + '\n', encoding='ascii', newline='\n')
+    if live.exists():
+        old = live.with_name('data.old')
+        if old.exists():
+            shutil.rmtree(old)
+        os.replace(live, old)
+        shutil.rmtree(old)
+    os.replace(part, live)
+    log(f'SD card: game files written to {live} ({len(files)} files)')
+    state.mark('sd-game', key)
 
 
 def stage_rr_sd(state, tools, spec, out_dir):
-    """<out>/RetroRewind6 for the SD card, from the full Retro Rewind pack of the version that
-    was built (the update zips carry only the files that changed). The zip stays in the work
-    folder's downloads. Returns False when the approved entry names no full pack."""
+    """<out>/switch/kartpad/retro-rewind/RetroRewind6, where the launcher and the game read it,
+    from the full Retro Rewind pack of the version that was built (the update zips carry only
+    the files that changed). The zip stays in the work folder's downloads. Returns False when
+    the approved entry names no full pack."""
     version = spec['version']
     if not spec.get('full_url'):
         log(f'Retro Rewind {version}: the approved list has no full pack for this version, so the '
             'RetroRewind6 folder is not included; INSTALL.txt says where to get it.')
         return False
-    dest = Path(out_dir) / 'RetroRewind6'
+    root = Path(out_dir) / 'switch/kartpad/retro-rewind'
+    dest = root / 'RetroRewind6'
     xml, code = dest / 'xml/RetroRewind6.xml', dest / 'Binaries/Code.pul'
     key = f'{dest.resolve()}|{spec["full_sha256"]}'
     if state.done('rr-sd', key) and xml.is_file() and code.is_file() \
@@ -992,12 +1096,25 @@ def stage_rr_sd(state, tools, spec, out_dir):
     zpath = download(spec['full_url'], tools.dl / name, spec['full_size'], spec['full_sha256'],
                      label=f'Retro Rewind {version} full pack')
     emit(progress='extract', item='RetroRewind6', done=0, total=0)
-    # Unpacked over an existing folder (it may be the SD card itself): nothing is deleted.
-    count = extract_zip(zpath, out_dir, include=['RetroRewind6/'], label='RetroRewind6')
-    if not xml.is_file() or not code.is_file():
+    # Unpacked beside the old folder and swapped in, so files a newer version dropped do not
+    # linger. Saves live in retro-rewind/riivolution, outside RetroRewind6, and are untouched.
+    part = root / 'RetroRewind6.part'
+    if part.exists():
+        shutil.rmtree(part)
+    count = extract_zip(zpath, part, include=['RetroRewind6/'], label='RetroRewind6')
+    new = part / 'RetroRewind6'
+    if not (new / 'xml/RetroRewind6.xml').is_file() or not (new / 'Binaries/Code.pul').is_file():
         raise Failure(f'the Retro Rewind {version} full pack has no RetroRewind6/xml/RetroRewind6.xml or Code.pul')
-    if sha256_file(code) != spec['code_pul_sha256']:
+    if sha256_file(new / 'Binaries/Code.pul') != spec['code_pul_sha256']:
         raise Failure(f'the Retro Rewind {version} full pack has a different Code.pul than the one built')
+    if dest.exists():
+        old = root / 'RetroRewind6.old'
+        if old.exists():
+            shutil.rmtree(old)
+        os.replace(dest, old)
+        shutil.rmtree(old)
+    os.replace(new, dest)
+    shutil.rmtree(part)
     log(f'RetroRewind6: {count} files from {name} -> {dest}')
     state.mark('rr-sd', key)
     return True
@@ -1009,9 +1126,9 @@ def main():
     ap.add_argument('--data', required=True, type=Path)
     ap.add_argument('--disc', required=True, type=Path)
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--rr', action='store_true', help='also build Retro Rewind')
-    ap.add_argument('--rr-sd', action='store_true',
-                    help="with --rr: also put the built version's RetroRewind6 folder (from its full pack) in --out")
+    ap.add_argument('--rr', action='store_true',
+                    help="also build Retro Rewind, and put its matching RetroRewind6 folder in --out")
+    ap.add_argument('--rr-sd', action='store_true', help=argparse.SUPPRESS)  # older frontends; implied by --rr
     ap.add_argument('--jobs', type=int, default=0)
     ap.add_argument('--toolkit', default=None)
     ap.add_argument('--exe-dir', default=None)
@@ -1029,10 +1146,7 @@ def main():
     LOG = open(data / 'logs' / time.strftime('build-%Y%m%d-%H%M%S.log'), 'w', encoding='utf-8')
     jobs = args.jobs or default_jobs()
     profiles = ['base'] + (['retro-rewind'] if args.rr else [])
-    log(f'KartPad-NX AIO builder: data={data} jobs={jobs} profiles={",".join(profiles)}'
-        + (' +RetroRewind6' if args.rr and args.rr_sd else ''))
-    if args.rr_sd and not args.rr:
-        log('--rr-sd is ignored without --rr')
+    log(f'KartPad-NX AIO builder: data={data} out={args.out} jobs={jobs} profiles={",".join(profiles)}')
     t0 = time.time()
     try:
         manifest = json.loads(args.manifest.read_text(encoding='utf-8'))
@@ -1056,6 +1170,9 @@ def main():
         ws = stage_toolkit(state, data, key, extract)
         run = Runner(tools, ws)
         stage_disc(state, run, args.disc)
+        disc_key = state.root.joinpath('disc.done').read_text(encoding='utf-8')
+        # The SD card's game files are copied and hashed while the game is translated and built.
+        sd_game = Background(lambda: sd_game_files(state, run, args.out, disc_key))
         rr_spec = resolve_rr(manifest, args.rr_list) if args.rr else manifest['retro_rewind']
         nros = {}
         for profile in profiles:
@@ -1081,22 +1198,23 @@ def main():
         stage('launcher', 'Packing the launcher')
         dest = pack_launcher(run, nros, args.out)
         sha = sha256_file(dest)
-        converted = stage_sd_disc(run, args.disc, args.out)
         rr = rr_spec['version']
-        rr_sd = args.rr and args.rr_sd and stage_rr_sd(state, tools, rr_spec, args.out)
+        rr_sd = args.rr and stage_rr_sd(state, tools, rr_spec, args.out)
+        if sd_game.thread.is_alive():
+            stage('sd-game', 'Finishing the game files for the SD card')
+        sd_game.join()
         if not args.rr:
             rr_text = ''
         elif rr_sd:
-            rr_text = RR_TEXT_INCLUDED.format(rr=rr)
+            rr_text = RR_TEXT_INCLUDED
         else:
-            rr_text = RR_TEXT.format(rr=rr, why=RR_NO_FULL_PACK if args.rr_sd else '')
+            rr_text = RR_TEXT_MISSING.format(rr=rr)
+        games = ' and '.join(PROFILES[p]['app'] for p in profiles)
         (Path(args.out) / 'INSTALL.txt').write_text(INSTALL_TEXT.format(
-            when=time.strftime('%Y-%m-%d %H:%M'),
-            iso_note='; an ISO copy is already in iso/' if converted else '',
-            rr_line=RR_LINE.format(rr=rr) if rr_sd else '', rr_text=rr_text,
-            games=', '.join(PROFILES[p]['app'] for p in profiles), sha=sha), encoding='utf-8')
-        log(f'\nDone in {(time.time() - t0) / 60:.0f} min: {dest} ({dest.stat().st_size:,} bytes)')
-        emit(done=True, output=str(dest), sha256=sha)
+            when=time.strftime('%Y-%m-%d %H:%M'), games=games,
+            rr_line=RR_LINE.format(rr=rr) if rr_sd else '', rr_text=rr_text, sha=sha), encoding='utf-8')
+        log(f'\nDone in {(time.time() - t0) / 60:.0f} min: SD card files in {Path(args.out).resolve()}')
+        emit(done=True, output=str(Path(args.out).resolve()), sha256=sha)
         return 0
     except Failure as e:
         log(f'\nERROR: {e}')
