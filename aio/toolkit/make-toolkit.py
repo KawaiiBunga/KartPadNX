@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """Assemble the AIO builder toolkit from this checkout (run on the developer machine).
 
-  python aio/toolkit/make-toolkit.py --out aio/out/toolkit [--build-root DIR] [--zip] [--no-pgo] [--no-seeds]
+  python aio/toolkit/make-toolkit.py --out aio/out/toolkit (--from-release KartPadNX-Builder.data | --build-root DIR)
+                                     [--zip] [--no-pgo] [--no-seeds]
                                      [--prebuilt-data DIR [--bundle KartPadNX-Builder.data]]
+
+Normally run through aio/release.ps1. Sources (builder/, switch/, launcher assets, the KartPad
+subset) always come from this repo. The binary parts (Dawn/SDL, the staged runtime and built
+translator, the launcher ELF, compiled shaders, Aurora's fetched sources, PGO profiles, shader
+seeds, frozen shard maps) come either from the previous release's .data file
+(--from-release: nothing outside the repo is needed) or from a checkout where the Docker source
+build ran (--build-root: only when the runtime, Aurora, Dawn, the launcher or the renderer
+shaders changed).
 
 The toolkit holds everything the user-side build needs that is not on a public download
 server and not derived from the user's disc. It is laid out as a small copy of this
@@ -35,6 +44,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +121,112 @@ def make_space_safe(out):
         p.write_text(text, encoding='utf-8', newline='')
 
 
+def release_base(data):
+    """The toolkit inside a release's .data, unpacked to aio/out/release-base. Its layout is a
+    build root's, except the compiled shaders and Aurora's fetched sources (see first_dir)."""
+    base = REPO / 'aio/out/release-base'
+    if base.exists():
+        shutil.rmtree(base)
+    with zipfile.ZipFile(data) as z:
+        for info in z.infolist():
+            if not info.filename.startswith('toolkit/') or info.is_dir():
+                continue
+            dest = base / info.filename[len('toolkit/'):]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+    if not (base / 'aio-toolkit.json').is_file():
+        sys.exit(f'{data} has no toolkit (is it a KartPadNX-Builder.data?)')
+    print(f'binary parts from {data}')
+    return base
+
+
+def patch_sections(patch_dir):
+    """{path: that file's diff} for the switch/patches/runtime series, with LF line ends."""
+    sections = {}
+    for name in (patch_dir / 'series').read_text().split():
+        text = (patch_dir / name).read_text(encoding='utf-8').replace('\r\n', '\n')
+        for part in re.split(r'^(?=diff --git )', text, flags=re.M):
+            m = re.match(r'diff --git a/(\S+) b/', part)
+            if m:
+                sections[m.group(1)] = part
+    return sections
+
+
+def apply_section(lines, rel, section, reverse=False):
+    """One file's unified diff applied to its lines (reverse=True undoes it). Every hunk must
+    match exactly, at its line number or uniquely elsewhere."""
+    out, pos = [], 0
+    for hunk in re.split(r'^(?=@@ )', section, flags=re.M)[1:]:
+        m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk)
+        counts = [int(m.group(2) or 1), int(m.group(4) or 1)]
+        old, new = [], []
+        for line in hunk.split('\n')[1:]:
+            if counts == [0, 0]:
+                break
+            if line.startswith('\\'):
+                continue
+            tag, text = line[:1], line[1:]
+            if tag in (' ', '-'):
+                old.append(text)
+                counts[0] -= 1
+            if tag in (' ', '+'):
+                new.append(text)
+                counts[1] -= 1
+        line_no, count = (m.group(3), m.group(4)) if reverse else (m.group(1), m.group(2))
+        if reverse:
+            old, new = new, old
+        start = int(line_no) - (0 if count == '0' else 1)
+        if lines[start:start + len(old)] != old:
+            found = [i for i in range(pos, len(lines) - len(old) + 1) if lines[i:i + len(old)] == old]
+            if len(found) != 1:
+                sys.exit(f'{rel}: the staged file does not match its runtime patch (hunk {m.group(0)}); '
+                         'build with --build-root after a Docker build')
+            start = found[0]
+        out += lines[pos:start] + new
+        pos = start + len(old)
+    return out + lines[pos:]
+
+
+def sync_runtime_patches(old_dir, stg):
+    """The staged runtime and Aurora (stg) were built from old_dir's switch/patches/runtime.
+    Every file whose patch changed in this repo since is brought up to date: the old change is
+    undone and the new one applied. The patches under them (switch/patches/*.patch) and the
+    translator need a Docker build."""
+    new_dir = REPO / 'switch/patches/runtime'
+    for p in (REPO / 'switch/patches').glob('wiicompiled-switch-*.patch'):
+        q = old_dir.parent / p.name
+        if not q.is_file() or q.read_bytes().replace(b'\r\n', b'\n') != p.read_bytes().replace(b'\r\n', b'\n'):
+            sys.exit(f'switch/patches/{p.name} changed since the staged runtime was built; '
+                     'build with --build-root after a Docker build')
+    old, new = patch_sections(old_dir), patch_sections(new_dir)
+    for rel in sorted(p for p in old.keys() | new.keys() if old.get(p) != new.get(p)):
+        f = stg / rel
+        text = f.read_bytes().decode('utf-8') if f.is_file() else ''
+        crlf = '\r\n' in text
+        lines = text.replace('\r\n', '\n').split('\n')
+        if lines[-1] == '':
+            lines.pop()
+        if rel in old:
+            lines = apply_section(lines, rel, old[rel], reverse=True)
+        if rel in new:
+            lines = apply_section(lines, rel, new[rel])
+        if lines:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            text = '\n'.join(lines) + '\n'
+            f.write_bytes((text.replace('\n', '\r\n') if crlf else text).encode('utf-8'))
+        else:
+            f.unlink(missing_ok=True)
+        print(f'runtime patch changed since the staged runtime: {rel}')
+
+
+def first_dir(*candidates):
+    for c in candidates:
+        if c.is_dir():
+            return c
+    sys.exit('missing: ' + ' or '.join(map(str, candidates)))
+
+
 def pgo_names(bld):
     names = set()
     for marker in ('current', 'current-retro-rewind'):
@@ -128,15 +244,22 @@ def main():
     ap.add_argument('--zip', action='store_true', help='also write <out>.zip')
     ap.add_argument('--no-pgo', action='store_true', help='leave out the sample-PGO profiles')
     ap.add_argument('--no-seeds', action='store_true', help='leave out the shader/pipeline seeds')
-    ap.add_argument('--build-root', type=Path, default=REPO,
+    ap.add_argument('--build-root', type=Path, default=None,
                     help='checkout that holds the Docker build outputs (build/, private/) and the fetched '
                          'upstreams (ref/dawn, ref/SDL, ref/upstream); sources always come from this repo')
+    ap.add_argument('--from-release', type=Path, default=None,
+                    help="take the binary parts from a previous release's KartPadNX-Builder.data instead")
     ap.add_argument('--prebuilt-data', type=Path, default=None,
                     help='also run make-prebuilt.py with this AIO work folder (the player then compiles '
                          'only the translated game)')
     ap.add_argument('--bundle', default=None, help='with --prebuilt-data: KartPadNX-Builder.data to take the tools from')
     args = ap.parse_args()
-    BLD = args.build_root.resolve()
+    if bool(args.build_root) == bool(args.from_release):
+        sys.exit('give exactly one of --from-release (the last release) or --build-root (a Docker build)')
+    if args.from_release:
+        BLD = release_base(args.from_release)
+    else:
+        BLD = args.build_root.resolve()
     out = args.out.resolve()
     if out.exists():
         shutil.rmtree(out)
@@ -181,7 +304,8 @@ def main():
     # generated/ holds pc-harvest.py's rebased copies of a translation; test_output is upstream's.
     tk.copy_tree(stg, 'build/wiicompiled-fpscr', skip=SKIP_DIRS | {'obj'}, skip_top={'generated', 'test_output'},
                  exclude=('*.pdb',))
-    dll = out / 'build/wiicompiled-fpscr/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll'
+    sync_runtime_patches(BLD / 'switch/patches/runtime', out / 'build/wiicompiled-fpscr')
+    dll =out / 'build/wiicompiled-fpscr/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll'
     if not dll.is_file():
         sys.exit(f'translator not built: {dll} (dotnet build it first)')
 
@@ -196,18 +320,29 @@ def main():
     tk.copy_file(BLD / 'build/launcher/mkw_launcher.elf', 'build/launcher/mkw_launcher.elf')
     tk.copy_file(BLD / 'build/launcher/mkw-launcher.nacp', 'build/launcher/mkw-launcher.nacp')
 
-    # Precompiled renderer shaders, checked against this repo's sources.
-    dksh = BLD / 'build/switch-fullapp/dksh'
+    # Precompiled renderer shaders, checked against this repo's sources. A release keeps them in
+    # aio-prebuilt/dksh with the hashes of the GLSL they came from: a changed shader needs a
+    # Docker build (uam has no Windows build).
+    dksh = first_dir(BLD / 'build/switch-fullapp/dksh', BLD / 'aio-prebuilt/dksh')
+    recorded = {}
+    if (dksh / 'sources.sha256').is_file():
+        for line in (dksh / 'sources.sha256').read_text().splitlines():
+            if line.strip():
+                digest, name = line.split('  ', 1)
+                recorded[name] = digest
     sums = []
     for glsl in sorted((REPO / 'switch/deko/shaders').glob('*.glsl')):
         bin_ = dksh / (glsl.stem + '.dksh')
         if not bin_.is_file():
             sys.exit(f'no precompiled shader for {glsl.name} in {dksh}')
+        digest = hashlib.sha256(glsl.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+        if recorded and recorded.get(glsl.name) != digest:
+            sys.exit(f'{glsl.name} changed since its shader was compiled; build with --build-root after a Docker build')
         tk.copy_file(bin_, Path('aio-prebuilt/dksh') / bin_.name)
-        sums.append(hashlib.sha256(glsl.read_bytes().replace(b'\r\n', b'\n')).hexdigest() + '  ' + glsl.name)
+        sums.append(digest + '  ' + glsl.name)
     (out / 'aio-prebuilt/dksh/sources.sha256').write_text('\n'.join(sums) + '\n')
 
-    deps = BLD / 'build/switch-fullapp/_deps'
+    deps = first_dir(BLD / 'build/switch-fullapp/_deps', BLD / 'aio-prebuilt/deps')
     for name in FETCH_DEPS:
         tk.copy_tree(deps / f'{name}-src', f'aio-prebuilt/deps/{name}-src',
                      skip={'.git', '.github', '__pycache__', 'tests', 'test', 'doc', 'docs', 'examples'})

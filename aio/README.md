@@ -190,22 +190,32 @@ Retro Rewind is re-translated and rebuilt (about 12 minutes), the SD card folder
 
 ## Making a release
 
-On the developer machine, after a normal Docker build of the game and launcher
-([docs/BUILDING-SWITCH.md](../docs/BUILDING-SWITCH.md)). The toolkit takes this repo's sources,
-and the prebuilt Dawn/SDL libraries, staged runtime, built translator, launcher ELF, compiled
-shaders, PGO profiles and shader seeds from the checkout the Docker build ran in
-(`--build-root`, default this repo):
+One command, nothing installed, everything kept in `aio\out` (gitignored):
 
 ```powershell
-python aio\toolkit\make-toolkit.py --out aio\out\toolkit --build-root "D:\path\to\build checkout" --prebuilt-data C:\KPNX-dev --bundle aio\out\dist\KartPadNX-Builder.data
-python aio\toolkit\make-bundle.py --toolkit aio\out\toolkit
-powershell -ExecutionPolicy Bypass -File aio\build.ps1 -Bundle aio\out\bundle.zip
+powershell -ExecutionPolicy Bypass -File aio\release.ps1
 ```
 
-`aio\out\KartPadNX-Builder.zip` is the release (also unpacked in `aio\out\dist\`): attach it to
-a GitHub release. When only the exe changes (pipeline or manifest), players replace the exe and
+It takes this repo's sources and the binary parts (Dawn/SDL, the staged runtime and built
+translator, the launcher ELF, compiled shaders, PGO profiles, shader seeds) from the previous
+release in `aio\out\dist` (`-From <KartPadNX-Builder.data>` for another one), compiles the
+game-independent code, and writes `aio\out\KartPadNX-Builder.zip`: attach that to a GitHub
+release. About 20 minutes; `aio\out\work` keeps the compiled code so later runs are faster.
+
+Only when the runtime, Aurora, Dawn, the launcher or the renderer shaders change do the binary
+parts need a Docker source build ([docs/BUILDING-SWITCH.md](../docs/BUILDING-SWITCH.md)):
+then run `release.ps1 -BuildRoot <that checkout>`. `make-toolkit.py` stops if a renderer shader
+changed since its compiled copy, rather than shipping a stale one.
+
+`aio\out` after a run: `dist\` and `KartPadNX-Builder.zip` (the release), `previous-release.data`
+(what it was built from), `toolkit\`, `bundle.zip`, `work\` (compiled game-independent code),
+`cache\` (pinned downloads), `python\`. All of it can be deleted except `dist\`, which the next
+run starts from. When only the exe changes (pipeline or manifest), players replace the exe and
 keep their `.data` file.
-`make-bundle.py` fetches the pinned tool downloads once into `aio\out\cache`. Without `-Bundle`
+
+The individual steps (`release.ps1` runs them) are `toolkit\make-toolkit.py`,
+`toolkit\make-bundle.py` and `build.ps1`. `make-bundle.py` fetches the pinned tool downloads once
+into `aio\out\cache`. Without `-Bundle`
 you get an exe that downloads every tool itself and uses a `KartPadNX-Toolkit*.zip` next to it
 (`make-toolkit.py --zip`) or the toolkit URL in `manifest/tools.json`. A toolkit zip next to the
 exe always wins over the bundled toolkit, to try a new one without rebuilding the bundle.
@@ -213,7 +223,7 @@ exe always wins over the bundled toolkit, to try a new one without rebuilding th
 functions or shards, game NROs or saves. `--no-pgo` and `--no-seeds` leave out the sample-PGO
 profiles and the shader/pipeline seeds.
 
-`--prebuilt-data` runs `make-prebuilt.py` on the new toolkit, with `C:\KPNX-dev` as its AIO
+`--prebuilt-data` runs `make-prebuilt.py` on the new toolkit, with `aio\out\work` as its AIO
 work folder (tools from `--bundle`, or downloaded). It takes about 15 minutes, less when the
 folder already holds builds of the same sources. Run it again whenever the runtime, Aurora,
 `switch/` sources, PGO profiles or pinned tools change. A stale toolkit only falls back to
