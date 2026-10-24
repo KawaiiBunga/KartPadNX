@@ -79,6 +79,9 @@ KartPadNX-Builder-data/
 /launcher/tests/test_romfs/
 /launcher/tests/test_sdmc/
 
+# Local handoff notes
+/HANDOFF.md
+
 # Logs, caches, editors, OS
 *.log
 Logs/
