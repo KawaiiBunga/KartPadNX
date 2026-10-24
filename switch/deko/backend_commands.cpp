@@ -8,6 +8,7 @@
 #include "probe_fsh_dksh.h"
 #include <sys/stat.h>
 #endif
+extern "C" void kartpad_deko_log_failure_context();
 
 namespace kd {
 std::unordered_map<WGPUCommandEncoder, std::shared_ptr<Commands>> encoders;
@@ -15,6 +16,232 @@ std::unordered_map<WGPUCommandEncoder, int> encoderRefs;
 std::unordered_map<WGPUCommandBuffer, std::pair<std::shared_ptr<Commands>, int>> commands;
 std::unordered_map<WGPURenderPassEncoder, Pass> passes;
 State state;
+#if defined(COS_DK_GPU_CHECKPOINTS) || defined(COS_DK_GPU_FLUSHES)
+namespace {
+const char *gpuOperation = "<none>";
+uint64_t gpuArgs[3]{}, gpuOperationSerial = 0, gpuProgressSerial = 0;
+struct OperationRecord {
+  const char *name = "<none>";
+  uint64_t serial = 0, args[3]{};
+};
+std::array<OperationRecord, 32> gpuRecent{};
+struct ImageCopyRecord {
+  uint64_t serial = 0, srcAddress = 0, dstAddress = 0;
+  uint32_t srcSize = 0, dstSize = 0, srcFormat = 0, dstFormat = 0;
+  uint32_t srcMip = 0, dstMip = 0, srcOrigin[3]{}, dstOrigin[3]{};
+  char source[96]{}, destination[96]{};
+} gpuImageCopy;
+#ifdef COS_DK_GPU_BREADCRUMBS
+// Reports write a value and timestamp into permanent, CPU-uncached memory.
+// Neither this storage nor its CPU history moves while commands are in flight.
+// Reuse requires the old GPU-written serial, rather than a CPU submit count.
+constexpr size_t kGpuBreadcrumbs = 16384;
+struct Breadcrumb {
+  OperationRecord operation{nullptr, 0, {}};
+  uint64_t frame = 0, vs = 0, fs = 0, targetAddress = 0, depthAddress = 0;
+  uint64_t indexAddress = 0, indexBytes = 0;
+  uint32_t width = 0, height = 0;
+  char pipeline[96]{}, target[96]{};
+  ImageCopyRecord copy;
+  bool recorded = false;
+};
+std::array<Breadcrumb, kGpuBreadcrumbs> gpuBreadcrumbs;
+Block gpuReports;
+void log_gpu_breadcrumbs();
+uint64_t breadcrumb_value(uint64_t serial) {
+  if (!gpuReports) return 0;
+  return reinterpret_cast<volatile const uint64_t *>(gpuReports.cpu)[(serial % kGpuBreadcrumbs) * 2];
+}
+void breadcrumb_context(Breadcrumb &record) {
+  const auto &p = state.pipeline;
+  const auto *v = state.target ? find_view(state.target.Get()) : nullptr;
+  const auto *d = state.depthTarget ? find_view(state.depthTarget.Get()) : nullptr;
+  const auto *t = v ? v->tex : nullptr;
+  record.vs = p && p->vs.shader ? p->vs.shader->glslHash : 0;
+  record.fs = p && p->fs.shader ? p->fs.shader->glslHash : 0;
+  record.targetAddress = t ? dkImageGetGpuAddr(&t->image) : 0;
+  record.depthAddress = d ? dkImageGetGpuAddr(&d->tex->image) : 0;
+  record.width = t ? t->width : 0; record.height = t ? t->height : 0;
+  record.indexAddress = state.index ? state.index->mem.gpu + state.indexOffset : 0;
+  record.indexBytes = state.index ? state.index->size - state.indexOffset : 0;
+  std::snprintf(record.pipeline, sizeof(record.pipeline), "%s", p ? p->label.c_str() : "<none>");
+  std::snprintf(record.target, sizeof(record.target), "%s", t ? t->label.c_str() : "<none>");
+}
+void breadcrumb_begin() {
+  // ReportValue has a 32-bit payload. Stop rather than confuse generations on wrap.
+  if (gpuOperationSerial > UINT32_MAX) fatal("GPU breadcrumb serial exhausted");
+  auto &record = gpuBreadcrumbs[gpuOperationSerial % kGpuBreadcrumbs];
+  if (record.operation.serial &&
+      (!record.recorded || breadcrumb_value(record.operation.serial) != record.operation.serial)) {
+    log_gpu_breadcrumbs();
+    fatal("GPU breadcrumb history full: refusing to overwrite unfinished operation %llu",
+          (unsigned long long)record.operation.serial);
+  }
+  record = {};
+  record.operation = {gpuOperation, gpuOperationSerial, {gpuArgs[0], gpuArgs[1], gpuArgs[2]}};
+  record.frame = R.frame + 1;
+  breadcrumb_context(record);
+}
+void breadcrumb_end() {
+  if (!gpuReports) {
+    gpuReports = block_create(kGpuBreadcrumbs * 16, "GPU completion breadcrumbs");
+    if (!gpuReports) fatal("Cannot allocate GPU completion breadcrumbs");
+    std::memset(gpuReports.cpu, 0, gpuReports.size);
+  }
+  auto &record = gpuBreadcrumbs[gpuOperationSerial % kGpuBreadcrumbs];
+  breadcrumb_context(record);
+  if (gpuImageCopy.serial == gpuOperationSerial) record.copy = gpuImageCopy;
+  dkCmdBufReportValue(R.cmd, uint32_t(gpuOperationSerial),
+                      gpuReports.gpu + (gpuOperationSerial % kGpuBreadcrumbs) * 16);
+  record.recorded = true;
+  static uint64_t nextSampleFrame = 0;
+  if (record.frame >= nextSampleFrame) {
+    const uint64_t sample = gpuOperationSerial > 2048 ? gpuOperationSerial - 2048 : 1;
+    dklog("GPU progress sample: CPU=%llu sample_serial=%llu GPU_value=%llu",
+          (unsigned long long)gpuOperationSerial, (unsigned long long)sample,
+          (unsigned long long)breadcrumb_value(sample));
+    nextSampleFrame = record.frame + 300;
+  }
+}
+void log_gpu_breadcrumbs() {
+  const uint64_t oldest = gpuOperationSerial >= kGpuBreadcrumbs ? gpuOperationSerial - kGpuBreadcrumbs + 1 : 1;
+  uint64_t firstPending = 0, lastReported = 0;
+  for (uint64_t serial = oldest; serial <= gpuOperationSerial; ++serial) {
+    const auto &record = gpuBreadcrumbs[serial % kGpuBreadcrumbs];
+    if (record.operation.serial != serial) continue;
+    if (record.recorded && breadcrumb_value(serial) == serial)
+      lastReported = serial;
+    else if (!firstPending)
+      firstPending = serial;
+  }
+  std::fprintf(stderr, "[gpu-progress] CPU=%llu retained_from=%llu last_GPU_report=%llu first_missing=%llu report_addr=0x%llx\n",
+      (unsigned long long)gpuOperationSerial, (unsigned long long)oldest,
+      (unsigned long long)lastReported, (unsigned long long)firstPending,
+      (unsigned long long)gpuReports.gpu);
+  const uint64_t focus = firstPending ? firstPending : gpuOperationSerial;
+  for (uint64_t serial = std::max(oldest, focus > 8 ? focus - 8 : 1);
+       serial <= std::min(gpuOperationSerial, focus + 24); ++serial) {
+    const auto &r = gpuBreadcrumbs[serial % kGpuBreadcrumbs];
+    const auto &op = r.operation;
+    if (op.serial != serial) continue;
+    std::fprintf(stderr, "[gpu-breadcrumb] serial=%llu frame=%llu recorded=%u GPU_value=%llu op=%s args=%llu/%llu/%llu pipeline=%s vs=%016llx fs=%016llx target=%s %ux%u addr=0x%llx depth=0x%llx index=0x%llx bytes=%llu\n",
+        (unsigned long long)serial, (unsigned long long)r.frame, unsigned(r.recorded),
+        (unsigned long long)breadcrumb_value(serial), op.name,
+        (unsigned long long)op.args[0], (unsigned long long)op.args[1], (unsigned long long)op.args[2],
+        r.pipeline, (unsigned long long)r.vs, (unsigned long long)r.fs, r.target, r.width, r.height,
+        (unsigned long long)r.targetAddress, (unsigned long long)r.depthAddress,
+        (unsigned long long)r.indexAddress, (unsigned long long)r.indexBytes);
+    if (r.copy.serial == serial)
+      std::fprintf(stderr, "[gpu-breadcrumb-copy] serial=%llu source=%s addr=0x%llx bytes=%u format=%u mip=%u origin=%u/%u/%u destination=%s addr=0x%llx bytes=%u format=%u mip=%u origin=%u/%u/%u\n",
+          (unsigned long long)serial, r.copy.source, (unsigned long long)r.copy.srcAddress, r.copy.srcSize,
+          r.copy.srcFormat, r.copy.srcMip, r.copy.srcOrigin[0], r.copy.srcOrigin[1], r.copy.srcOrigin[2],
+          r.copy.destination, (unsigned long long)r.copy.dstAddress, r.copy.dstSize,
+          r.copy.dstFormat, r.copy.dstMip, r.copy.dstOrigin[0], r.copy.dstOrigin[1], r.copy.dstOrigin[2]);
+  }
+}
+#endif
+#ifdef COS_DK_GPU_FLUSHES
+uint32_t gpuOperationsPending = 0;
+#endif
+}
+void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
+  static const bool announced = [] {
+#ifdef COS_DK_GPU_CHECKPOINTS
+    swdk::dklog("GPU checkpoint test v3: native API validation and timed per-operation fences enabled");
+#else
+#ifdef COS_DK_GPU_BREADCRUMBS
+    swdk::dklog("GPU progress test v9: GPU-written completion history; v8 pass/transfer flush policy; no CPU waits");
+#else
+    swdk::dklog("GPU transition test v8: pass/transfer flushes, at most %u draw operations; CPU waits disabled",
+               unsigned(COS_DK_GPU_FLUSH_INTERVAL));
+#endif
+#endif
+    return true;
+  }();
+  (void)announced;
+  gpuOperation = name;
+  gpuArgs[0] = a; gpuArgs[1] = b; gpuArgs[2] = c;
+  ++gpuOperationSerial;
+  gpuRecent[gpuOperationSerial % gpuRecent.size()] = {name, gpuOperationSerial, {a, b, c}};
+#ifdef COS_DK_GPU_BREADCRUMBS
+  breadcrumb_begin();
+#endif
+}
+void gpu_operation_end(bool flushBoundary) {
+#ifdef COS_DK_GPU_BREADCRUMBS
+  breadcrumb_end();
+#endif
+#ifdef COS_DK_GPU_CHECKPOINTS
+  (void)flushBoundary;
+  DkFence fence{};
+  dkCmdBufSignalFence(R.cmd, &fence, true);
+  submit_readback("GPU operation checkpoint");
+  const DkResult result = dkFenceWait(&fence, 2'000'000'000ll);
+  if (result != DkResult_Success) {
+    kartpad_deko_log_failure_context();
+    fatal("GPU checkpoint stopped after %s: result=%d frame=%llu", gpuOperation, int(result),
+          static_cast<unsigned long long>(R.frame + 1));
+  }
+#else
+  // Diagnostic flush policy only; a small submitted batch can still time out.
+  if (++gpuOperationsPending < COS_DK_GPU_FLUSH_INTERVAL && !flushBoundary)
+    return;
+  submit_readback("asynchronous operation flush");
+  gpuOperationsPending = 0;
+#endif
+  gpuProgressSerial = gpuOperationSerial;
+}
+void gpu_operation_image_copy(const Tex &source, const Tex &destination,
+                              const WGPUTexelCopyTextureInfo &src,
+                              const WGPUTexelCopyTextureInfo &dst) {
+  gpuImageCopy.serial = gpuOperationSerial;
+  gpuImageCopy.srcAddress = dkImageGetGpuAddr(&source.image);
+  gpuImageCopy.dstAddress = dkImageGetGpuAddr(&destination.image);
+  gpuImageCopy.srcSize = source.mem.size; gpuImageCopy.dstSize = destination.mem.size;
+  gpuImageCopy.srcFormat = unsigned(source.format); gpuImageCopy.dstFormat = unsigned(destination.format);
+  gpuImageCopy.srcMip = src.mipLevel; gpuImageCopy.dstMip = dst.mipLevel;
+  gpuImageCopy.srcOrigin[0] = src.origin.x; gpuImageCopy.srcOrigin[1] = src.origin.y; gpuImageCopy.srcOrigin[2] = src.origin.z;
+  gpuImageCopy.dstOrigin[0] = dst.origin.x; gpuImageCopy.dstOrigin[1] = dst.origin.y; gpuImageCopy.dstOrigin[2] = dst.origin.z;
+  std::snprintf(gpuImageCopy.source, sizeof(gpuImageCopy.source), "%s", source.label.c_str());
+  std::snprintf(gpuImageCopy.destination, sizeof(gpuImageCopy.destination), "%s", destination.label.c_str());
+}
+#ifdef COS_DK_GPU_FLUSHES
+void gpu_operation_queue_submitted() {
+  // Submit the short tail too: a caller can enqueue fewer than the limit and
+  // then wait for a map/readback before producing any further GPU operations.
+  std::lock_guard<std::mutex> lock(fence_mutex());
+  dkQueueFlush(R.queue);
+  gpuOperationsPending = 0;
+  gpuProgressSerial = gpuOperationSerial;
+}
+#endif
+void log_gpu_operation_context() {
+#ifdef COS_DK_GPU_BREADCRUMBS
+  log_gpu_breadcrumbs();
+#endif
+#ifdef COS_DK_GPU_CHECKPOINTS
+  const char *progress = "completed";
+#else
+  const char *progress = "flushed";
+#endif
+  std::fprintf(stderr, "[gpu-operation] serial=%llu %s=%llu op=%s args=%llu/%llu/%llu\n",
+      (unsigned long long)gpuOperationSerial, progress, (unsigned long long)gpuProgressSerial, gpuOperation,
+      (unsigned long long)gpuArgs[0], (unsigned long long)gpuArgs[1], (unsigned long long)gpuArgs[2]);
+  const auto &copy = gpuImageCopy;
+  std::fprintf(stderr, "[gpu-image-copy] serial=%llu source=%s addr=0x%llx bytes=%u format=%u mip=%u origin=%u/%u/%u destination=%s addr=0x%llx bytes=%u format=%u mip=%u origin=%u/%u/%u\n",
+      (unsigned long long)copy.serial, copy.source, (unsigned long long)copy.srcAddress, copy.srcSize,
+      copy.srcFormat, copy.srcMip, copy.srcOrigin[0], copy.srcOrigin[1], copy.srcOrigin[2], copy.destination,
+      (unsigned long long)copy.dstAddress, copy.dstSize, copy.dstFormat, copy.dstMip,
+      copy.dstOrigin[0], copy.dstOrigin[1], copy.dstOrigin[2]);
+  for (uint64_t serial = gpuOperationSerial > gpuRecent.size() ? gpuOperationSerial - gpuRecent.size() + 1 : 1;
+       serial <= gpuOperationSerial; ++serial) {
+    const auto &op = gpuRecent[serial % gpuRecent.size()];
+    std::fprintf(stderr, "[gpu-operation-recent] serial=%llu op=%s args=%llu/%llu/%llu\n",
+        (unsigned long long)op.serial, op.name, (unsigned long long)op.args[0],
+        (unsigned long long)op.args[1], (unsigned long long)op.args[2]);
+  }
+}
+#endif
 Binding *binding(BoundGroup &g, uint32_t b) {
   if (g.group)
     for (auto &e : g.group->entries)
@@ -109,6 +336,7 @@ bool bind_pipeline() {
 #endif
 void draw(bool indexed, uint32_t count, uint32_t instances, uint32_t first, int32_t base,
           uint32_t firstInstance) {
+  GpuCheckpoint checkpoint(indexed ? "indexed draw" : "draw", count, instances, first);
   bind_pipeline();
 #ifdef COS_DK_DEBUG_LIB
   // Probe before the real draw: the depth comparison must see the same depth
@@ -154,8 +382,36 @@ void draw(bool indexed, uint32_t count, uint32_t instances, uint32_t first, int3
 #ifdef COS_DK_DEBUG_LIB
   probe_after_draw();
 #endif
+  checkpoint.finish();
 }
 } // namespace kd
+
+extern "C" void kartpad_deko_log_failure_context() {
+  // A driver failure may arrive while the fence mutex is held. Avoid waiting
+  // for the object mutex in the reverse order on this diagnostic path.
+  std::unique_lock lock(kd::mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    std::fprintf(stderr, "[gpu-submit] replay context busy\n");
+    return;
+  }
+  const auto stats = swdk::submit_stats();
+#if defined(COS_DK_GPU_CHECKPOINTS) || defined(COS_DK_GPU_FLUSHES)
+  kd::log_gpu_operation_context();
+#endif
+  const auto pipeline = kd::state.pipeline;
+  const auto *view = kd::state.target ? kd::find_view(kd::state.target.Get()) : nullptr;
+  const auto *texture = view ? view->tex : nullptr;
+  std::fprintf(stderr,
+      "[gpu-submit] frame=%llu submits=%llu pass_draws=%llu pipeline=%s "
+      "vs=%016llx fs=%016llx target=%s (%ux%u) buffers=%zu pipelines=%zu\n",
+      static_cast<unsigned long long>(swdk::R.frame + 1),
+      static_cast<unsigned long long>(stats.submits),
+      static_cast<unsigned long long>(kd::state.draws), pipeline ? pipeline->label.c_str() : "<none>",
+      static_cast<unsigned long long>(pipeline && pipeline->vs.shader ? pipeline->vs.shader->glslHash : 0),
+      static_cast<unsigned long long>(pipeline && pipeline->fs.shader ? pipeline->fs.shader->glslHash : 0),
+      texture ? texture->label.c_str() : "<none>", texture ? texture->width : 0,
+      texture ? texture->height : 0, kd::buffers.size(), kd::pipelines.size());
+}
 
 extern "C" {
 WGPUCommandEncoder __wrap_wgpuDeviceCreateCommandEncoder(WGPUDevice d,
@@ -213,6 +469,7 @@ __wrap_wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e,
       desc->depthStencilAttachment && desc->depthStencilAttachment->depthLoadOp == WGPULoadOp_Clear;
   float z = desc->depthStencilAttachment ? desc->depthStencilAttachment->depthClearValue : 1;
   kd::record(e, [view, depth, color, clear, clearDepth, z] {
+    kd::GpuCheckpoint checkpoint("begin render pass");
     kd::open();
     kd::barrier();
     kd::state = {};
@@ -234,6 +491,7 @@ __wrap_wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e,
     }
     if (clearDepth && d)
       dkCmdBufClearDepthStencil(swdk::R.cmd, true, z, 0, 0);
+    checkpoint.finish(true);
   });
   return p;
 }
@@ -243,6 +501,7 @@ void __wrap_wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
   auto target = pass.target;
   auto label = pass.label;
   kd::record_pass(p, [target, label] {
+    kd::GpuCheckpoint checkpoint("end render pass");
     kd::barrier();
     if (swdk::capture_frame()) {
       auto *v = kd::find_view(target.Get());
@@ -274,6 +533,7 @@ void __wrap_wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
         }
       }
     }
+    checkpoint.finish(true);
   });
   __real_wgpuRenderPassEncoderEnd(p);
   kd::passes.erase(p);
@@ -354,6 +614,9 @@ void __wrap_wgpuQueueSubmit(WGPUQueue q, size_t n, const WGPUCommandBuffer *b) {
   for (size_t i = 0; i < n; ++i)
     kd::required(kd::commands, b[i], __func__).first->run();
   swdk::submit("Aurora queue submit");
+#ifdef COS_DK_GPU_FLUSHES
+  kd::gpu_operation_queue_submitted();
+#endif
   kd::retire_uploads();
   __real_wgpuQueueSubmit(q, n, b);
 }
@@ -366,11 +629,15 @@ void __wrap_wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffe
   // memory to the producer again before this command and its GPU fence finish.
   auto source = s->active;
   kd::record(e, [=] {
+    kd::GpuCheckpoint checkpoint("buffer copy", so, off, n);
     kd::open();
     kd::barrier();
     dkCmdBufCopyBuffer(swdk::R.cmd, source->mem.gpu + so, d->mem.gpu + off, n);
-    kd::barrier();
+    // DMA writes can replace uniforms/storage at an address the shader has
+    // already cached. L2 invalidation alone does not invalidate that cache.
+    kd::barrier(DkInvalidateFlags_Shader);
     source->used();
+    checkpoint.finish(true);
   });
 }
 void __wrap_wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e,
@@ -381,10 +648,14 @@ void __wrap_wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e,
   auto s = *src, d = *dst;
   auto n = *size;
   kd::record(e, [=] {
+    kd::GpuCheckpoint checkpoint("image copy", n.width, n.height, n.depthOrArrayLayers);
     kd::open();
     kd::barrier();
     auto *st = kd::find_texture(sh.Get());
     auto *dt = kd::find_texture(dh.Get());
+#if defined(COS_DK_GPU_CHECKPOINTS) || defined(COS_DK_GPU_FLUSHES)
+    kd::gpu_operation_image_copy(*st, *dt, s, d);
+#endif
     auto sv = kd::level_view(st, s.mipLevel), dv = kd::level_view(dt, d.mipLevel);
     auto sx = s.origin.x, sy = s.origin.y, dx = d.origin.x, dy = d.origin.y, w = n.width,
          h = n.height;
@@ -400,6 +671,7 @@ void __wrap_wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e,
         dr{dx, dy, d.origin.z, w, h, n.depthOrArrayLayers};
     dkCmdBufCopyImage(swdk::R.cmd, &sv, &sr, &dv, &dr, 0);
     kd::barrier();
+    checkpoint.finish(true);
   });
 }
 void __wrap_wgpuCommandEncoderCopyBufferToTexture(WGPUCommandEncoder e,
@@ -416,6 +688,7 @@ void __wrap_wgpuCommandEncoderCopyBufferToTexture(WGPUCommandEncoder e,
     kd::open();
     kd::barrier();
     auto *dt = kd::find_texture(t.Get());
+    kd::GpuCheckpoint checkpoint("buffer to image", n.width, n.height, n.depthOrArrayLayers);
     auto dv = kd::level_view(dt, d.mipLevel);
     uint32_t row = layout.bytesPerRow == WGPU_COPY_STRIDE_UNDEFINED
                        ? ((n.width + dt->blockW - 1) / dt->blockW) * dt->blockBytes
@@ -428,6 +701,7 @@ void __wrap_wgpuCommandEncoderCopyBufferToTexture(WGPUCommandEncoder e,
     dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &dv, &r, 0);
     kd::barrier();
     s->used();
+    checkpoint.finish(true);
   });
 }
 void __wrap_wgpuCommandEncoderCopyTextureToBuffer(WGPUCommandEncoder e,
@@ -444,6 +718,7 @@ void __wrap_wgpuCommandEncoderCopyTextureToBuffer(WGPUCommandEncoder e,
     kd::open();
     kd::barrier();
     auto *st = kd::find_texture(t.Get());
+    kd::GpuCheckpoint checkpoint("image to buffer", n.width, n.height, n.depthOrArrayLayers);
     auto sv = kd::level_view(st, s.mipLevel);
     uint32_t row = layout.bytesPerRow == WGPU_COPY_STRIDE_UNDEFINED ? n.width * st->blockBytes
                                                                     : layout.bytesPerRow;
@@ -452,7 +727,8 @@ void __wrap_wgpuCommandEncoderCopyTextureToBuffer(WGPUCommandEncoder e,
     DkCopyBuf b{d->mem.gpu + layout.offset, row, row * rows};
     DkImageRect r{s.origin.x, s.origin.y, s.origin.z, n.width, n.height, n.depthOrArrayLayers};
     dkCmdBufCopyImageToBuffer(swdk::R.cmd, &sv, &r, &b, 0);
-    kd::barrier();
+    kd::barrier(DkInvalidateFlags_Shader);
+    checkpoint.finish(true);
   });
 }
 void __wrap_wgpuCommandEncoderClearBuffer(WGPUCommandEncoder e, WGPUBuffer b, uint64_t off,
@@ -462,6 +738,7 @@ void __wrap_wgpuCommandEncoderClearBuffer(WGPUCommandEncoder e, WGPUBuffer b, ui
   if (n == WGPU_WHOLE_SIZE)
     n = d->size - off;
   kd::record(e, [=] {
+    kd::GpuCheckpoint checkpoint("buffer clear", off, n);
     kd::open();
     kd::barrier();
     std::vector<uint8_t> zero(n);
@@ -469,7 +746,8 @@ void __wrap_wgpuCommandEncoderClearBuffer(WGPUCommandEncoder e, WGPUBuffer b, ui
     memcpy(temp.cpu, zero.data(), n);
     dkCmdBufCopyBuffer(swdk::R.cmd, temp.gpu, d->mem.gpu + off, n);
     swdk::block_free_deferred(temp.block);
-    kd::barrier();
+    kd::barrier(DkInvalidateFlags_Shader);
+    checkpoint.finish(true);
   });
 }
 
@@ -478,13 +756,15 @@ void __wrap_wgpuQueueWriteBuffer(WGPUQueue q, WGPUBuffer h, uint64_t off, const 
                                  size_t n) {
   kd::Lock l(kd::mutex);
   auto b = kd::required(kd::buffers, h, __func__);
+  kd::GpuCheckpoint checkpoint("buffer upload", off, n);
   kd::open();
   kd::barrier();
   auto temp = kd::upload_allocation(n);
   memcpy(temp->mem.cpu, data, n);
   dkCmdBufCopyBuffer(swdk::R.cmd, temp->mem.gpu, b->mem.gpu + off, n);
   temp->used();
-  kd::barrier();
+  kd::barrier(DkInvalidateFlags_Shader);
+  checkpoint.finish(true);
 }
 void __wrap_wgpuQueueWriteTexture(WGPUQueue q, const WGPUTexelCopyTextureInfo *dst,
                                   const void *data, size_t bytes,
@@ -494,6 +774,7 @@ void __wrap_wgpuQueueWriteTexture(WGPUQueue q, const WGPUTexelCopyTextureInfo *d
   kd::open();
   kd::barrier();
   auto *t = kd::find_texture(dst->texture);
+  kd::GpuCheckpoint checkpoint("texture upload", size->width, size->height, size->depthOrArrayLayers);
   auto v = kd::level_view(t, dst->mipLevel);
   uint32_t row = ((size->width + t->blockW - 1) / t->blockW) * t->blockBytes,
            rows = (size->height + t->blockH - 1) / t->blockH, pitch = (row + 255) & ~255u;
@@ -511,5 +792,6 @@ void __wrap_wgpuQueueWriteTexture(WGPUQueue q, const WGPUTexelCopyTextureInfo *d
   dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &v, &r, 0);
   temp->used();
   kd::barrier();
+  checkpoint.finish(true);
 }
 }

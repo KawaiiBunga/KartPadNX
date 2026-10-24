@@ -34,6 +34,8 @@ extern "C" struct mallinfo mallinfo(void);
 // the game's host allocation scope (JKRHeap.cpp, native/src/pc/game_hooks/pc_jkr_heap.cpp)
 void JKRPcBeginHostAlloc();              // libnx: the end of the heap malloc grows into (sbrk)
 extern "C" void cos_switch_flush_logs(void);  // backend_present.cpp
+extern "C" void kartpad_log_flush_sync(void);
+extern "C" void kartpad_deko_log_failure_context();
 
 namespace swdk {
 
@@ -76,6 +78,7 @@ size_t heap_free_inside_mib() { return size_t(mallinfo().fordblks) >> 20; }
 // library calls nothing on an error: it aborts with result 2359-xxxx.
 void debug_message(void*, const char* context, DkResult result, const char* message) {
     if (result != DkResult_Success) {
+        kartpad_deko_log_failure_context();
         fatal("deko3d error in %s: result %d: %s (frame %llu)", context ? context : "?", int(result),
               message ? message : "", (unsigned long long)R.frame + 1);
     }
@@ -533,6 +536,7 @@ void fatal(const char* format, ...) {
     va_end(args);
     fprintf(stderr, "[dk] FATAL: %s\n", line);
     log_flush();
+    kartpad_log_flush_sync();  // fflush alone only reaches the asynchronous RAM sink
     abort();  // Atmosphere writes the crash report (backtrace, registers)
 }
 
@@ -614,6 +618,7 @@ extern "C" void aurora_switch_dk_init(uint32_t gxConfigVersion) {
     R.queue = dkQueueCreate(&qm);
     dklog("queue created: graphics, command memory %u KiB, zcull %s", qm.commandMemorySize >> 10,
           R.zcull ? "ON (COS_DK_ZCULL=1)" : "off (COS_DK_ZCULL=1 turns it on)");
+    dklog("Buffer-write shader data/uniform cache invalidation enabled");
 
     C.flipY = env_flag("COS_DK_FLIP_Y", false);
     C.flipFront = env_flag("COS_DK_FLIP_FRONT", false);

@@ -23,7 +23,8 @@ function(kartpad_link_switch_graphics target)
   # order so they win over older copies in later archives.
   target_sources(${target} PRIVATE
     "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/clang_tls_switch.c"
-    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/libc_switch.c")
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/libc_switch.c"
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/gpu_submit_diagnostics.cpp")
   target_include_directories(${target} PRIVATE
     "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src"
     "$ENV{DEVKITPRO}/libnx/include" "$ENV{DEVKITPRO}/portlibs/switch/include")
@@ -35,6 +36,7 @@ function(kartpad_link_switch_graphics target)
   # libnx's join has unmapped the stack mirror (clang_tls_switch.c).
   target_link_options(${target} PRIVATE
     "LINKER:--wrap=pthread_create" "LINKER:--wrap=pthread_join" "LINKER:--wrap=exit"
+    "LINKER:--wrap=nvGpuChannelAppendEntry" "LINKER:--wrap=nvGpuChannelKickoff"
     "LINKER:--allow-multiple-definition"
     "LINKER:-Map,${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
   # Diagnostic quarantine for the Retro WFC host heap corruption

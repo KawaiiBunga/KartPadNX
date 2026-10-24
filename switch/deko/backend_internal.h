@@ -55,9 +55,34 @@ auto &required(Map &objects, Handle handle, const char *operation) {
 }
 std::string str(WGPUStringView s);
 
+// Explicitly enabled diagnostics: timed GPU completion checks or asynchronous
+// operation batches with recent-operation history for submission failures.
+#if defined(COS_DK_GPU_CHECKPOINTS) || defined(COS_DK_GPU_FLUSHES)
+void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c);
+void gpu_operation_end(bool flushBoundary);
+void gpu_operation_image_copy(const Tex &source, const Tex &destination,
+                              const WGPUTexelCopyTextureInfo &src,
+                              const WGPUTexelCopyTextureInfo &dst);
+#ifdef COS_DK_GPU_FLUSHES
+void gpu_operation_queue_submitted();
+#endif
+struct GpuCheckpoint {
+  explicit GpuCheckpoint(const char *name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
+    gpu_operation_begin(name, a, b, c);
+  }
+  void finish(bool flushBoundary = false) { gpu_operation_end(flushBoundary); }
+};
+#else
+struct GpuCheckpoint {
+  explicit GpuCheckpoint(const char *, uint64_t = 0, uint64_t = 0, uint64_t = 0) {}
+  void finish(bool = false) {}
+};
+#endif
+
 // Frame helpers: a full barrier, open the frame if needed, drain the queue (CPU readback).
-inline void barrier() {
-  dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+inline void barrier(uint32_t extraInvalidations = 0) {
+  dkCmdBufBarrier(R.cmd, DkBarrier_Full,
+                 DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache | extraInvalidations);
 }
 inline void open() {
   if (!R.frameOpen) {

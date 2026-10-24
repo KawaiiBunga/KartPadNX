@@ -37,6 +37,7 @@ void kartpad_deko_present(WGPUTexture texture, unsigned width, unsigned height) 
       [](void *data, int stage) {
         if (stage != 1)
           return;
+        kd::GpuCheckpoint checkpoint("presentation draw", swdk::R.width, swdk::R.height);
         auto &p = *static_cast<Picture *>(data);
         kd::barrier();
         swdk::bind_2d_state(false);
@@ -54,6 +55,7 @@ void kartpad_deko_present(WGPUTexture texture, unsigned width, unsigned height) 
         dkCmdBufBindTextures(swdk::R.cmd, DkStage_Fragment, 0, &handle, 1);
         dkCmdBufDraw(swdk::R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
         swdk::image_slot_free(slot);
+        checkpoint.finish(true);
       },
       &picture);
 }
