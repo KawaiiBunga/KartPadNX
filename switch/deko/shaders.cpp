@@ -73,6 +73,10 @@ uint64_t g_compilerId = 0;
 std::mutex g_cacheMutex;
 bool g_cacheWritable = true;
 std::string g_sessionPath;
+// Stage records of cache hits, appended to the session journal by save_usage (g_cacheMutex). A
+// hit's record is already in a cache file, so it must not cost the pipeline build SD-card I/O:
+// three opens per stage serialized the warm boot preload on the card (108 s for 3550 pipelines).
+std::vector<uint8_t> g_sessionStages;
 std::unordered_map<ShaderEntry*, uint64_t> g_savedUses;
 uint64_t g_lastUsageNs = 0;
 
@@ -109,6 +113,12 @@ void save_usage() {
     if (!rows.empty() && !g_sessionPath.empty() &&
         !journal::write(g_sessionPath+"/usage.csv",{rows.begin(),rows.end()},"ab"))
         dklog("shaders: session usage write failed");
+    if (!g_sessionStages.empty() && !g_sessionPath.empty() &&
+        !journal::write(g_sessionPath+"/stages.bin",g_sessionStages,"ab")) {
+        dklog("shaders: session journal write failed: %s",g_sessionPath.c_str());
+        g_sessionPath.clear();
+    }
+    g_sessionStages.clear();
 }
 
 // the session's figures (g_jobMutex)
@@ -220,6 +230,39 @@ void start_worker() {
     g_workerUp = true;
 }
 
+// Builds before 2026-10-25 appended every stage of every session to dksh_local.bin, cache hits
+// included, so it grew by about 1 MiB a boot with duplicate stage records that every start reads
+// and parses again. Rewrite it once with the last record of each name (the one
+// shader_cache_add_names keeps). The temporary name is the one read_local completes after a crash.
+void compact_local(const DkshFile& file, size_t fileBytes) {
+    std::unordered_map<std::string, size_t> last;
+    for (size_t i = 0; i < file.named.size(); ++i) last[file.named[i].name] = i;
+    if (file.named.size() < last.size() + 4096) return;
+    std::vector<uint8_t> bytes = dksh_file_header(file.compilerId);
+    for (const DkshShaderRecord& r : file.shaders) append_record(&bytes, r);
+    for (const DkshModuleRecord& m : file.modules) append_record(&bytes, m);
+    for (size_t i = 0; i < file.named.size(); ++i)
+        if (last[file.named[i].name] == i) append_stage_record(&bytes, file.named[i]);
+    const std::string temp = std::string(kLocalPath) + ".recover.tmp";
+    if (!journal::write(temp, bytes, "wb")) {
+        std::remove(temp.c_str());
+        dklog("shaders: %s compaction skipped (temporary write failed)", kLocalPath);
+        return;
+    }
+    if (std::remove(kLocalPath) != 0) {
+        std::remove(temp.c_str());
+        dklog("shaders: %s compaction skipped (cannot replace the file)", kLocalPath);
+        return;
+    }
+    if (std::rename(temp.c_str(), kLocalPath) != 0) {
+        g_cacheWritable = false;
+        dklog("shaders: %s compaction rename failed; the next start completes it", kLocalPath);
+        return;
+    }
+    dklog("shaders: %s compacted: %zu of %zu stage records were duplicates, %zu -> %zu bytes", kLocalPath,
+          file.named.size() - last.size(), file.named.size(), fileBytes, bytes.size());
+}
+
 // dksh_local.bin: its records into the registry (loaded into code memory as the initial cache's)
 void read_local(uint32_t gxConfigVersion) {
     FILE* f = fopen(kLocalPath, "rb");
@@ -263,6 +306,7 @@ void read_local(uint32_t gxConfigVersion) {
                   kLocalPath, loaded, known, file.badCrc);
             g_loaded += loaded;
             shader_cache_add_names(file);
+            if (g_cacheWritable) compact_local(file, data.size());
             return;
         }
         dklog("shaders: %s %s: started again", kLocalPath,
@@ -278,6 +322,13 @@ void read_local(uint32_t gxConfigVersion) {
 }
 
 }  // namespace
+
+void shader_note_stage(const std::string& key, ShaderStage stage, uint64_t hash,
+                       const std::vector<SlotBinding>& slots) {
+    DkshNamedRecord record{stage,key,hash,slots};
+    std::lock_guard lock(g_cacheMutex);
+    if (!g_sessionPath.empty()) append_stage_record(&g_sessionStages,record);
+}
 
 void shader_record_stage(const std::string& key, ShaderStage stage, uint64_t hash,
                          const std::vector<SlotBinding>& slots, const std::string& source) {
@@ -393,7 +444,7 @@ void shaders_init(uint32_t gxConfigVersion) {
         const std::string metadata=info;
         if (!journal::write(g_sessionPath+"/session.json",{metadata.begin(),metadata.end()},"wb"))
             dklog("shaders: session identity write failed");
-        dklog("shader training: session=%s; stage records saved immediately, use counts every 5s",g_sessionPath.c_str());
+        dklog("shader training: session=%s; new stage records saved immediately, cached ones and use counts every 5s",g_sessionPath.c_str());
     }
     translate_init();
     start_worker();

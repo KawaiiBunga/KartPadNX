@@ -35,7 +35,7 @@ Stage compile(WGPUShaderModule module, WGPUStringView entry, ShaderStage stage) 
   }
   if (cached) {
     Stage s{cached->entry, cached->bindings};
-    shader_record_stage(key, stage, s.shader->glslHash, s.slots, source);
+    shader_note_stage(key, stage, s.shader->glslHash, s.slots);
     return s;
   }
   ShaderCompileTrace trace(key, static_cast<unsigned>(stage), source);

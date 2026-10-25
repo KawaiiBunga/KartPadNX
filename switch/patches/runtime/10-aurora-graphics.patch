@@ -4966,7 +4966,7 @@ diff --git a/aurora-main/lib/gfx/depth_peek.cpp b/aurora-main/lib/gfx/depth_peek
 diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeline_cache.cpp
 --- a/aurora-main/lib/gfx/pipeline_cache.cpp
 +++ b/aurora-main/lib/gfx/pipeline_cache.cpp
-@@ -1,1453 +1,1841 @@
+@@ -1,1453 +1,1915 @@
 -#include "pipeline_cache.hpp"
 -
 -#include "clear.hpp"
@@ -6567,6 +6567,9 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +static std::deque<PendingPipeline> g_backgroundPipelines;
 +static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
 +
++static constexpr const char* PipelineCacheLoadSql = "SELECT hash, config, first_frame_used FROM pipeline_cache "
++                                                    "WHERE type = ? AND config_version = ? "
++                                                    "ORDER BY first_frame_used ASC, rowid ASC";
 +static sqlite3* g_pipelineCacheDb = nullptr;
 +static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
 +static sqlite3_stmt* g_pipelineCacheUpsertStmt = nullptr;
@@ -7419,11 +7422,8 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +    return false;
 +  }
 +
-+  ret = sqlite3_prepare_v3(g_pipelineCacheDb,
-+                           "SELECT hash, config, first_frame_used FROM pipeline_cache "
-+                           "WHERE type = ? AND config_version = ? "
-+                           "ORDER BY first_frame_used ASC, rowid ASC",
-+                           -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineCacheLoadStmt, nullptr);
++  ret = sqlite3_prepare_v3(g_pipelineCacheDb, PipelineCacheLoadSql, -1, SQLITE_PREPARE_PERSISTENT,
++                           &g_pipelineCacheLoadStmt, nullptr);
 +  if (ret != SQLITE_OK) {
 +    Log.error("Failed to prepare pipeline cache load statement: {}", sqlite3_errmsg(g_pipelineCacheDb));
 +    pipeline_cache_abort();
@@ -7898,7 +7898,8 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +}
 +
 +template <typename PipelineConfig, typename CreateFn>
-+static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersion, CreateFn&& create,
++static size_t load_pipeline_cache_entries(sqlite3_stmt* stmt, ShaderType type, uint32_t configVersion,
++                                          CreateFn&& create,
 +                                          size_t maxEntries = std::numeric_limits<size_t>::max()) {
 +  // A zero warmup budget performs no sqlite3_step. Binding a statement returns
 +  // SQLITE_OK, which must not be mistaken for a failed SQLITE_ROW/SQLITE_DONE.
@@ -7906,26 +7907,27 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +  if (!prepare_pipeline_cache_db()) {
 +    return 0;
 +  }
++  sqlite3* const db = sqlite3_db_handle(stmt);
 +
-+  auto ret = sqlite3_bind_int(g_pipelineCacheLoadStmt, 1, underlying(type));
++  auto ret = sqlite3_bind_int(stmt, 1, underlying(type));
 +  if (ret != SQLITE_OK) {
-+    Log.error("Failed to bind pipeline cache load type: {}", sqlite3_errmsg(g_pipelineCacheDb));
++    Log.error("Failed to bind pipeline cache load type: {}", sqlite3_errmsg(db));
 +    pipeline_cache_abort();
 +    return 0;
 +  }
-+  ret = sqlite3_bind_int(g_pipelineCacheLoadStmt, 2, static_cast<int>(configVersion));
++  ret = sqlite3_bind_int(stmt, 2, static_cast<int>(configVersion));
 +  if (ret != SQLITE_OK) {
-+    Log.error("Failed to bind pipeline cache load config version: {}", sqlite3_errmsg(g_pipelineCacheDb));
++    Log.error("Failed to bind pipeline cache load config version: {}", sqlite3_errmsg(db));
 +    pipeline_cache_abort();
 +    return 0;
 +  }
 +
 +  size_t loaded = 0;
-+  while (loaded < maxEntries && (ret = sqlite3_step(g_pipelineCacheLoadStmt)) == SQLITE_ROW) {
-+    const auto storedHash = static_cast<PipelineRef>(sqlite3_column_int64(g_pipelineCacheLoadStmt, 0));
-+    const auto* configBlob = static_cast<const uint8_t*>(sqlite3_column_blob(g_pipelineCacheLoadStmt, 1));
-+    const auto configSize = sqlite3_column_bytes(g_pipelineCacheLoadStmt, 1);
-+    const auto firstFrameUsed = static_cast<uint32_t>(sqlite3_column_int64(g_pipelineCacheLoadStmt, 2));
++  while (loaded < maxEntries && (ret = sqlite3_step(stmt)) == SQLITE_ROW) {
++    const auto storedHash = static_cast<PipelineRef>(sqlite3_column_int64(stmt, 0));
++    const auto* configBlob = static_cast<const uint8_t*>(sqlite3_column_blob(stmt, 1));
++    const auto configSize = sqlite3_column_bytes(stmt, 1);
++    const auto firstFrameUsed = static_cast<uint32_t>(sqlite3_column_int64(stmt, 2));
 +    if (configSize != static_cast<int>(sizeof(PipelineConfig)) || (configSize != 0 && configBlob == nullptr)) {
 +      continue;
 +    }
@@ -7955,14 +7957,63 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +  }
 +
 +  if (ret != SQLITE_DONE && ret != SQLITE_ROW) {
-+    Log.error("Failed to read pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
++    Log.error("Failed to read pipeline cache rows: {}", sqlite3_errmsg(db));
 +    pipeline_cache_abort();
++    return loaded;
 +  }
 +
-+  sqlite3_reset(g_pipelineCacheLoadStmt);
-+  sqlite3_clear_bindings(g_pipelineCacheLoadStmt);
++  sqlite3_reset(stmt);
++  sqlite3_clear_bindings(stmt);
 +  return loaded;
 +}
++
++#if defined(AURORA_GFX_DEKO3D)
++// A read-only RAM copy of the recipe database for the boot load. Through the SD card every 4 KiB
++// page was its own read IPC (3.0 s for 3550 recipes on the console, the whole boot preload once the
++// stage lookups stopped touching the card); here the file is read in 1 MiB pieces through the
++// connection's own handle (HOS refuses a second open while it is writable) and queried in memory.
++// The committed state is on the card: journal_mode=OFF writes every page at commit, and the writer
++// thread starts after the load. Null when unavailable; the caller then reads the file itself.
++static sqlite3* open_pipeline_cache_snapshot(double* mib, int64_t* ms) {
++  const auto start = steady_millis();
++  sqlite3_file* file = nullptr;
++  if (sqlite3_file_control(g_pipelineCacheDb, "main", SQLITE_FCNTL_FILE_POINTER, &file) != SQLITE_OK ||
++      file == nullptr || file->pMethods == nullptr) {
++    return nullptr;
++  }
++  sqlite3_int64 size = 0;
++  if (file->pMethods->xFileSize(file, &size) != SQLITE_OK || size <= 0) {
++    return nullptr;
++  }
++  auto* data = static_cast<unsigned char*>(sqlite3_malloc64(static_cast<sqlite3_uint64>(size)));
++  if (data == nullptr) {
++    return nullptr;
++  }
++  for (sqlite3_int64 offset = 0; offset < size;) {
++    const int chunk = static_cast<int>(std::min<sqlite3_int64>(size - offset, 1 << 20));
++    if (file->pMethods->xRead(file, data + offset, chunk, offset) != SQLITE_OK) {
++      sqlite3_free(data);
++      return nullptr;
++    }
++    offset += chunk;
++  }
++  sqlite3* snapshot = nullptr;
++  if (sqlite3_open_v2(":memory:", &snapshot, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
++    sqlite3_close(snapshot);
++    sqlite3_free(data);
++    return nullptr;
++  }
++  // FREEONCLOSE frees `data` with the connection, and on failure too.
++  if (sqlite3_deserialize(snapshot, "main", data, size, size,
++                          SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_READONLY) != SQLITE_OK) {
++    sqlite3_close(snapshot);
++    return nullptr;
++  }
++  *mib = static_cast<double>(size) / (1024.0 * 1024.0);
++  *ms = steady_millis() - start;
++  return snapshot;
++}
++#endif
 +
 +static void load_pipeline_cache() {
 +  if (!prepare_pipeline_cache_db()) {
@@ -7987,20 +8038,43 @@ diff --git a/aurora-main/lib/gfx/pipeline_cache.cpp b/aurora-main/lib/gfx/pipeli
 +#endif
 +  const size_t prewarmMax = prewarmMaxSetting >= 0 ? static_cast<size_t>(prewarmMaxSetting) : std::numeric_limits<size_t>::max();
 +
++  sqlite3_stmt* loadStmt = g_pipelineCacheLoadStmt;
++#if defined(AURORA_GFX_DEKO3D)
++  double snapshotMib = 0.0;
++  int64_t snapshotMs = 0;
++  sqlite3* snapshot = prewarmMax != 0 ? open_pipeline_cache_snapshot(&snapshotMib, &snapshotMs) : nullptr;
++  sqlite3_stmt* snapshotStmt = nullptr;
++  if (snapshot != nullptr &&
++      sqlite3_prepare_v3(snapshot, PipelineCacheLoadSql, -1, 0, &snapshotStmt, nullptr) == SQLITE_OK) {
++    loadStmt = snapshotStmt;
++  } else if (snapshot != nullptr) {
++    Log.warn("Pipeline cache RAM copy unusable ({}); reading the recipes from the card", sqlite3_errmsg(snapshot));
++  }
++#endif
++
 +  const size_t clearCount = load_pipeline_cache_entries<clear::PipelineConfig>(
-+      ShaderType::Clear, clear::ClearPipelineConfigVersion, clear::create_pipeline, prewarmMax);
++      loadStmt, ShaderType::Clear, clear::ClearPipelineConfigVersion, clear::create_pipeline, prewarmMax);
 +
 +  size_t remainingMax = std::numeric_limits<size_t>::max();
 +  if (prewarmMaxSetting >= 0) {
 +    remainingMax = (prewarmMax > clearCount) ? (prewarmMax - clearCount) : 0;
 +  }
 +
-+  const size_t gxCount = load_pipeline_cache_entries<gx::PipelineConfig>(
-+      ShaderType::GX, gx::GXPipelineConfigVersion, gx::create_pipeline, remainingMax);
++  const size_t gxCount = g_pipelineCacheBroken ? 0 : load_pipeline_cache_entries<gx::PipelineConfig>(
++      loadStmt, ShaderType::GX, gx::GXPipelineConfigVersion, gx::create_pipeline, remainingMax);
 +
 +  const auto loadElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++#if defined(AURORA_GFX_DEKO3D)
++  sqlite3_finalize(snapshotStmt);
++  sqlite3_close(snapshot);
++  Log.info("Loaded {} pipeline cache recipes ({} clear, {} GX) from DB in {} ms ({})", clearCount + gxCount,
++           clearCount, gxCount, loadElapsed,
++           snapshotStmt != nullptr ? fmt::format("RAM copy: {:.1f} MiB read in {} ms", snapshotMib, snapshotMs)
++                                   : std::string("read from the card"));
++#else
 +  Log.info("Loaded {} pipeline cache recipes ({} clear, {} GX) from DB in {} ms",
 +           clearCount + gxCount, clearCount, gxCount, loadElapsed);
++#endif
 +
 +  const auto queued = queuedPipelines.load();
 +  if (queued > 0) {
@@ -10181,7 +10255,68 @@ diff --git a/aurora-main/lib/switch/blob_cache.hpp b/aurora-main/lib/switch/blob
 diff --git a/aurora-main/lib/switch/sqlite_vfs.cpp b/aurora-main/lib/switch/sqlite_vfs.cpp
 --- a/aurora-main/lib/switch/sqlite_vfs.cpp
 +++ b/aurora-main/lib/switch/sqlite_vfs.cpp
-@@ -231,6 +231,10 @@
+@@ -26,6 +26,9 @@
+   u32 mode;
+   unsigned references;
+   bool deleteOnClose;
++  // Tracked from open, writes and truncation: nothing outside this handle changes the file while
++  // it is open, and a size query before every page read doubled the IPCs of each read.
++  s64 size;
+   char path[FS_MAX_PATH];
+   SharedFile* next;
+ };
+@@ -81,12 +84,11 @@
+ int read(sqlite3_file* base, void* buffer, int amount, sqlite3_int64 offset) {
+   auto* f = file(base);
+   std::lock_guard guard(handleMutex);
+-  s64 length = 0;
+-  Result rc = fsFileGetSize(&f->shared->handle, &length);
+-  if (R_FAILED(rc)) return error(rc, SQLITE_IOERR_READ, "read size", f->path);
++  const s64 length = f->shared->size;
+   const u64 available = offset < length ? static_cast<u64>(length - offset) : 0;
+   const u64 requested = available < static_cast<u64>(amount) ? available : static_cast<u64>(amount);
+   u64 count = 0;
++  Result rc = 0;
+   if (requested) rc = fsFileRead(&f->shared->handle, offset, buffer, requested, FsReadOption_None, &count);
+   if ((rc & 0x3fffff) == 0xd401) {
+     // Like fsdev, bounce buffers from memory that HOS cannot map for IPC.
+@@ -126,13 +128,21 @@
+       written += chunk;
+     }
+   }
+-  return R_SUCCEEDED(rc) ? SQLITE_OK : error(rc, SQLITE_IOERR_WRITE, "write", f->path);
++  if (R_FAILED(rc)) {
++    // A failed write may still have extended the file.
++    s64 length = 0;
++    if (R_SUCCEEDED(fsFileGetSize(&f->shared->handle, &length))) f->shared->size = length;
++    return error(rc, SQLITE_IOERR_WRITE, "write", f->path);
++  }
++  if (offset + amount > f->shared->size) f->shared->size = offset + amount;
++  return SQLITE_OK;
+ }
+ int truncate(sqlite3_file* base, sqlite3_int64 size) {
+   auto* f = file(base);
+   if (f->readOnly) return SQLITE_READONLY;
+   std::lock_guard guard(handleMutex);
+   const Result rc = fsFileSetSize(&f->shared->handle, size);
++  if (R_SUCCEEDED(rc)) f->shared->size = size;
+   return R_SUCCEEDED(rc) ? SQLITE_OK : error(rc, SQLITE_IOERR_TRUNCATE, "truncate", f->path);
+ }
+ int sync(sqlite3_file* base, int) {
+@@ -144,10 +154,8 @@
+ int size(sqlite3_file* base, sqlite3_int64* output) {
+   auto* f = file(base);
+   std::lock_guard guard(handleMutex);
+-  s64 value = 0;
+-  const Result rc = fsFileGetSize(&f->shared->handle, &value);
+-  *output = value;
+-  return R_SUCCEEDED(rc) ? SQLITE_OK : error(rc, SQLITE_IOERR_FSTAT, "size", f->path);
++  *output = f->shared->size;
++  return SQLITE_OK;
+ }
+ int lock(sqlite3_file* base, int level) {
+   auto* f = file(base);
+@@ -231,6 +239,10 @@
        return error(rc, SQLITE_CANTOPEN, "create", f->path);
    }
    if (!shared) {
@@ -10192,6 +10327,19 @@ diff --git a/aurora-main/lib/switch/sqlite_vfs.cpp b/aurora-main/lib/switch/sqli
      shared = new (std::nothrow) SharedFile{};
      if (!shared) return SQLITE_NOMEM;
      // Keep main databases shareable if a read-only connection opens first.
+@@ -244,6 +256,12 @@
+       rc = fsFsOpenFile(f->fs, f->path, mode, &shared->handle);
+     }
+     if (R_FAILED(rc)) { delete shared; return error(rc, SQLITE_CANTOPEN, "open", f->path); }
++    rc = fsFileGetSize(&shared->handle, &shared->size);
++    if (R_FAILED(rc)) {
++      fsFileClose(&shared->handle);
++      delete shared;
++      return error(rc, SQLITE_CANTOPEN, "open size", f->path);
++    }
+     shared->fs = f->fs;
+     shared->mode = mode;
+     std::strcpy(shared->path, f->path);
 diff --git a/aurora-main/lib/webgpu/gpu.cpp b/aurora-main/lib/webgpu/gpu.cpp
 --- a/aurora-main/lib/webgpu/gpu.cpp
 +++ b/aurora-main/lib/webgpu/gpu.cpp

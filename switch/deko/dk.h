@@ -204,8 +204,14 @@ struct NamedShader {
 const NamedShader* shader_cache_named(const char* name);
 const char* shader_cache_status();  // a short line for the test pattern's legend
 void shader_cache_add_names(const struct DkshFile& file);
+// A newly translated stage: its record goes to dksh_local.bin and the session journal now, and its
+// WGSL to Cache/deko/sources (training input for the seeds).
 void shader_record_stage(const std::string& key, ShaderStage stage, uint64_t hash,
                          const std::vector<SlotBinding>& slots, const std::string& source);
+// A stage found in a loaded cache file: only the session journal records it, batched with the
+// use counts (no SD-card access on the pipeline build).
+void shader_note_stage(const std::string& key, ShaderStage stage, uint64_t hash,
+                       const std::vector<SlotBinding>& slots);
 
 // One stage's shader. state: Missing (no GLSL yet), Queued / Compiling (the uam worker has it),
 // Compiled (DKSH waiting for the render worker's load budget), Ready (loaded: `shader` is valid),

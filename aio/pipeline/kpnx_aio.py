@@ -862,6 +862,10 @@ def cmake_configure_cmd(run, profile, bdir, tr):
                     '-DKARTPAD_PGO_ALL=ON']
     dkp = fwd(t.dkp)
     llvm = t.llvm / 'bin'
+    # Carry the hardware-tested v9 vanilla configuration into ordinary AIO
+    # builds. Keep RR's existing renderer policy, and explicitly reset cached
+    # CMake options when an existing build directory is reused.
+    vanilla_gpu = 'ON' if profile == 'base' else 'OFF'
     cmd = [t.cmake, '-S', ws / 'switch', '-B', bdir, '-G', 'Ninja',
            f'-DCMAKE_MAKE_PROGRAM={fwd(t.ninja)}',
            f'-DCMAKE_TOOLCHAIN_FILE={fwd(ws / "switch/cmake/SwitchClang.cmake")}',
@@ -872,6 +876,9 @@ def cmake_configure_cmd(run, profile, bdir, tr):
            f'-DCMAKE_LINKER={fwd(llvm / "ld.lld.exe")}', f'-DCMAKE_STRIP={fwd(llvm / "llvm-strip.exe")}',
            f'-DDKP_NM={fwd(llvm / "llvm-nm.exe")}', f'-DDKP_OBJCOPY={fwd(llvm / "llvm-objcopy.exe")}',
            f'-DKARTPAD_PROFILE={profile}', '-DKARTPAD_BUILD_GRAPHICS=ON', '-DKARTPAD_ENABLE_FULL_APP=ON',
+           '-DKARTPAD_DEKO_DEBUG=OFF', '-DKARTPAD_DEKO_GPU_CHECKPOINTS=OFF',
+           f'-DKARTPAD_DEKO_GPU_FLUSHES={vanilla_gpu}',
+           f'-DKARTPAD_DEKO_GPU_BREADCRUMBS={vanilla_gpu}', '-DKARTPAD_DEKO_GPU_FLUSH_INTERVAL=32',
            f'-DKARTPAD_SHARDS={fwd(tr / "build_shards/shards.cmake")}',
            f'-DKARTPAD_TRANSLATION_DIR={fwd(tr)}',
            f'-DKARTPAD_RUNTIME_SRC={fwd(ws / "build/wiicompiled-fpscr/runtime")}',

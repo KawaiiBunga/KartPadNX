@@ -217,6 +217,18 @@ const char* build_stamp() { return &kartpad_build_stamp[0] ? kartpad_build_stamp
 u64 anchor_address() { return reinterpret_cast<u64>(&kartpad_prof_anchor); }
 }
 
+// A profiling build (FullApp.cmake KARTPAD_PROF_RACE_SECONDS) records its first race seconds without
+// a perf.cfg, sampling every thread that runs game, GX, audio or renderer code (roles 1, 4, 6, 7, 8).
+#ifdef KARTPAD_PROF_RACE_SECONDS
+constexpr int kDefaultRaceSeconds = KARTPAD_PROF_RACE_SECONDS;
+constexpr int kDefaultRoles = (1 << KARTPAD_ROLE_FRAME_WORKER) | (1 << KARTPAD_ROLE_AUDIO_MIX) |
+                              (1 << KARTPAD_ROLE_GX_WORKER) | (1 << KARTPAD_ROLE_GX_HLE) |
+                              (1 << KARTPAD_ROLE_SND_GUEST);
+#else
+constexpr int kDefaultRaceSeconds = 0;
+constexpr int kDefaultRoles = 192;
+#endif
+
 // Called on the guest thread once its placement is final.
 extern "C" void kartpad_prof_start_guest(void) {
   const int configuredHz = kartpad_perf_int("prof_hz", 750);
@@ -228,7 +240,7 @@ extern "C" void kartpad_prof_start_guest(void) {
   if (g_targetCount.load(std::memory_order_relaxed) == 0)
     g_targetCount.store(1, std::memory_order_release);
   g_targetBusy.store(false, std::memory_order_release);
-  g_roleMask.store(static_cast<u32>(kartpad_perf_int("prof_roles", 192)) & ~1u, std::memory_order_relaxed);
+  g_roleMask.store(static_cast<u32>(kartpad_perf_int("prof_roles", kDefaultRoles)) & ~1u, std::memory_order_relaxed);
   ueventCreate(&g_command, true);
 
   // Core 0 (a worker core; the guest owns core 1 under the tuned profile),
@@ -282,7 +294,7 @@ extern "C" void kartpad_prof_race_second(void) {
   static int raceSeconds = 0;
   static int recorded = 0;
   static bool done = false;
-  if (configured < 0) configured = kartpad_perf_int("prof_race_seconds", 0);
+  if (configured < 0) configured = kartpad_perf_int("prof_race_seconds", kDefaultRaceSeconds);
   if (configured <= 0 || done) return;
   ++raceSeconds;
   const int state = g_state.load(std::memory_order_acquire);

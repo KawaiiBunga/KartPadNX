@@ -545,6 +545,28 @@ if(KARTPAD_PGO_PROFILE AND KARTPAD_PGO_ALL)
   endforeach()
 endif()
 
+# Profiling builds (builder/pgo-gen.py): line tables with profiling discriminators for every target
+# the sample profile optimizes, so on-console PC samples (prof.bin) map back to source lines. Only
+# the ELF carries them (elf2nro keeps the loaded segments) and Clang emits the same code either way.
+# KARTPAD_PROF_RACE_SECONDS makes such a build record its first race seconds by itself
+# (prof_switch.cpp), with the threads that run game, GX and renderer code.
+option(KARTPAD_PROFILE_LINES "Line tables for sample-PGO profiling (ELF only)" OFF)
+set(KARTPAD_PROF_RACE_SECONDS "0" CACHE STRING "Race seconds a build profiles by itself (0 = perf.cfg decides)")
+if(KARTPAD_PROFILE_LINES)
+  message(STATUS "FullApp: line tables for sample-PGO profiling")
+  foreach(_lines_target kartpad_full mkw_base_shared mkw_runtime_common kartpad_switch_shim kartpad_deko
+                        mkw_retro_sensitive mkw_retro_rewind_functions aurora_core aurora_gx aurora_gd
+                        aurora_main aurora_os aurora_pad aurora_dvd aurora_mtx aurora_card aurora_ms aurora_vi
+                        aurora_si)
+    if(TARGET ${_lines_target})
+      target_compile_options(${_lines_target} PRIVATE -gline-tables-only -fdebug-info-for-profiling)
+    endif()
+  endforeach()
+endif()
+if(NOT KARTPAD_PROF_RACE_SECONDS STREQUAL "0")
+  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PROF_RACE_SECONDS=${KARTPAD_PROF_RACE_SECONDS}")
+endif()
+
 # AIO builder only (off by default): take the game-independent targets from prebuilt objects.
 # Last, so every target's settings are final when they are compared.
 include("${CMAKE_CURRENT_LIST_DIR}/Prebuilt.cmake")
