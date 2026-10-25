@@ -342,17 +342,36 @@ void submit_readback(const char* why) {
     dkQueueFlush(R.queue);
 }
 
-void frame_present(PictureFn picture, void* user) {
+bool present_acquire(PresentImage* image) {
+    // R.width/R.height change only in resize_window, which runs on this (the presenting) thread.
+    uint32_t ww, wh;
+    window_wanted(ww, wh);
+    if (ww != R.width || wh != R.height || g_swapchain == nullptr) return false;
+    const uint64_t t0 = now_ns();
+    dkSwapchainAcquireImage(g_swapchain, &image->slot, &image->fence);
+    image->acquireNs = now_ns() - t0;
+    return true;
+}
+
+void frame_present(PictureFn picture, void* user, const PresentImage* acquired) {
     frame_open();
     const uint64_t frame = R.frame + 1;
-    {
+    // An image acquired before the lock is presented at the size it was acquired for; a mode change
+    // since then resizes at the next present.
+    if (!acquired) {
         uint32_t ww, wh;
         window_wanted(ww, wh);
         if (ww != R.width || wh != R.height) resize_window(ww, wh, frame);
     }
     const uint64_t t1 = now_ns();
     int slot;
-    {
+    if (acquired) {
+        // dkQueueAcquireImage's second half, at the same point in the queue.
+        check_queue("waiting for a swapchain image");
+        DkFence fence = acquired->fence;
+        dkQueueWaitFence(R.queue, &fence);
+        slot = acquired->slot;
+    } else {
         check_queue("acquiring a swapchain image");
         slot = dkQueueAcquireImage(R.queue, g_swapchain);
     }
@@ -391,7 +410,7 @@ void frame_present(PictureFn picture, void* user) {
         dklog("first present: acquire %.2f ms, record %.2f ms, submit+present %.2f ms; heap never used %zu MiB",
               double(t2 - t1) / 1e6, double(t3 - t2) / 1e6, double(t4 - t3) / 1e6, heap_never_used_mib());
     }
-    g_times.acquireNs += t2 - t1;
+    g_times.acquireNs += t2 - t1 + (acquired ? acquired->acquireNs : 0);
     g_times.recordNs += (t1 - g_frameOpenNs) + (t3 - t2);
     g_times.submitNs += t4 - t3;
     frame_stats(t4 - g_frameOpenNs);

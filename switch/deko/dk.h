@@ -167,7 +167,17 @@ void submit_readback(const char* why);
 // swapchain image is bound (offscreen passes: the resample), then with stage 1 into the bound image,
 // and with stage 2 at the end of the present pass
 using PictureFn = void (*)(void* user, int stage);
-void frame_present(PictureFn picture, void* user);
+// A swapchain image the presenter acquired before taking the renderer's lock (present_acquire). The
+// window's dequeue blocks until the display gives an image back; holding the lock meanwhile stalled
+// every other thread's renderer work. Only the presenter uses the swapchain.
+struct PresentImage {
+    int slot = -1;
+    DkFence fence{};
+    uint64_t acquireNs = 0;
+};
+// False when the window must be resized first: frame_present then acquires under the lock as before.
+bool present_acquire(PresentImage* image);
+void frame_present(PictureFn picture, void* user, const PresentImage* acquired = nullptr);
 // Opt-in, bounded GPU readbacks for black-frame diagnosis. Enabled by the file
 // sdmc:/switch/kartpad/deko-capture.flag; inactive during normal runs.
 bool capture_frame();

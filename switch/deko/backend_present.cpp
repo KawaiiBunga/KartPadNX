@@ -6,6 +6,11 @@
 #include "present_fsh_dksh.h"
 #include "present_vsh_dksh.h"
 void kartpad_deko_present(WGPUTexture texture, unsigned width, unsigned height) {
+  // The swapchain image first, without the renderer's lock: the window's dequeue blocks until the
+  // display gives an image back (about 1 ms a present), and the frame worker's next frame waited
+  // for the lock all that time (dk.h PresentImage).
+  swdk::PresentImage image;
+  const bool acquired = swdk::present_acquire(&image);
   kd::Lock l(kd::mutex);
   static bool firstGameSnapshot = true;
   if (firstGameSnapshot) {
@@ -57,7 +62,7 @@ void kartpad_deko_present(WGPUTexture texture, unsigned width, unsigned height) 
         swdk::image_slot_free(slot);
         checkpoint.finish(true);
       },
-      &picture);
+      &picture, acquired ? &image : nullptr);
 }
 
 namespace kd {

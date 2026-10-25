@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
-#include <shared_mutex>
 #include <unordered_map>
 
 std::recursive_mutex &kartpad_deko_object_mutex();
@@ -35,7 +34,10 @@ using swdk::dklog;
 
 namespace {
 
-std::shared_mutex g_mutex;
+// Every lookup and update is a short map operation, so a plain mutex: on devkitPro newlib a
+// shared_mutex is a pthread rwlock whose every unlock broadcasts a condition variable (a kernel
+// call), and draws looked objects up several times each.
+std::mutex g_mutex;
 std::unordered_map<const void*, Tex*> g_textures;
 std::unordered_map<const void*, View*> g_views;
 std::unordered_map<const void*, Samp*> g_samplers;
@@ -50,7 +52,7 @@ bool g_compression = false;  // COS_DK_COMPRESSION=1: hardware compression on co
 
 template <class T> T* find(std::unordered_map<const void*, T*>& map, const void* h) {
     if (!h) return nullptr;
-    std::shared_lock<std::shared_mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
     auto it = map.find(h);
     return it == map.end() ? nullptr : it->second;
 }
@@ -114,7 +116,7 @@ void destroy(BindGroup* g) {
 template <class T> bool drop(std::unordered_map<const void*, T*>& map, T* obj, uint64_t ObjectStats::*alive) {
     if (obj->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return false;
     {
-        std::unique_lock<std::shared_mutex> lock(g_mutex);
+        std::lock_guard<std::mutex> lock(g_mutex);
         auto it = map.find(obj->handle);
         if (it != map.end() && it->second == obj) map.erase(it);
         g_stats.*alive -= 1;
@@ -125,7 +127,7 @@ template <class T> bool drop(std::unordered_map<const void*, T*>& map, T* obj, u
 void release_tex(Tex* t) {
     if (drop(g_textures, t, &ObjectStats::textures)) {
         {
-            std::unique_lock<std::shared_mutex> lock(g_mutex);
+            std::lock_guard<std::mutex> lock(g_mutex);
             if (t->valid) g_stats.imageBytes -= t->mem.size;
         }
         destroy(t);
@@ -168,7 +170,7 @@ Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
     t->blockH = f.blockH;
     t->blockBytes = f.blockBytes;
     if (f.format == DkImageFormat_None) {
-        std::unique_lock<std::shared_mutex> lock(g_mutex);
+        std::lock_guard<std::mutex> lock(g_mutex);
         if (g_stats.unknownFormats++ < 16)
             dklog("textures: WebGPU format 0x%X (%s, %ux%u) has no deko3d format: not drawn", unsigned(d.format),
                   t->label.c_str(), t->width, t->height);
@@ -360,7 +362,7 @@ DkImageView level_view(Tex* t, uint32_t level) {
 }
 
 ObjectStats object_stats() {
-    std::shared_lock<std::shared_mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
     return g_stats;
 }
 
@@ -375,7 +377,7 @@ WGPUTexture __wrap_wgpuDeviceCreateTexture(WGPUDevice device, WGPUTextureDescrip
     WGPUTexture t = __real_wgpuDeviceCreateTexture(device, descriptor);
     if (t && descriptor && R.device) {
         Tex* shadow = make_texture(t, *descriptor);
-        std::unique_lock<std::shared_mutex> lock(g_mutex);
+        std::lock_guard<std::mutex> lock(g_mutex);
         auto [it, inserted] = g_textures.emplace(t, shadow);
         if (!inserted) it->second = shadow;  // (a stale entry: Dawn reused the address)
         g_stats.textures++;
@@ -440,7 +442,7 @@ WGPUTextureView __wrap_wgpuTextureCreateView(WGPUTexture texture, WGPUTextureVie
             view->view.swizzle[3] = swizzle_of(s->swizzle.a, DkImageSwizzle_Alpha);
         }
     }
-    std::unique_lock<std::shared_mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_views[v] = view;
     g_stats.views++;
     return v;
@@ -491,7 +493,7 @@ WGPUSampler __wrap_wgpuDeviceCreateSampler(WGPUDevice device, WGPUSamplerDescrip
         k.compareOp = DkCompareOp(DkCompareOp_Never + (int(sd.compare) - int(WGPUCompareFunction_Never)));
     }
     samp->key = fnv_bytes(&k, sizeof k);
-    std::unique_lock<std::shared_mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_samplers[s] = samp;
     g_stats.samplers++;
     return s;
@@ -528,7 +530,7 @@ WGPUBindGroup __wrap_wgpuDeviceCreateBindGroup(WGPUDevice device, WGPUBindGroupD
         if (entry.sampler) entry.sampler->refs.fetch_add(1, std::memory_order_relaxed);
         group->entries.push_back(entry);
     }
-    std::unique_lock<std::shared_mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_bindGroups[g] = group;
     g_stats.bindGroups++;
     return g;
