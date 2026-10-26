@@ -258,6 +258,8 @@ void frame_begin(uint64_t frame) {
         s.fenced = false;
         s.frame = frame;
     }
+    // Course transitions (R.synchronous): blocks leave the GPU address space only with the GPU idle.
+    if (R.synchronous && (!s.retired.empty() || !s.retiredBlocks.empty())) dkQueueWaitIdle(R.queue);
     {
         std::lock_guard<std::mutex> lock(g_heapMutex);
         for (const ImageAlloc& a : s.retired)
@@ -484,6 +486,16 @@ void sched_report() {
 static std::atomic<bool> g_codeWritten{false};
 
 bool code_take_written() { return g_codeWritten.exchange(false, std::memory_order_acq_rel); }
+
+void code_make_visible() {
+    if (!code_take_written()) return;
+    // The code block is CPU-uncached and GPU-cached: the CPU's bytes are in memory, but the GPU's L2
+    // can still hold what was there before (the GPU prefetches past the last shader's end, into where
+    // the next one is written). L2 first, then the shader caches that refill from it, as deko3d's
+    // own post-flush invalidation does between dkQueueFlush calls.
+    dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_L2Cache);
+    dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+}
 
 bool code_load(DkShader& shader, const void* dksh, uint32_t size, const char* name) {
     std::lock_guard<std::mutex> lock(g_codeMutex);

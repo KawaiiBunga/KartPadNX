@@ -132,8 +132,7 @@ void probe_draw(bool indexed, uint32_t count, uint32_t instances, uint32_t first
     if (!loaded)
       fatal("GX isolation probe shader failed to load");
   }
-  if (code_take_written())
-    dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+  code_make_visible();
   DkImageLayoutMaker maker;
   dkImageLayoutMakerDefaults(&maker, R.device);
   maker.type = DkImageType_2D;

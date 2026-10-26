@@ -347,12 +347,16 @@ def main():
         tk.copy_tree(deps / f'{name}-src', f'aio-prebuilt/deps/{name}-src',
                      skip={'.git', '.github', '__pycache__', 'tests', 'test', 'doc', 'docs', 'examples'})
 
-    # Optional performance data.
+    # Optional performance data: each profile named in this checkout's private/pgo (the newest,
+    # builder/pgo-gen.py writes there), else the one the release base carries.
     if not args.no_pgo:
-        for marker, name in sorted(pgo_names(BLD)):
-            tk.copy_file(BLD / 'private/pgo' / marker, Path('private/pgo') / marker)
+        local = dict(pgo_names(REPO))
+        for marker, name in sorted(dict(pgo_names(BLD), **local).items()):
+            src = REPO if marker in local else BLD
+            tk.copy_file(src / 'private/pgo' / marker, Path('private/pgo') / marker)
             for ext in ('.extbin', '.order.ld'):
-                tk.copy_file(BLD / 'private/pgo' / (name + ext), Path('private/pgo') / (name + ext))
+                tk.copy_file(src / 'private/pgo' / (name + ext), Path('private/pgo') / (name + ext))
+            print(f'PGO {marker}: {name} (from {"this checkout" if src is REPO else "the release base"})')
     if not args.no_seeds:
         for name in ('initial_dksh_cache.bin', 'initial_pipeline_cache.db', 'initial_pipeline_cache.id'):
             tk.copy_file(BLD / 'private/deko-training' / name, Path('private/deko-training') / name)

@@ -57,10 +57,13 @@ FETCH_DEPS = ('fmt', 'imgui', 'sqlite3', 'tracy', 'xxhash', 'zstd')
 PROFILES = {
     'base': {'build': 'build/switch-fullapp', 'translation': 'private/self-build/translation',
              'app': 'KartPad-NX', 'nro': 'kartpad.nro', 'pgo': 'current', 'cpu_rewrites': False,
-             'variant': 'vanilla', 'payload': 'kartpad.nro.zst'},
+             'variant': 'vanilla', 'payload': 'kartpad.nro.zst', 'pgo_renderer': False},
+    # pgo_renderer: the profile was recorded with the current renderer sources (FullApp.cmake
+    # KARTPAD_PGO_RENDERER); Retro Rewind's h1-rr-2track is, vanilla's r39mix-race predates them.
     'retro-rewind': {'build': 'build/switch-fullapp-rr', 'translation': 'private/self-build/retro-rewind/translation',
                      'app': 'KartPad Retro Rewind', 'nro': 'kartpad-retro-rewind.nro', 'pgo': 'current-retro-rewind',
-                     'cpu_rewrites': True, 'variant': 'rr', 'payload': 'kartpad-retro-rewind.nro.zst'},
+                     'cpu_rewrites': True, 'variant': 'rr', 'payload': 'kartpad-retro-rewind.nro.zst',
+                     'pgo_renderer': True},
 }
 
 
@@ -859,7 +862,7 @@ def cmake_configure_cmd(run, profile, bdir, tr):
         name = marker.read_text().strip()
         pgo_args = [f'-DKARTPAD_PGO_PROFILE={fwd(ws / "private/pgo" / (name + ".extbin"))}',
                     f'-DKARTPAD_SECTION_ORDER={fwd(ws / "private/pgo" / (name + ".order.ld"))}',
-                    '-DKARTPAD_PGO_ALL=ON']
+                    '-DKARTPAD_PGO_ALL=ON', f'-DKARTPAD_PGO_RENDERER={"ON" if p["pgo_renderer"] else "OFF"}']
     dkp = fwd(t.dkp)
     llvm = t.llvm / 'bin'
     # The hardware-tested v9 configuration (docs/VANILLA-GPU-HANDOFF.md) for both

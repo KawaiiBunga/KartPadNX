@@ -112,12 +112,17 @@ def quote_windows(arg):
 # ------------------------------------------------------------------------- link driver ---
 
 def section_order_to_symbols(order_file, out_file):
-    """GNU ld --section-ordering-file (a linker-script fragment listing *(.text.<sym>)) to an
-    lld --symbol-ordering-file. Translated code is built with -ffunction-sections, so each
-    section name carries exactly one symbol."""
+    """GNU ld --section-ordering-file (a linker-script fragment listing *(.text.<sym>), or
+    *(.text.hot.<sym> .text.<sym> .text.unlikely.<sym>) as builder/section-order.py writes it for
+    sample-PGO builds) to an lld --symbol-ordering-file. Translated code is built with
+    -ffunction-sections, so each section name carries exactly one symbol."""
     syms = []
-    for m in re.finditer(r'\*\(\.text\.([^\s)]+)\)', Path(order_file).read_text(encoding='utf-8')):
-        syms.append(m.group(1))
+    for m in re.finditer(r'\*\(([^)]*)\)', Path(order_file).read_text(encoding='utf-8')):
+        names = [s[len('.text.'):] for s in m.group(1).split() if s.startswith('.text.')]
+        if len(names) == 3 and names[0] == 'hot.' + names[1] and names[2] == 'unlikely.' + names[1]:
+            syms.append(names[1])
+        elif len(names) == 1:
+            syms.append(names[0])
     Path(out_file).write_text('\n'.join(syms) + '\n', encoding='utf-8')
     return len(syms)
 

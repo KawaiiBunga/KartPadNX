@@ -323,8 +323,7 @@ void frame_open() {
     empty_image_init();
     if (g_testPattern) pattern_init();
     shaders_frame_start();
-    if (code_take_written())
-        dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+    code_make_visible();
     R.frameOpen = true;
 }
 

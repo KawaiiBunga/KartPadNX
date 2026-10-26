@@ -52,8 +52,7 @@ void kartpad_deko_present(WGPUTexture texture, unsigned width, unsigned height) 
         swdk::write_image_view_descriptor(slot, v);
         DkResHandle handle = dkMakeTextureHandle(slot, swdk::kSamplerLinearClamp);
         const DkShader *sh[] = {&p.vs, &p.fs};
-        if (swdk::code_take_written())
-          dkCmdBufBarrier(swdk::R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+        swdk::code_make_visible();
         dkCmdBufBindVtxAttribState(swdk::R.cmd, nullptr, 0);
         dkCmdBufBindVtxBufferState(swdk::R.cmd, nullptr, 0);
         dkCmdBufBindShaders(swdk::R.cmd, DkStageFlag_Vertex | DkStageFlag_Fragment, sh, 2);

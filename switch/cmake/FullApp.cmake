@@ -159,6 +159,7 @@ target_compile_options(mkw_base_shared PRIVATE -O3 -fno-strict-aliasing ${_FP_OP
 # builder/pgo-gen.py from on-hardware samples. Build-level, so it ships as a separate NRO; the
 # [build] log line carries KARTPAD_PGO_TAG so a log always says which variant ran.
 set(KARTPAD_PGO_PROFILE "" CACHE FILEPATH "LLVM sample profile for the translated shards (empty = off)")
+option(KARTPAD_SPLIT_FUNCTIONS "Split never-sampled blocks out of every target the profile optimizes (needs KARTPAD_PGO_PROFILE)" OFF)
 if(KARTPAD_PGO_PROFILE)
   if(NOT EXISTS "${KARTPAD_PGO_PROFILE}")
     message(FATAL_ERROR "KARTPAD_PGO_PROFILE does not exist: ${KARTPAD_PGO_PROFILE}")
@@ -166,6 +167,15 @@ if(KARTPAD_PGO_PROFILE)
   message(STATUS "FullApp: sample PGO for translated shards from ${KARTPAD_PGO_PROFILE}")
   target_compile_options(mkw_base_shared PRIVATE "-fprofile-sample-use=${KARTPAD_PGO_PROFILE}")
   get_filename_component(_PGO_NAME "${KARTPAD_PGO_PROFILE}" NAME)
+  # Machine function splitting (docs/RR-PERFORMANCE-2026-10.md): blocks the profile never saw
+  # move to .text.split.<fn>, which the link order leaves behind the hot functions. Layout only:
+  # the shards' instructions are unchanged apart from the branches between the two parts. The
+  # Retro Rewind shards (RetroRewind.cmake), KARTPAD_PGO_ALL's targets and ThinLTO's backends
+  # split the same way.
+  if(KARTPAD_SPLIT_FUNCTIONS)
+    target_compile_options(mkw_base_shared PRIVATE -fsplit-machine-functions)
+    string(APPEND _PGO_NAME "+split")
+  endif()
   target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PGO_TAG=\"${_PGO_NAME}\"")
 endif()
 # Hot-function link order (same doc section): a GNU ld --section-ordering-file from
@@ -361,6 +371,7 @@ target_sources(kartpad_full PRIVATE
     "${CMAKE_SOURCE_DIR}/src/scalar_fp_cold.cpp"
     "${CMAKE_SOURCE_DIR}/src/native_scene.cpp"
     "${CMAKE_SOURCE_DIR}/src/native_subsystems.cpp"
+    "${CMAKE_SOURCE_DIR}/src/transition_guard.cpp"
     "${_NATIVE_MODEL_REGION}"
     "${_NATIVE_SCENE_REGION}")
 if(KARTPAD_PROFILE STREQUAL "retro-rewind")
@@ -398,34 +409,48 @@ if(KARTPAD_THINLTO_SHARDS)
   if(NOT KARTPAD_THINLTO_JOBS MATCHES "^[1-9][0-9]*$")
     message(FATAL_ERROR "KARTPAD_THINLTO_JOBS must be a positive integer")
   endif()
-  string(REGEX MATCH "^[0-9]+" _LLVM_MAJOR "${CMAKE_CXX_COMPILER_VERSION}")
-  find_file(KARTPAD_LLVM_GOLD NAMES LLVMgold.so
-      HINTS "/usr/lib/llvm-${_LLVM_MAJOR}/lib" REQUIRED)
-  find_program(_THINLTO_AR NAMES "llvm-ar-${_LLVM_MAJOR}" REQUIRED)
-  find_program(_THINLTO_RANLIB NAMES "llvm-ranlib-${_LLVM_MAJOR}" REQUIRED)
-  # GNU devkitPro specs retain the proven crt/linker layout. LLVM archives must
-  # index bitcode correctly; plain devkitA64 ranlib has no LLVM bitcode reader.
-  set(CMAKE_AR "${_THINLTO_AR}")
-  set(CMAKE_RANLIB "${_THINLTO_RANLIB}")
+  # The AIO toolchain links through aio/pipeline/nxtools.py with LLVM lld, which has ThinLTO
+  # built in and archives with llvm-ar already; the Docker toolchain links with GNU ld and
+  # needs the gold plugin.
+  get_filename_component(_THINLTO_LINKER_NAME "${CMAKE_LINKER}" NAME)
+  if(_THINLTO_LINKER_NAME MATCHES "lld")
+    set(_THINLTO_LLD ON)
+  else()
+    set(_THINLTO_LLD OFF)
+    string(REGEX MATCH "^[0-9]+" _LLVM_MAJOR "${CMAKE_CXX_COMPILER_VERSION}")
+    find_file(KARTPAD_LLVM_GOLD NAMES LLVMgold.so
+        HINTS "/usr/lib/llvm-${_LLVM_MAJOR}/lib" REQUIRED)
+    find_program(_THINLTO_AR NAMES "llvm-ar-${_LLVM_MAJOR}" REQUIRED)
+    find_program(_THINLTO_RANLIB NAMES "llvm-ranlib-${_LLVM_MAJOR}" REQUIRED)
+    # GNU devkitPro specs retain the proven crt/linker layout. LLVM archives must
+    # index bitcode correctly; plain devkitA64 ranlib has no LLVM bitcode reader.
+    set(CMAKE_AR "${_THINLTO_AR}")
+    set(CMAKE_RANLIB "${_THINLTO_RANLIB}")
+  endif()
   target_compile_options(mkw_base_shared PRIVATE -flto=thin)
   # The Switch BFD/plugin combination does not tell LLVM about --wrap symbols.
   # Keep their defining shards native so ThinLTO cannot import/integrate the
   # original bodies ahead of the linker's existing native dispatch seam.
+  # One pass over each shard (they are large) for the definitions of all wrapped symbols.
+  list(JOIN KARTPAD_GUEST_WRAP_SYMBOLS "|" _wrap_alternatives)
   set(_NATIVE_WRAP_SHARDS "")
   foreach(_symbol IN LISTS KARTPAD_GUEST_WRAP_SYMBOLS)
-    set(_found "")
-    foreach(_shard IN LISTS MKW_BASE_COMMON_SHARDS)
-      file(STRINGS "${_shard}" _definition
-          REGEX "^extern \"C\" void ${_symbol}\\(CpuContext\\* MKW_RESTRICT ctx\\)$")
-      if(_definition)
-        list(APPEND _found "${_shard}")
-      endif()
+    set(_wrap_found_${_symbol} "")
+  endforeach()
+  foreach(_shard IN LISTS MKW_BASE_COMMON_SHARDS)
+    file(STRINGS "${_shard}" _definitions
+        REGEX "^extern \"C\" void (${_wrap_alternatives})\\(CpuContext\\* MKW_RESTRICT ctx\\)$")
+    foreach(_definition IN LISTS _definitions)
+      string(REGEX REPLACE "^extern \"C\" void ([A-Za-z0-9_]+)\\(.*$" "\\1" _symbol "${_definition}")
+      list(APPEND _wrap_found_${_symbol} "${_shard}")
     endforeach()
-    list(LENGTH _found _count)
+  endforeach()
+  foreach(_symbol IN LISTS KARTPAD_GUEST_WRAP_SYMBOLS)
+    list(LENGTH _wrap_found_${_symbol} _count)
     if(NOT _count EQUAL 1)
       message(FATAL_ERROR "ThinLTO needs exactly one defining shard for ${_symbol}; found ${_count}")
     endif()
-    list(APPEND _NATIVE_WRAP_SHARDS ${_found})
+    list(APPEND _NATIVE_WRAP_SHARDS ${_wrap_found_${_symbol}})
   endforeach()
   list(REMOVE_DUPLICATES _NATIVE_WRAP_SHARDS)
   foreach(_shard IN LISTS _NATIVE_WRAP_SHARDS)
@@ -433,20 +458,40 @@ if(KARTPAD_THINLTO_SHARDS)
   endforeach()
   list(LENGTH _NATIVE_WRAP_SHARDS _native_count)
   message(STATUS "FullApp: ThinLTO retains ${_native_count} native wrapper-definition shards")
-  target_link_options(kartpad_full PRIVATE
-      "LINKER:-plugin,${KARTPAD_LLVM_GOLD}"
-      "LINKER:-plugin-opt,thinlto"
-      "LINKER:-plugin-opt,jobs=${KARTPAD_THINLTO_JOBS}"
-      "LINKER:-plugin-opt,-vectorize-slp=false"
-      "LINKER:-plugin-opt,cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
-  # The backends otherwise run at the plugin's default O2 and emit one .text section, which
-  # also defeats KARTPAD_SECTION_ORDER. The sample profile re-annotates imported bodies.
-  target_link_options(kartpad_full PRIVATE
-      "LINKER:-plugin-opt,O3"
-      "LINKER:-plugin-opt,-function-sections"
-      "LINKER:-plugin-opt,-data-sections")
-  if(KARTPAD_PGO_PROFILE)
-    target_link_options(kartpad_full PRIVATE "LINKER:-plugin-opt,sample-profile=${KARTPAD_PGO_PROFILE}")
+  if(_THINLTO_LLD)
+    # Same backend settings as the gold branch below. lld always emits function and data
+    # sections for LTO code. Machine function splitting is a code-generation option, so the
+    # shards' -fsplit-machine-functions has to be repeated for the LTO backends.
+    target_link_options(kartpad_full PRIVATE
+        "LINKER:--thinlto-jobs=${KARTPAD_THINLTO_JOBS}"
+        "LINKER:--lto-O3"
+        "LINKER:--plugin-opt=-vectorize-slp=false"
+        "LINKER:--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    if(KARTPAD_PGO_PROFILE)
+      target_link_options(kartpad_full PRIVATE "LINKER:--lto-sample-profile=${KARTPAD_PGO_PROFILE}")
+      if(KARTPAD_SPLIT_FUNCTIONS)
+        target_link_options(kartpad_full PRIVATE "LINKER:--plugin-opt=-split-machine-functions")
+      endif()
+    endif()
+  else()
+    target_link_options(kartpad_full PRIVATE
+        "LINKER:-plugin,${KARTPAD_LLVM_GOLD}"
+        "LINKER:-plugin-opt,thinlto"
+        "LINKER:-plugin-opt,jobs=${KARTPAD_THINLTO_JOBS}"
+        "LINKER:-plugin-opt,-vectorize-slp=false"
+        "LINKER:-plugin-opt,cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    # The backends otherwise run at the plugin's default O2 and emit one .text section, which
+    # also defeats KARTPAD_SECTION_ORDER. The sample profile re-annotates imported bodies.
+    target_link_options(kartpad_full PRIVATE
+        "LINKER:-plugin-opt,O3"
+        "LINKER:-plugin-opt,-function-sections"
+        "LINKER:-plugin-opt,-data-sections")
+    if(KARTPAD_PGO_PROFILE)
+      target_link_options(kartpad_full PRIVATE "LINKER:-plugin-opt,sample-profile=${KARTPAD_PGO_PROFILE}")
+      if(KARTPAD_SPLIT_FUNCTIONS)
+        target_link_options(kartpad_full PRIVATE "LINKER:-plugin-opt,-split-machine-functions")
+      endif()
+    endif()
   endif()
   if(_CPU_OPT_TAG STREQUAL "baseline")
     set(_CPU_OPT_TAG "thin-shards")
@@ -532,15 +577,26 @@ nx_create_nro(kartpad_full OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${KARTPAD_NRO_NAM
   NACP kartpad-full.nacp ROMFS "${_KARTPAD_ROMFS}")
 
 # Whole-program sample PGO (docs/PERF-60FPS-ROADMAP.md, "Sample PGO"): with KARTPAD_PGO_ALL the same
-# profile also optimizes the runtime (HLE), the Switch shim and Aurora. Use a profile taken from a
-# build with the current runtime/Aurora sources, or their line offsets will not match.
+# profile also optimizes the runtime (HLE), the Switch shim, the renderer (kartpad_deko) and Aurora.
+# Use a profile taken from a build with the current runtime/renderer/Aurora sources, or their line
+# offsets will not match.
 option(KARTPAD_PGO_ALL "Apply KARTPAD_PGO_PROFILE to runtime, shim and Aurora targets too" OFF)
+# The renderer changes often (the v9 GPU policy, the transition guard): only a profile recorded with
+# its current sources may optimize it, or its newest code has no samples and is compiled as cold.
+option(KARTPAD_PGO_RENDERER "With KARTPAD_PGO_ALL, also apply the profile to the renderer (kartpad_deko)" OFF)
 if(KARTPAD_PGO_PROFILE AND KARTPAD_PGO_ALL)
   message(STATUS "FullApp: sample PGO also for runtime, shim and Aurora")
-  foreach(_pgo_target kartpad_full mkw_runtime_common kartpad_switch_shim aurora_core aurora_gx aurora_gd
+  set(_pgo_renderer "")
+  if(KARTPAD_PGO_RENDERER)
+    set(_pgo_renderer kartpad_deko)
+  endif()
+  foreach(_pgo_target kartpad_full mkw_runtime_common kartpad_switch_shim ${_pgo_renderer} aurora_core aurora_gx aurora_gd
                       aurora_main aurora_os aurora_pad aurora_dvd aurora_mtx aurora_card aurora_ms aurora_vi aurora_si)
     if(TARGET ${_pgo_target})
       target_compile_options(${_pgo_target} PRIVATE "-fprofile-sample-use=${KARTPAD_PGO_PROFILE}")
+      if(KARTPAD_SPLIT_FUNCTIONS)
+        target_compile_options(${_pgo_target} PRIVATE -fsplit-machine-functions)
+      endif()
     endif()
   endforeach()
 endif()
@@ -563,8 +619,14 @@ if(KARTPAD_PROFILE_LINES)
     endif()
   endforeach()
 endif()
+set(KARTPAD_PROF_RACE_START "0" CACHE STRING "Race seconds (across races) before that capture starts")
+option(KARTPAD_PROF_RACE_EVERY "Capture every race to its own prof-race-NN.bin (start counted per race)" OFF)
 if(NOT KARTPAD_PROF_RACE_SECONDS STREQUAL "0")
-  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PROF_RACE_SECONDS=${KARTPAD_PROF_RACE_SECONDS}")
+  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PROF_RACE_SECONDS=${KARTPAD_PROF_RACE_SECONDS}"
+                             "KARTPAD_PROF_RACE_START=${KARTPAD_PROF_RACE_START}")
+  if(KARTPAD_PROF_RACE_EVERY)
+    target_compile_definitions(kartpad_switch_shim PRIVATE KARTPAD_PROF_RACE_EVERY=1)
+  endif()
 endif()
 
 # AIO builder only (off by default): take the game-independent targets from prebuilt objects.

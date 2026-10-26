@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #endif
 extern "C" void kartpad_deko_log_failure_context();
+// switch/src/transition_guard.cpp; weak, so builds without the game (renderer tests) link.
+extern "C" int kartpad_gpu_transition_guard(void) __attribute__((weak));
 
 namespace kd {
 std::unordered_map<WGPUCommandEncoder, std::shared_ptr<Commands>> encoders;
@@ -31,6 +33,13 @@ struct ImageCopyRecord {
   uint32_t srcMip = 0, dstMip = 0, srcOrigin[3]{}, dstOrigin[3]{};
   char source[96]{}, destination[96]{};
 } gpuImageCopy;
+// The bytes snprintf(out, N, "%s", label) writes, without the printf machinery: breadcrumbs
+// copy two labels twice for every GPU operation on the frame worker.
+template <size_t N> void copy_label(char (&out)[N], const char *label) {
+  const size_t n = strnlen(label, N - 1);
+  std::memcpy(out, label, n);
+  out[n] = '\0';
+}
 #ifdef COS_DK_GPU_BREADCRUMBS
 // Reports write a value and timestamp into permanent, CPU-uncached memory.
 // Neither this storage nor its CPU history moves while commands are in flight.
@@ -64,8 +73,8 @@ void breadcrumb_context(Breadcrumb &record) {
   record.width = t ? t->width : 0; record.height = t ? t->height : 0;
   record.indexAddress = state.index ? state.index->mem.gpu + state.indexOffset : 0;
   record.indexBytes = state.index ? state.index->size - state.indexOffset : 0;
-  std::snprintf(record.pipeline, sizeof(record.pipeline), "%s", p ? p->label.c_str() : "<none>");
-  std::snprintf(record.target, sizeof(record.target), "%s", t ? t->label.c_str() : "<none>");
+  copy_label(record.pipeline, p ? p->label.c_str() : "<none>");
+  copy_label(record.target, t ? t->label.c_str() : "<none>");
 }
 void breadcrumb_begin() {
   // ReportValue has a 32-bit payload. Stop rather than confuse generations on wrap.
@@ -142,6 +151,21 @@ void log_gpu_breadcrumbs() {
 #endif
 #ifdef COS_DK_GPU_FLUSHES
 uint32_t gpuOperationsPending = 0;
+// Course transitions: the guard (switch/src/transition_guard.cpp) is asked at most every 5 ms;
+// R.synchronous follows it.
+bool synchronous_operation() {
+  static uint64_t nextCheck = 0;
+  const uint64_t now = now_ns();
+  if (now >= nextCheck) {
+    nextCheck = now + 5'000'000;
+    const bool synchronous = kartpad_gpu_transition_guard && kartpad_gpu_transition_guard() != 0;
+    if (synchronous != R.synchronous)
+      dklog(synchronous ? "course transition: each GPU operation completes before the next until a race runs"
+                        : "race running: GPU operations asynchronous again");
+    R.synchronous = synchronous;
+  }
+  return R.synchronous;
+}
 #endif
 }
 void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
@@ -183,6 +207,21 @@ void gpu_operation_end(bool flushBoundary) {
           static_cast<unsigned long long>(R.frame + 1));
   }
 #else
+  if (synchronous_operation()) {
+    // v3's checkpoint without its validation: the operation and everything before it finish now.
+    DkFence fence{};
+    dkCmdBufSignalFence(R.cmd, &fence, true);
+    submit_readback("course transition operation");
+    gpuOperationsPending = 0;
+    const DkResult result = dkFenceWait(&fence, 2'000'000'000ll);
+    if (result != DkResult_Success) {
+      kartpad_deko_log_failure_context();
+      fatal("GPU operation did not complete during a course transition: %s, result=%d frame=%llu", gpuOperation,
+            int(result), static_cast<unsigned long long>(R.frame + 1));
+    }
+    gpuProgressSerial = gpuOperationSerial;
+    return;
+  }
   // Diagnostic flush policy only; a small submitted batch can still time out.
   if (++gpuOperationsPending < COS_DK_GPU_FLUSH_INTERVAL && !flushBoundary)
     return;
@@ -202,8 +241,8 @@ void gpu_operation_image_copy(const Tex &source, const Tex &destination,
   gpuImageCopy.srcMip = src.mipLevel; gpuImageCopy.dstMip = dst.mipLevel;
   gpuImageCopy.srcOrigin[0] = src.origin.x; gpuImageCopy.srcOrigin[1] = src.origin.y; gpuImageCopy.srcOrigin[2] = src.origin.z;
   gpuImageCopy.dstOrigin[0] = dst.origin.x; gpuImageCopy.dstOrigin[1] = dst.origin.y; gpuImageCopy.dstOrigin[2] = dst.origin.z;
-  std::snprintf(gpuImageCopy.source, sizeof(gpuImageCopy.source), "%s", source.label.c_str());
-  std::snprintf(gpuImageCopy.destination, sizeof(gpuImageCopy.destination), "%s", destination.label.c_str());
+  copy_label(gpuImageCopy.source, source.label.c_str());
+  copy_label(gpuImageCopy.destination, destination.label.c_str());
 }
 #ifdef COS_DK_GPU_FLUSHES
 void gpu_operation_queue_submitted() {
@@ -292,8 +331,7 @@ bool bind_pipeline() {
     fatal("Native shader could not be loaded");
   p->vs.shader->usedDraws.fetch_add(1, std::memory_order_relaxed);
   p->fs.shader->usedDraws.fetch_add(1, std::memory_order_relaxed);
-  if (code_take_written())
-    dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+  code_make_visible();
   if (state.boundPipeline != p.get()) {
     // Pipeline binds and any fixed/native helper may change driver-side state.
     // A pass reset clears these too; never carry bindings across render passes.

@@ -95,6 +95,8 @@ bool code_load(DkShader& shader, const void* dksh, uint32_t size, const char* na
 // whether code_load wrote code since the last call (render worker: then the GPU's shader caches are invalidated
 // before the next shader bind, so they cannot keep stale lines of the new code's addresses, e.g. prefetched)
 bool code_take_written();
+// render worker, before binding shaders: code written since the last call is made visible to the GPU
+void code_make_visible();
 // the "[dk] shader scheduling:" line: COS_DK_SHADER_SCHED (diagnostic, memory.cpp) and what it patched
 void sched_report();
 uint32_t code_used();
@@ -141,6 +143,9 @@ struct Renderer {
     uint32_t width = 1280, height = 720;  // the swapchain images (the window)
     bool zcull = false;      // COS_DK_ZCULL=1 (queue flag; off by default, plan section 7.5)
     bool frameOpen = false;  // between frame_open and the present
+    // course transitions (switch/src/transition_guard.cpp): every GPU operation completes before the
+    // next is recorded, and frame_begin unmaps memory only with the GPU idle (backend_commands.cpp)
+    bool synchronous = false;
 };
 extern Renderer R;
 

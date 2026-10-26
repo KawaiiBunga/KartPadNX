@@ -49,6 +49,9 @@ struct Header {
   char stamp[48];
 };
 
+// The capture's file: kProfPath, or a race auto capture's own file (prof-race-NN.bin) when every race
+// is recorded. Written before a capture is requested, read by the profiler thread when it starts one.
+char g_path[64] = "sdmc:/switch/kartpad/prof.bin";
 Record* g_records = nullptr;
 u64 g_count = 0;    // records produced (ring index = count % kRingRecords)
 u64 g_written = 0;  // records appended to the file
@@ -69,6 +72,10 @@ UEvent g_command{};
 std::atomic<int> g_state{KARTPAD_PROF_UNAVAILABLE};
 std::atomic<bool> g_requested{false};
 std::atomic<u64> g_startedNs{0}, g_elapsedNs{0}, g_samples{0}, g_dropCount{0};
+// A race auto capture ends with its race: no race second for kRaceGapNs stops it.
+std::atomic<bool> g_raceCapture{false};
+std::atomic<u64> g_lastRaceSecondNs{0};
+constexpr u64 kRaceGapNs = 3'000'000'000ull;
 
 u64 now_ns() { return armTicksToNs(armGetSystemTick()); }
 
@@ -119,7 +126,7 @@ bool flush() {
     g_written = g_count - kRingRecords;
   }
   if (g_written == g_count) return true;
-  FILE* f = std::fopen(kProfPath, "ab");
+  FILE* f = std::fopen(g_path, "ab");
   if (f == nullptr) return false;
   while (g_written < g_count) {
     const size_t at = static_cast<size_t>(g_written % kRingRecords);
@@ -139,7 +146,7 @@ bool begin_capture() {
   g_elapsedNs.store(0, std::memory_order_relaxed);
   g_records = static_cast<Record*>(std::malloc(kRingRecords * sizeof(Record)));
   if (g_records == nullptr) return false;
-  FILE* f = std::fopen(kProfPath, "wb");
+  FILE* f = std::fopen(g_path, "wb");
   if (f == nullptr) return false;
   Header h{};
   std::memcpy(h.magic, "KPPROF1", 8);
@@ -168,13 +175,18 @@ void prof_main(void*) {
     g_startedNs.store(t0, std::memory_order_relaxed);
     int starting = KARTPAD_PROF_STARTING;
     g_state.compare_exchange_strong(starting, KARTPAD_PROF_RECORDING, std::memory_order_release);
-    std::fprintf(stderr, "[prof] manual capture at %u Hz -> %s\n", g_hz, kProfPath);
+    std::fprintf(stderr, "[prof] capture at %u Hz -> %s\n", g_hz, g_path);
     u64 next = t0 + periodNs;
     u64 lastFlush = t0;
     while (okay && g_requested.load(std::memory_order_acquire)) {
       const u64 now = now_ns();
       if (next > now) waitSingle(waiterForUEvent(&g_command), next - now);
       if (!g_requested.load(std::memory_order_acquire)) break;
+      if (g_raceCapture.load(std::memory_order_relaxed) &&
+          now_ns() - g_lastRaceSecondNs.load(std::memory_order_relaxed) > kRaceGapNs) {
+        std::fprintf(stderr, "[prof] race ended; race auto capture stopped\n");
+        break;
+      }
       next = now_ns() + periodNs; // Never burst to catch up after SD writes.
       const int targets = g_targetCount.load(std::memory_order_acquire);
       for (int i = 0; i < targets; ++i) {
@@ -189,6 +201,7 @@ void prof_main(void*) {
         lastFlush = now_ns();
       }
     }
+    g_raceCapture.store(false, std::memory_order_relaxed);
     g_state.store(KARTPAD_PROF_STOPPING, std::memory_order_release);
     if (okay) okay = flush();
     g_samples.store(g_count, std::memory_order_relaxed);
@@ -196,6 +209,7 @@ void prof_main(void*) {
     g_elapsedNs.store(now_ns() - t0, std::memory_order_relaxed);
     std::free(g_records);
     g_records = nullptr;
+    std::snprintf(g_path, sizeof(g_path), "%s", kProfPath);  // a manual capture's file again
     g_requested.store(false, std::memory_order_release);
     g_state.store(okay ? KARTPAD_PROF_SAVED : KARTPAD_PROF_ERROR, std::memory_order_release);
     std::fprintf(stderr, "[prof] %s after %llu samples (%llu dropped)\n",
@@ -219,6 +233,14 @@ u64 anchor_address() { return reinterpret_cast<u64>(&kartpad_prof_anchor); }
 
 // A profiling build (FullApp.cmake KARTPAD_PROF_RACE_SECONDS) records its first race seconds without
 // a perf.cfg, sampling every thread that runs game, GX, audio or renderer code (roles 1, 4, 6, 7, 8).
+// KARTPAD_PROF_RACE_START (perf.cfg prof_race_start) delays that capture by a number of race
+// seconds, so a test session's first race runs unprofiled and stays comparable with
+// unprofiled builds while a later race is recorded.
+#ifdef KARTPAD_PROF_RACE_START
+constexpr int kDefaultRaceStart = KARTPAD_PROF_RACE_START;
+#else
+constexpr int kDefaultRaceStart = 0;
+#endif
 #ifdef KARTPAD_PROF_RACE_SECONDS
 constexpr int kDefaultRaceSeconds = KARTPAD_PROF_RACE_SECONDS;
 constexpr int kDefaultRoles = (1 << KARTPAD_ROLE_FRAME_WORKER) | (1 << KARTPAD_ROLE_AUDIO_MIX) |
@@ -286,23 +308,57 @@ extern "C" int kartpad_prof_set_enabled(int enabled) {
   return 1;
 }
 
+// KARTPAD_PROF_RACE_EVERY (perf.cfg prof_race_every): one capture in every race instead of one per
+// session, each in its own file (prof-race-NN.bin, NN = the session's race number), and
+// prof_race_start counted within each race. A PGO profile then covers every track that was raced.
+#ifdef KARTPAD_PROF_RACE_EVERY
+constexpr int kDefaultRaceEvery = KARTPAD_PROF_RACE_EVERY;
+#else
+constexpr int kDefaultRaceEvery = 0;
+#endif
+
 // perf.cfg `prof_race_seconds N` (b73, default 0 = off): perf_diag calls this once per second while a
-// race is running. The capture starts by itself on the 5th race second and stops after N more race
-// seconds, so every test run yields a profile (PGO refresh, hot-function analysis) without the Port menu.
+// race is running. The capture starts by itself on the 5th race second (after `prof_race_start` more,
+// counted across races) and stops after N more race seconds, so every test run yields a profile (PGO
+// refresh, hot-function analysis) without the Port menu.
 extern "C" void kartpad_prof_race_second(void) {
   static int configured = -1;
+  static int start = 0;
+  static bool every = false;
   static int raceSeconds = 0;
   static int recorded = 0;
+  static int race = 0;
   static bool done = false;
-  if (configured < 0) configured = kartpad_perf_int("prof_race_seconds", kDefaultRaceSeconds);
-  if (configured <= 0 || done) return;
+  if (configured < 0) {
+    configured = kartpad_perf_int("prof_race_seconds", kDefaultRaceSeconds);
+    start = kartpad_perf_int("prof_race_start", kDefaultRaceStart);
+    if (start < 0) start = 0;
+    every = kartpad_perf_int("prof_race_every", kDefaultRaceEvery) != 0;
+  }
+  if (configured <= 0) return;
+  const u64 now = now_ns();
+  const u64 last = g_lastRaceSecondNs.exchange(now, std::memory_order_relaxed);
+  if (every && (last == 0 || now - last > kRaceGapNs)) {  // race seconds resumed: another race
+    ++race;
+    raceSeconds = 0;
+    recorded = 0;
+    done = false;
+  }
+  if (done) return;
   ++raceSeconds;
   const int state = g_state.load(std::memory_order_acquire);
-  if (raceSeconds == 5) {
-    if (kartpad_prof_set_enabled(1))
+  if (raceSeconds == start + 5) {
+    // The profiler thread resets g_path before it reports a capture finished: write it only then.
+    if (every && (state == KARTPAD_PROF_IDLE || state == KARTPAD_PROF_SAVED || state == KARTPAD_PROF_ERROR))
+      std::snprintf(g_path, sizeof(g_path), "sdmc:/switch/kartpad/prof-race-%02d.bin", race);
+    g_raceCapture.store(true, std::memory_order_relaxed);
+    if (kartpad_prof_set_enabled(1)) {
       std::fprintf(stderr, "[prof] race auto capture started (%d race seconds)\n", configured);
-    else
+    } else {
+      g_raceCapture.store(false, std::memory_order_relaxed);
+      if (every) std::snprintf(g_path, sizeof(g_path), "%s", kProfPath);
       done = true;  // a manual capture is running; leave it alone
+    }
     return;
   }
   if (state != KARTPAD_PROF_RECORDING && state != KARTPAD_PROF_STARTING) return;
