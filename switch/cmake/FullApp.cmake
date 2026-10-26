@@ -610,6 +610,8 @@ option(KARTPAD_PROFILE_LINES "Line tables for sample-PGO profiling (ELF only)" O
 set(KARTPAD_PROF_RACE_SECONDS "0" CACHE STRING "Race seconds a build profiles by itself (0 = perf.cfg decides)")
 if(KARTPAD_PROFILE_LINES)
   message(STATUS "FullApp: line tables for sample-PGO profiling")
+  # And the boot-time TLB probe of the flat guest views (guest_flat_memory_switch.cpp).
+  target_compile_definitions(mkw_runtime_common PRIVATE KARTPAD_TLB_PROBE_DEFAULT=1)
   foreach(_lines_target kartpad_full mkw_base_shared mkw_runtime_common kartpad_switch_shim kartpad_deko
                         mkw_retro_sensitive mkw_retro_rewind_functions aurora_core aurora_gx aurora_gd
                         aurora_main aurora_os aurora_pad aurora_dvd aurora_mtx aurora_card aurora_ms aurora_vi

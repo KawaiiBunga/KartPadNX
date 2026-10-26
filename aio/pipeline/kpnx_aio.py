@@ -826,6 +826,9 @@ def transform(run, profile):
             run.python('elide-redundant-flushes.py', tr / 'build_shards', '--exemptions', ex)
     for s in TRANSFORM_PASSES:
         run.python(s + '.py', tr / 'build_shards')
+    if p['cpu_rewrites']:
+        # Last: the passes above match the translator's original access text.
+        run.python('flat-guest-displacement.py', tr / 'build_shards')
 
 
 def configure_seed(run, bdir):

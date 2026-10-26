@@ -5635,7 +5635,7 @@ diff --git a/runtime/src/perf_diag.cpp b/runtime/src/perf_diag.cpp
 diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 --- a/runtime/src/settings_overlay.cpp
 +++ b/runtime/src/settings_overlay.cpp
-@@ -1,990 +1,1187 @@
+@@ -1,990 +1,1373 @@
 -#include "settings_overlay.h"
 -#include "wup028_adapter.h"
 -#include "audio_backend.h"
@@ -5723,6 +5723,7 @@ diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 +#include "aurora_events.h"
 +#if defined(__SWITCH__)
 +#include "prof_control.h"
++#include "kartpad_mobile_runtime_host.h"  // switch/src/input_switch.cpp: controllers and their mapping
 +#endif
 +
 +#include <imgui.h>
@@ -5736,6 +5737,7 @@ diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 +#include <algorithm>
 +#include <atomic>
 +#include <cctype>
++#include <cfloat>
 +#include <chrono>
 +#include <cmath>
 +#include <cstdint>
@@ -5750,12 +5752,10 @@ diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 +static const char* const kartpad_build_stamp = "pc";
 +static bool (*const kartpad_has_return_path)() = nullptr;
 +static const char* (*const kartpad_get_variant)() = nullptr;
-+static bool (*const KartPadShowControllerApplet)(void) = nullptr;
 +#else
 +extern "C" const char kartpad_build_stamp[] __attribute__((weak));
 +extern "C" bool kartpad_has_return_path() __attribute__((weak));
 +extern "C" const char* kartpad_get_variant() __attribute__((weak));
-+extern "C" bool KartPadShowControllerApplet(void) __attribute__((weak));  // switch/src/input_switch.cpp
 +#endif
 +
 +#if defined(_WIN32)
@@ -6988,16 +6988,199 @@ diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 +    ImGui::EndMenu();
 +}
 +
-+void DrawControllerSettings() {
-+    // The game reads Switch controllers as players 1-4; the system applet assigns them (pairs,
-+    // sideways Joy-Cons, Pro Controllers). The menu closes so the applet gets the screen.
-+    if (KartPadShowControllerApplet && ImGui::MenuItem("Switch controllers (players 1-4)...")) {
++#if defined(__SWITCH__)
++// The Switch game reads players 1-4 as Classic Controllers through input_switch.cpp's mapping, so
++// that is what this page shows and edits; SDL's GameCube PAD mapping is not used there.
++int g_switchMappingPlayer = 0;
++int g_switchMappingStyle = -1;  // -1: the style of the selected player's controller
++std::string g_switchControllerStatus;
++
++std::string SwitchTargetLabel(int target) {
++    std::string label = KartPadInputTargetName(target);
++    const char* use = KartPadInputTargetUse(target);
++    if (use[0] != '\0') {
++        label += "  (";
++        label += use;
++        label += ')';
++    }
++    return label;
++}
++
++std::string ClassicButtonNames(uint32_t buttons) {
++    std::string names;
++    for (int target = 1; target < KartPadInputTargetCount(); ++target) {
++        if ((buttons & KartPadInputTargetButton(target)) == 0) {
++            continue;
++        }
++        if (!names.empty()) {
++            names += "  ";
++        }
++        names += KartPadInputTargetName(target);
++    }
++    return names.empty() ? std::string("no buttons") : names;
++}
++
++// Switch controllers reach the game as Classic Controllers, and this menu has no GameCube port page
++// there. A port an earlier build assigned to one of them through SDL would send the same presses a
++// second time, outside the mapping shown here: release it.
++void ReleaseGameCubePorts() {
++    for (uint32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
++        if (PADGetIndexForPort(port) < 0) {
++            continue;
++        }
++        PADClearPort(port);
++        RT_LOG(RT_TAG_CONFIG) << "Released GameCube port " << port + 1
++                              << ": Switch controllers reach the game as Classic Controllers" << std::endl;
++    }
++}
++
++void DrawSwitchControllerSettings() {
++    const float wide = ImGui::GetContentRegionAvail().x;
++    // The system applet assigns controllers to players; the menu closes so it gets the screen.
++    if (ImGui::Button("Assign controllers to players 1-4...", ImVec2(wide, 0.0f))) {
 +        SetTopBarVisible(false);
 +        KartPadShowControllerApplet();
++        return;
 +    }
-+    if (KartPadShowControllerApplet) {
-+        ImGui::Separator();
++    ImGui::TextWrapped("A player holds a Pro Controller, a Joy-Con pair, or one Joy-Con sideways (SL and SR on top).");
++    for (unsigned player = 0; player < 4; ++player) {
++        ImGui::PushID(static_cast<int>(player));
++        const char* controller = KartPadInputPlayerController(player);
++        const int style = KartPadInputPlayerStyle(player);
++        ImGui::AlignTextToFramePadding();
++        ImGui::Text("Player %u: %s", player + 1, controller != nullptr ? controller : "no controller");
++        if (style == KARTPAD_INPUT_JOYCON_PAIR) {
++            ImGui::SameLine();
++            if (ImGui::SmallButton("Split into two players")) {
++                const int other = KartPadInputSplitJoyCons(player);
++                g_switchControllerStatus = other >= 0
++                    ? "Player " + std::to_string(player + 1) + " keeps the left Joy-Con, player " +
++                          std::to_string(other + 1) + " has the right one"
++                    : std::string("Could not split the pair (are all four players taken?)");
++            }
++        } else if (style == KARTPAD_INPUT_JOYCON_SIDEWAYS) {
++            ImGui::SameLine();
++            if (ImGui::SmallButton("Join into a pair")) {
++                const int other = KartPadInputJoinJoyCons(player);
++                g_switchControllerStatus = other >= 0
++                    ? "Player " + std::to_string(player + 1) + " now has the pair (with player " +
++                          std::to_string(other + 1) + "'s Joy-Con)"
++                    : std::string("No other player has the matching Joy-Con");
++            }
++        }
++        ImGui::PopID();
 +    }
++    if (!g_switchControllerStatus.empty()) {
++        ImGui::TextDisabled("%s", g_switchControllerStatus.c_str());
++    }
++
++    ImGui::SeparatorText("Button mapping");
++    for (int player = 0; player < 4; ++player) {
++        const std::string label = "Player " + std::to_string(player + 1);
++        if (ImGui::RadioButton(label.c_str(), g_switchMappingPlayer == player)) {
++            g_switchMappingPlayer = player;
++            g_switchMappingStyle = -1;
++        }
++        if (player + 1 < 4) {
++            ImGui::SameLine();
++        }
++    }
++    const unsigned player = static_cast<unsigned>(g_switchMappingPlayer);
++    const int inUse = KartPadInputPlayerStyle(player);
++    int style = g_switchMappingStyle >= 0 ? g_switchMappingStyle : (inUse >= 0 ? inUse : KARTPAD_INPUT_PRO);
++    const auto styleLabel = [&](int candidate) {
++        return std::string(KartPadInputStyleName(candidate)) + (candidate == inUse ? "  (in use)" : "");
++    };
++    ImGui::SetNextItemWidth(wide * 0.6f);
++    if (ImGui::BeginCombo("Controller", styleLabel(style).c_str())) {
++        for (int candidate = 0; candidate < KARTPAD_INPUT_STYLE_COUNT; ++candidate) {
++            const bool selected = candidate == style;
++            if (ImGui::Selectable(styleLabel(candidate).c_str(), selected)) {
++                g_switchMappingStyle = candidate;
++                style = candidate;
++            }
++            if (selected) {
++                ImGui::SetItemDefaultFocus();
++            }
++        }
++        ImGui::EndCombo();
++    }
++    const int steer = KartPadInputGetSteeringStick(player, style);
++    if (steer >= 0) {
++        ImGui::AlignTextToFramePadding();
++        ImGui::TextUnformatted("Steer with");
++        ImGui::SameLine();
++        if (ImGui::RadioButton("Left stick", steer == 0)) {
++            KartPadInputSetSteeringStick(player, style, 0);
++        }
++        ImGui::SameLine();
++        if (ImGui::RadioButton("Right stick", steer == 1)) {
++            KartPadInputSetSteeringStick(player, style, 1);
++        }
++    } else {
++        ImGui::TextDisabled("Steers with the Joy-Con's stick, turned with the Joy-Con.");
++    }
++
++    // The game's own read of this player (as it is with the menu closed), so what is shown here is
++    // what the game gets.
++    KartPadMobileClassicInputSnapshot snapshot{};
++    if (KartPadMobileReadClassicInputForPlayer(player, &snapshot)) {
++        ImGui::Text("Game receives: %s, stick %+.2f %+.2f", ClassicButtonNames(snapshot.buttons).c_str(),
++                    snapshot.leftStickX, snapshot.leftStickY);
++    } else {
++        ImGui::TextDisabled("Game receives: nothing (player %u has no controller)", player + 1);
++    }
++
++    // One row per physical input; a row lights up while its input is held.
++    const int sources = KartPadInputSourceCount(style);
++    const unsigned long long held = KartPadInputHeldSources(player, style);
++    float labelWidth = 0.0f;
++    for (int source = 0; source < sources; ++source) {
++        labelWidth = std::max(labelWidth, ImGui::CalcTextSize(KartPadInputSourceName(style, source)).x);
++    }
++    const float comboX = ImGui::GetCursorPosX() + labelWidth + ImGui::GetStyle().ItemSpacing.x * 2.0f;
++    for (int source = 0; source < sources; ++source) {
++        ImGui::PushID(source);
++        const char* name = KartPadInputSourceName(style, source);
++        ImGui::AlignTextToFramePadding();
++        if ((held >> source) & 1ull) {
++            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1.0f), "%s", name);
++        } else {
++            ImGui::TextUnformatted(name);
++        }
++        ImGui::SameLine(comboX);
++        ImGui::SetNextItemWidth(-FLT_MIN);
++        const int current = KartPadInputGetTarget(player, style, source);
++        if (ImGui::BeginCombo("##target", SwitchTargetLabel(current).c_str())) {
++            for (int target = 0; target < KartPadInputTargetCount(); ++target) {
++                const bool selected = target == current;
++                if (ImGui::Selectable(SwitchTargetLabel(target).c_str(), selected)) {
++                    KartPadInputSetTarget(player, style, source, target);
++                }
++                if (selected) {
++                    ImGui::SetItemDefaultFocus();
++                }
++            }
++            ImGui::EndCombo();
++        }
++        ImGui::PopID();
++    }
++    if (ImGui::Button("Reset to defaults")) {
++        KartPadInputResetMapping(player, style);
++    }
++    ImGui::SameLine();
++    if (ImGui::Button("Use for all players")) {
++        KartPadInputCopyMappingToAllPlayers(player, style);
++    }
++    ImGui::TextDisabled("Saved to controls.cfg on the SD card.");
++}
++#endif
++
++void DrawControllerSettings() {
++#if defined(__SWITCH__)
++    DrawSwitchControllerSettings();
++    return;
++#endif
 +    for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
 +        const std::string label = "Port " + std::to_string(port + 1);
 +        ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
@@ -7779,6 +7962,9 @@ diff --git a/runtime/src/settings_overlay.cpp b/runtime/src/settings_overlay.cpp
 +    // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
 +    // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
 +    aurora_wait_for_frame_worker();
++#if defined(__SWITCH__)
++    ReleaseGameCubePorts();
++#endif
 +    ApplyConfiguredMappings();
 +    PersistDisplayModeIfChanged();
 +    UpdateCursorAutoHide();

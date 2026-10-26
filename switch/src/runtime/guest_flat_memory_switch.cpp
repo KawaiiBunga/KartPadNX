@@ -173,10 +173,20 @@ void* FindAslrAligned(uint64_t size, uint64_t align, uint64_t skew = 0) {
 
 void ReserveFlatSpace() {
     if (g_base) return;
-    const uint64_t span = kGuestSpaceSize + kReservationGuard;
+    // Guards on both sides of the 4 GiB: base + displacement accesses (memory_access.h
+    // Flat*At, |d| < 64 KiB) of a garbage pointer near 0 or 4 GiB land in reserved, unmapped
+    // space and fault, as the wrapping 32-bit address did.
+    const uint64_t span = kReservationGuard + kGuestSpaceSize + kReservationGuard;
+    const uint64_t align = FlatAlignEnabled() ? kHugeAlign : kAllocationGranularity;
     virtmemLock();
-    void* found = FlatAlignEnabled() ? FindAslrAligned(span, kHugeAlign) : virtmemFindAslr(span, 0);
-    if (found) g_reservation = virtmemAddReservation(found, span);
+    // [raw, raw + span + align) is free; the base is the first aligned address at least one guard
+    // above raw, so [base - guard, base + 4 GiB + guard) lies inside it.
+    void* found = nullptr;
+    if (void* raw = virtmemFindAslr(span + align, 0)) {
+        const uint64_t base = RoundUp(reinterpret_cast<uint64_t>(raw) + kReservationGuard, align);
+        found = reinterpret_cast<void*>(base);
+        g_reservation = virtmemAddReservation(reinterpret_cast<void*>(base - kReservationGuard), span);
+    }
     virtmemUnlock();
     if (!found || !g_reservation) {
         throw std::runtime_error(
@@ -245,8 +255,14 @@ ProbeResult ProbeOne(uint8_t* host, const uint8_t* flat, const uint8_t* skew, ui
     return r;
 }
 
+// Profiling builds (FullApp.cmake KARTPAD_PROFILE_LINES) run it by default: one line in the log
+// says whether the guest views got block mappings.
+#ifndef KARTPAD_TLB_PROBE_DEFAULT
+#define KARTPAD_TLB_PROBE_DEFAULT 0
+#endif
+
 void RunTlbProbe(std::string& out) {
-    if (kartpad_opt == nullptr || kartpad_opt("flat_tlb_probe", 0) == 0) return;
+    if (kartpad_opt == nullptr || kartpad_opt("flat_tlb_probe", KARTPAD_TLB_PROBE_DEFAULT) == 0) return;
     const Section* best = nullptr;
     uint32_t bestGuest = 0;
     for (const auto& region : g_mappedRegions) {

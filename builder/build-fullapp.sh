@@ -286,6 +286,10 @@ do_transform() {
   python3 "$repo/builder/inject-archive-call-boundary.py" "$translation_dir/build_shards"
   python3 "$repo/builder/fix-rr-menu-model-flow.py" "$translation_dir/build_shards"
   python3 "$repo/builder/inject-globe-scene-boundary.py" "$translation_dir/build_shards"
+  # CPU pass, last: the passes above match the translator's original access text.
+  if [[ "${KARTPAD_CPU_REWRITES:-$cpu_rewrites_default}" == "1" ]]; then
+    python3 "$repo/builder/flat-guest-displacement.py" "$translation_dir/build_shards"
+  fi
 }
 
 do_build() {

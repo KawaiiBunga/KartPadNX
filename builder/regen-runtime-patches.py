@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate switch/patches/runtime/ from the staged runtime and Aurora sources.
 
-    python builder/regen-runtime-patches.py
+    python builder/regen-runtime-patches.py [STAGED_DIR]
+
+STAGED_DIR is the staged build/wiicompiled-fpscr to diff (default: this checkout's; the AIO's and
+private/perf's work folders keep their own).
 
 The staged sources under build/wiicompiled-fpscr are gitignored, so these patches are the only
 durable record of the KartPad changes made in them: every changed or new source file, diffed
@@ -37,7 +40,7 @@ GROUPS = [
                           'runtime/src/hle/vi.cpp', 'runtime/cmake/*', 'runtime/include/hle_stubs.h']),
     ('runtime-cpu', ['runtime/include/isa/*', 'runtime/include/ppc_runtime.h', 'runtime/include/native_cpu_calls.inc',
                      'runtime/include/guest_flat_memory.h', 'runtime/src/memory.cpp', 'runtime/*/recomp_mod_loader.*',
-                     'runtime/include/abi_bridge.h']),
+                     'runtime/include/abi_bridge.h', 'runtime/include/memory_access.h']),
     ('runtime-os', ['runtime/src/hle/os/*', 'runtime/include/os_host_thread.h', 'runtime/src/fiber_manager.cpp',
                     'runtime/include/guest_interrupt_context.h']),
     ('runtime-storage', ['runtime/src/hle/storage/*', 'runtime/include/hle/dvd_contract.h',
@@ -82,6 +85,9 @@ def file_diff(relative):
 
 
 def main():
+    global CUR
+    if len(sys.argv) > 1:
+        CUR = Path(sys.argv[1]).resolve()
     if not BASE.is_dir():
         with tarfile.open(BASE_TAR) as tar:
             tar.extractall(BASE_DIR, filter='data')
