@@ -95,3 +95,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+docs/VANILLA-GPU-HANDOFF.md
+docs/RR-PERFORMANCE-2026-10.md
+docs/PERF-CFG-KEYS.md
+builder/section-order.py
+builder/prof-report.py
+builder/perf-log-summary.py
+builder/pgo-gen.py

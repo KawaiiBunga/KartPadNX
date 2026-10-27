@@ -12,7 +12,7 @@ comments) and is read once at startup. Without the file every key has its defaul
   placement, kept for A/B runs. Placement keys are documented at the top of
   `switch/src/perf_switch.cpp`.
 
-79 keys.
+77 keys.
 
 | Key | Kind | Default | Read in |
 |---|---|---|---|
@@ -70,8 +70,6 @@ comments) and is read once at startup. Without the file every key has its defaul
 | `gxw_batch_kb` | opt | `32` | `build/wiicompiled-fpscr/aurora-main/lib/gx/gx_worker.cpp:447` |
 | `gxw_levent` | opt | `1` | `build/wiicompiled-fpscr/aurora-main/lib/gx/gx_worker.cpp:452` |
 | `gxw_owned_batches` | opt | `1` | `build/wiicompiled-fpscr/aurora-main/lib/gx/fifo.cpp:110` |
-| `joycon_rotate_stick` | setting | `0` | `switch/src/input_switch.cpp:138` |
-| `joycon_sideways_buttons` | setting | `1` | `switch/src/input_switch.cpp:139` |
 | `lyt_direct` | opt | `1` | `build/wiicompiled-fpscr/runtime/src/hle/gx/gx_dl.cpp:137` |
 | `mix_prio` | setting | `0x2C` | `switch/src/perf_switch.cpp:477` |
 | `monolithic_cache` | setting | `1` | `build/wiicompiled-fpscr/aurora-main/lib/webgpu/gpu.cpp:752` |
