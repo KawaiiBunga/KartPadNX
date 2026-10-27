@@ -1,7 +1,7 @@
 diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
 --- a/aurora-main/lib/aurora.cpp
 +++ b/aurora-main/lib/aurora.cpp
-@@ -1,1932 +1,1988 @@
+@@ -1,1932 +1,2011 @@
 -#include <aurora/aurora.h>
 -
 -#ifdef AURORA_ENABLE_GX
@@ -3552,8 +3552,21 @@ diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
 +  FrameMarkNamed("Aurora frame");
 +}
 +
-+// One complete frame-worker cycle. The scene encode only leaves the renderer mutex when
-+// interpolation actually inserts slots; otherwise both phases publish together.
++extern "C" int kartpad_opt(const char* key, int fallback) __attribute__((weak));
++
++// perf.cfg `gfx_overlap_encode` (default 1): encode outside the renderer mutex, after SEALED, for
++// every frame, not only interpolated ones. Encoding under the mutex kept the GX worker from decoding
++// the next frame until the previous one was recorded: the frame time was encode + decode end to end
++// (test 15 movie menu: 6-7 ms of recording per present, the worker idle for it, the game thread
++// waiting at its GXDrawDone). The encode reads only the sealed passes and `ctx`; ImGui's next frame
++// is started after it (Deferred), and every ImGui caller waits for DONE, as with interpolation.
++static bool overlap_encode_enabled() noexcept {
++  static const bool enabled = kartpad_opt == nullptr || kartpad_opt("gfx_overlap_encode", 1) != 0;
++  return enabled;
++}
++
++// One complete frame-worker cycle. The scene encode leaves the renderer mutex (see
++// overlap_encode_enabled); otherwise both phases publish together.
 +bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
 +  ZoneScopedN("Frame worker cycle");
 +  webgpu::fail_if_device_lost();
@@ -3563,7 +3576,7 @@ diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
 +  {
 +    std::lock_guard gpuLock(g_rendererGpuMutex);
 +    seal_frame_locked(sealedFrame, ctx);
-+    overlapEncode = ctx.interpolationActive;
++    overlapEncode = ctx.interpolationActive || overlap_encode_enabled();
 +    if (!overlapEncode) {
 +      presentationJobs = encode_sealed_frame(sealedFrame, ctx);
 +    }
@@ -3666,12 +3679,22 @@ diff --git a/aurora-main/lib/aurora.cpp b/aurora-main/lib/aurora.cpp
 +#ifdef AURORA_ENABLE_GX
 +  // A surface mutation can legitimately fail preparation, and optimistic success would let GX/ImGui
 +  // record into a frame that was never begun, so join this path and return its real result.
++#if defined(AURORA_GFX_DEKO3D)
++  // deko3d presents natively and has no wgpu surface (create_surface makes none), so `!g_surface`
++  // held on every frame: the producer (the GX HLE thread) waited for the frame worker's DONE at
++  // every begin_frame, 22-25% of that thread in menus and races (tests 15-16), and decoded nothing
++  // of the next frame meanwhile. These are the conditions the deko3d begin_frame_impl acts on.
++  waitForSurfacePreparation = !window::is_presentable() || window::native_resize_pending() ||
++                              window::is_paused() ||
++                              g_surfaceReconfigurePending.load(std::memory_order_acquire);
++#else
 +  waitForSurfacePreparation =
 +      !window::is_presentable() || !g_surface ||
 +      window::native_resize_pending() || window::is_paused() ||
 +      !window::native_window_size_matches(
 +          webgpu::g_graphicsConfig.surfaceConfiguration.width,
 +          webgpu::g_graphicsConfig.surfaceConfiguration.height);
++#endif
 +#endif
 +  bool workerPreparationPending = false;
 +  {
@@ -3982,7 +4005,29 @@ diff --git a/aurora-main/lib/gfx/common.cpp b/aurora-main/lib/gfx/common.cpp
          clear::render(draw.clear, pass, renderPasses[idx].targetSize, encodeState.currentPipeline);
          break;
        }
-@@ -1524,6 +1541,15 @@
+@@ -1482,7 +1499,8 @@
+   return true;
+ }
+ 
+-static inline Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
++static inline Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment,
++                         bool zeroPadding = true) {
+   size_t padding = 0;
+   if (alignment != 0) {
+     const size_t remainder = length % alignment;
+@@ -1496,8 +1514,10 @@
+     target.append_zeroes(alignment);
+   } else {
+     target.append(data, length);
+-    if (padding > 0) {
++    if (padding > 0 && zeroPadding) {
+       target.append_zeroes(padding);
++    } else if (padding > 0) {
++      target.append_uninitialized(padding);
+     }
+   }
+   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length + padding)};
+@@ -1524,11 +1544,22 @@
  }
  Range push_verts(const uint8_t* data, size_t length) { return push(g_verts, data, length, 0); }
  Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, data, length, 0); }
@@ -3998,6 +4043,14 @@ diff --git a/aurora-main/lib/gfx/common.cpp b/aurora-main/lib/gfx/common.cpp
  Range push_uniform(const uint8_t* data, size_t length) {
    return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
  }
++// A storage binding's alignment padding is never read: no zeroing pass over the write-combine
++// staging memory (a memset per storage push, 1.5% of the race's GX worker, test 14).
+ Range push_storage(const uint8_t* data, size_t length) {
+-  return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);
++  return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment, false);
+ }
+ Range push_texture_data(const uint8_t* data, size_t length, u32 bytesPerRow, u32 rowsPerImage) {
+   // For CopyBufferToTexture, we need an alignment of 256 per row (see Dawn kTextureBytesPerRowAlignment)
 diff --git a/aurora-main/lib/gfx/common.hpp b/aurora-main/lib/gfx/common.hpp
 --- a/aurora-main/lib/gfx/common.hpp
 +++ b/aurora-main/lib/gfx/common.hpp
@@ -9584,7 +9637,40 @@ diff --git a/aurora-main/lib/gfx/texture.cpp b/aurora-main/lib/gfx/texture.cpp
 diff --git a/aurora-main/lib/gfx/texture_convert.cpp b/aurora-main/lib/gfx/texture_convert.cpp
 --- a/aurora-main/lib/gfx/texture_convert.cpp
 +++ b/aurora-main/lib/gfx/texture_convert.cpp
-@@ -554,6 +554,67 @@
+@@ -228,10 +228,14 @@
+   { T::decode_texel(std::declval<typename T::Target*>(), std::declval<const typename T::Source*>(), 0u) };
+ };
+ 
++// Every texel of every mip is written below, so the buffer is not cleared first (a movie frame's
++// planes are 590 KB of RGBA8 each time, test 14), and a full block row has a constant length the
++// compiler can unroll.
+ template <TextureDecoder T>
+ static ByteBuffer DecodeTiled(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+   const size_t texelCount = ComputeMippedTexelCount(width, height, mips);
+-  ByteBuffer buf{texelCount * sizeof(typename T::Target)};
++  ByteBuffer buf;
++  buf.append_uninitialized(texelCount * sizeof(typename T::Target));
+ 
+   uint32_t w = width;
+   uint32_t h = height;
+@@ -248,8 +252,14 @@
+         for (uint32_t y = 0; y < numRows; ++y) {
+           auto* target = targetMip + (baseY + y) * w + baseX;
+           const auto n = std::min(w - baseX, T::BlockWidth);
+-          for (uint32_t x = 0; x < n; ++x) {
+-            T::decode_texel(target, in, x);
++          if (n == T::BlockWidth) {
++            for (uint32_t x = 0; x < T::BlockWidth; ++x) {
++              T::decode_texel(target, in, x);
++            }
++          } else {
++            for (uint32_t x = 0; x < n; ++x) {
++              T::decode_texel(target, in, x);
++            }
+           }
+           in += T::BlockWidth / T::Frac;
+         }
+@@ -554,6 +564,67 @@
    return buf;
  }
  
@@ -9652,7 +9738,7 @@ diff --git a/aurora-main/lib/gfx/texture_convert.cpp b/aurora-main/lib/gfx/textu
  ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
    const uint32_t maxMips = max_texture_mip_count(width, height);
    const uint32_t safeMips = std::clamp(mips, 1u, maxMips);
-@@ -616,12 +677,20 @@
+@@ -616,12 +687,20 @@
      converted = BuildRGBA8FromGCN(width, height, mips, data);
      break;
    case GX_TF_CMPR:

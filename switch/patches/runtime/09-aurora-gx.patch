@@ -1968,7 +1968,7 @@ diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
  namespace aurora::gx::fifo {
  static Module Log("aurora::gx::fifo");
  
-@@ -72,23 +76,161 @@
+@@ -72,23 +76,164 @@
    TracyPlot("aurora: fifoDrainWaitUs", static_cast<int64_t>(nanos / 1000));
  }
  
@@ -1989,14 +1989,17 @@ diff --git a/aurora-main/lib/gx/fifo.cpp b/aurora-main/lib/gx/fifo.cpp
 +// ring order and with the same frame-worker wait as a stream record, then returns the buffer
 +// through a single-producer/single-consumer free list. Buffers in flight are capped; past the cap
 +// (a stalled worker) batches take the copy path again, whose ring space is the backpressure.
++// The free list holds every buffer that can be in flight: with 64 slots, a worker more than 64
++// batches behind (menus flush once per layout quad) had its returned buffers freed and the producer
++// allocating new ones, 5-6% of the GX HLE thread in malloc (test 14).
 +namespace {
 +struct OwnedBatch {
 +  uint8_t* data;
 +  uint32_t bytes;
 +  uint32_t capacity;
 +};
-+constexpr uint32_t kOwnedFreeSlots = 64;
 +constexpr uint32_t kOwnedMaxInFlight = 256;
++constexpr uint32_t kOwnedFreeSlots = kOwnedMaxInFlight;
 +OwnedBatch sOwnedFree[kOwnedFreeSlots];
 +std::atomic<uint32_t> sOwnedFreeHead{0};  // producer pops
 +std::atomic<uint32_t> sOwnedFreeTail{0};  // worker pushes
