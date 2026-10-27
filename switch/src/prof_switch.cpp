@@ -76,6 +76,11 @@ std::atomic<u64> g_startedNs{0}, g_elapsedNs{0}, g_samples{0}, g_dropCount{0};
 std::atomic<bool> g_raceCapture{false};
 std::atomic<u64> g_lastRaceSecondNs{0};
 constexpr u64 kRaceGapNs = 3'000'000'000ull;
+// The menu auto capture (kartpad_prof_start_guest): its file, when it starts and how long it runs; a
+// race second ends it. Set before the profiler thread starts, then only that thread touches them.
+constexpr const char* kMenuProfPath = "sdmc:/switch/kartpad/prof-menu.bin";
+u64 g_menuStartNs = 0, g_menuDurationNs = 0;
+bool g_menuPending = false, g_menuCapture = false;
 
 u64 now_ns() { return armTicksToNs(armGetSystemTick()); }
 
@@ -168,7 +173,27 @@ void prof_main(void*) {
     while (!g_requested.load(std::memory_order_acquire)) {
       if (g_state.load(std::memory_order_acquire) == KARTPAD_PROF_STOPPING)
         g_state.store(KARTPAD_PROF_IDLE, std::memory_order_release);
-      waitSingle(waiterForUEvent(&g_command), UINT64_MAX);
+      u64 timeout = UINT64_MAX;
+      if (g_menuPending) {
+        const u64 now = now_ns();
+        if (now >= g_menuStartNs) {
+          g_menuPending = false;
+          const u64 lastRace = g_lastRaceSecondNs.load(std::memory_order_relaxed);
+          if (lastRace == 0 || now - lastRace > kRaceGapNs) {  // not in a race: the menus
+            std::snprintf(g_path, sizeof(g_path), "%s", kMenuProfPath);
+            g_menuCapture = kartpad_prof_set_enabled(1) != 0;
+            if (g_menuCapture) {
+              std::fprintf(stderr, "[prof] menu auto capture started (%llu s, until a race runs)\n",
+                           static_cast<unsigned long long>(g_menuDurationNs / 1'000'000'000ull));
+              continue;
+            }
+            std::snprintf(g_path, sizeof(g_path), "%s", kProfPath);
+          }
+        } else {
+          timeout = g_menuStartNs - now;
+        }
+      }
+      waitSingle(waiterForUEvent(&g_command), timeout);
     }
     bool okay = begin_capture();
     const u64 t0 = now_ns();
@@ -187,6 +212,12 @@ void prof_main(void*) {
         std::fprintf(stderr, "[prof] race ended; race auto capture stopped\n");
         break;
       }
+      if (g_menuCapture && (now_ns() - t0 >= g_menuDurationNs ||
+                            g_lastRaceSecondNs.load(std::memory_order_relaxed) > t0)) {
+        std::fprintf(stderr, "[prof] menu auto capture stopped (%s)\n",
+                     now_ns() - t0 >= g_menuDurationNs ? "its seconds are up" : "a race runs");
+        break;
+      }
       next = now_ns() + periodNs; // Never burst to catch up after SD writes.
       const int targets = g_targetCount.load(std::memory_order_acquire);
       for (int i = 0; i < targets; ++i) {
@@ -202,6 +233,7 @@ void prof_main(void*) {
       }
     }
     g_raceCapture.store(false, std::memory_order_relaxed);
+    g_menuCapture = false;
     g_state.store(KARTPAD_PROF_STOPPING, std::memory_order_release);
     if (okay) okay = flush();
     g_samples.store(g_count, std::memory_order_relaxed);
@@ -251,8 +283,26 @@ constexpr int kDefaultRaceSeconds = 0;
 constexpr int kDefaultRoles = 192;
 #endif
 
+// KARTPAD_PROF_MENU_SECONDS (perf.cfg prof_menu_seconds): a profiling build also records the menus,
+// to prof-menu.bin, from prof_menu_start seconds after the guest starts (default 20: past boot and
+// the title's first frames) for that many seconds, stopped early when a race runs (whose own capture
+// then starts as before). PGO then covers the menus' code (layouts, THP, GX copies), which race
+// profiles never sample.
+#ifdef KARTPAD_PROF_MENU_SECONDS
+constexpr int kDefaultMenuSeconds = KARTPAD_PROF_MENU_SECONDS;
+#else
+constexpr int kDefaultMenuSeconds = 0;
+#endif
+
 // Called on the guest thread once its placement is final.
 extern "C" void kartpad_prof_start_guest(void) {
+  const int menuSeconds = kartpad_perf_int("prof_menu_seconds", kDefaultMenuSeconds);
+  if (menuSeconds > 0) {
+    const int menuStart = kartpad_perf_int("prof_menu_start", 20);
+    g_menuStartNs = now_ns() + static_cast<u64>(menuStart > 0 ? menuStart : 0) * 1'000'000'000ull;
+    g_menuDurationNs = static_cast<u64>(menuSeconds) * 1'000'000'000ull;
+    g_menuPending = true;
+  }
   const int configuredHz = kartpad_perf_int("prof_hz", 750);
   const int hz = configuredHz > 0 ? configuredHz : 750;
   g_hz = static_cast<u32>(hz > 4000 ? 4000 : hz);

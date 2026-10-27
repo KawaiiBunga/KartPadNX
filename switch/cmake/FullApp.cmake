@@ -646,6 +646,11 @@ if(NOT KARTPAD_PROF_RACE_SECONDS STREQUAL "0")
     target_compile_definitions(kartpad_switch_shim PRIVATE KARTPAD_PROF_RACE_EVERY=1)
   endif()
 endif()
+# The menus too (prof-menu.bin, prof_switch.cpp): from 20 s after start until a race runs, at most this long.
+set(KARTPAD_PROF_MENU_SECONDS "0" CACHE STRING "Menu seconds a profiling build records by itself (0 = perf.cfg decides)")
+if(NOT KARTPAD_PROF_MENU_SECONDS STREQUAL "0")
+  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PROF_MENU_SECONDS=${KARTPAD_PROF_MENU_SECONDS}")
+endif()
 
 # AIO builder only (off by default): take the game-independent targets from prebuilt objects.
 # Last, so every target's settings are final when they are compared.

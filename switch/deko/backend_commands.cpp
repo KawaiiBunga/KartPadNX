@@ -11,6 +11,7 @@
 extern "C" void kartpad_deko_log_failure_context();
 // switch/src/transition_guard.cpp; weak, so builds without the game (renderer tests) link.
 extern "C" int kartpad_gpu_transition_guard(void) __attribute__((weak));
+extern "C" int kartpad_opt(const char *key, int fallback) __attribute__((weak));
 
 namespace kd {
 std::unordered_map<WGPUCommandEncoder, std::shared_ptr<Commands>> encoders;
@@ -151,6 +152,19 @@ void log_gpu_breadcrumbs() {
 #endif
 #ifdef COS_DK_GPU_FLUSHES
 uint32_t gpuOperationsPending = 0;
+// Outside course transitions, native submission works as without these diagnostics (candidate C,
+// docs/RR-PERFORMANCE-2026-10.md): the frame's own submits, no per-operation report and no pass,
+// copy or interval flush. Every recorded 2348-0006 timeout came in a Grand Prix course transition,
+// where the guard below makes each operation complete; v9's policy in steady state cost ~80 submits
+// and +3-6 ms of recording per present, and the game thread's GX wait rose from 6 to 45-230 ms/s.
+// It did not prevent the timeout either (test 6). perf.cfg `gpu_steady_v9 1` restores it everywhere.
+bool steady_v9() {
+  static const bool on = kartpad_opt && kartpad_opt("gpu_steady_v9", 0) != 0;
+  return on;
+}
+#ifdef COS_DK_GPU_BREADCRUMBS
+bool gpuOperationTracked = false;  // this operation's breadcrumb was begun (gpu_operation_begin)
+#endif
 // Course transitions: the guard (switch/src/transition_guard.cpp) is asked at most every 5 ms;
 // R.synchronous follows it.
 bool synchronous_operation() {
@@ -174,7 +188,11 @@ void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
     swdk::dklog("GPU checkpoint test v3: native API validation and timed per-operation fences enabled");
 #else
 #ifdef COS_DK_GPU_BREADCRUMBS
-    swdk::dklog("GPU progress test v9: GPU-written completion history; v8 pass/transfer flush policy; no CPU waits");
+    if (steady_v9())
+      swdk::dklog("GPU progress test v9: GPU-written completion history; v8 pass/transfer flush policy; no CPU waits");
+    else
+      swdk::dklog("GPU submission: native outside course transitions; in them each operation completes, with "
+                  "GPU-written completion history (perf.cfg gpu_steady_v9 1: v9 everywhere)");
 #else
     swdk::dklog("GPU transition test v8: pass/transfer flushes, at most %u draw operations; CPU waits disabled",
                unsigned(COS_DK_GPU_FLUSH_INTERVAL));
@@ -188,12 +206,15 @@ void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
   ++gpuOperationSerial;
   gpuRecent[gpuOperationSerial % gpuRecent.size()] = {name, gpuOperationSerial, {a, b, c}};
 #ifdef COS_DK_GPU_BREADCRUMBS
-  breadcrumb_begin();
+  // Steady state records no breadcrumb (its report is a GPU write and flush per operation); slots
+  // only ever hold completed transition operations, so breadcrumb_begin's reuse check still holds.
+  gpuOperationTracked = steady_v9() || synchronous_operation();
+  if (gpuOperationTracked) breadcrumb_begin();
 #endif
 }
 void gpu_operation_end(bool flushBoundary) {
 #ifdef COS_DK_GPU_BREADCRUMBS
-  breadcrumb_end();
+  if (gpuOperationTracked) breadcrumb_end();
 #endif
 #ifdef COS_DK_GPU_CHECKPOINTS
   (void)flushBoundary;
@@ -222,6 +243,7 @@ void gpu_operation_end(bool flushBoundary) {
     gpuProgressSerial = gpuOperationSerial;
     return;
   }
+  if (!steady_v9()) return;  // native: the frame's submits carry it
   // Diagnostic flush policy only; a small submitted batch can still time out.
   if (++gpuOperationsPending < COS_DK_GPU_FLUSH_INTERVAL && !flushBoundary)
     return;
@@ -248,6 +270,7 @@ void gpu_operation_image_copy(const Tex &source, const Tex &destination,
 void gpu_operation_queue_submitted() {
   // Submit the short tail too: a caller can enqueue fewer than the limit and
   // then wait for a map/readback before producing any further GPU operations.
+  if (!steady_v9() && !R.synchronous) return;  // native: no tail to flush (see steady_v9)
   std::lock_guard<std::mutex> lock(fence_mutex());
   dkQueueFlush(R.queue);
   gpuOperationsPending = 0;

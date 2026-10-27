@@ -18,7 +18,9 @@ constexpr uint32_t kRaceManager = 0x809BD730u;
 constexpr uint32_t kRaceFrameCounter = 0x20u;
 // A paused race: the counter stops. Race frames slower than this are rarer than 1 in 1,000.
 constexpr auto kStopped = std::chrono::milliseconds(200);
-constexpr auto kWindow = std::chrono::seconds(90);         // loading the next course takes 10-20 s
+// Loading the next course takes 10-20 s (13 s with the guard, test 7). After a Grand Prix's last race
+// the menus follow; every operation completing made them slow, so the window ends at 30 s, not 90.
+constexpr auto kWindow = std::chrono::seconds(30);
 }  // namespace
 
 // Called under the renderer's object lock (kd::mutex), from replay and present alike: the statics are

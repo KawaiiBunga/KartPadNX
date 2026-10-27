@@ -1,6 +1,7 @@
 #include "native_matrix_kernel.h"
 #include "memory_access.h"
 #include "isa/ppc_isa_context.h"
+#include <atomic>
 #include <cstring>
 
 namespace {
@@ -77,10 +78,17 @@ bool MkwTryNativeMatrixConcatArray(CpuContext* ctx) {
 }
 
 extern "C" int kartpad_opt(const char*, int) __attribute__((weak));
-// perf.cfg `native_mtx_concat` (default 1): 0 = translated PSMTXConcat/ConcatArray.
+// perf.cfg `native_mtx_concat` (default 1): 0 = translated PSMTXConcat/ConcatArray. Read once into a
+// plain relaxed cache, not a function-local static: its guard check (an acquire load) ran at every
+// PSMTXConcat, ~9% of this wrapper's samples. Threads racing the first read store the same value.
+static std::atomic<int> g_nativeConcat{-1};
 static bool NativeConcatEnabled() {
-    static const bool on = kartpad_opt == nullptr || kartpad_opt("native_mtx_concat", 1) != 0;
-    return on;
+    int on = g_nativeConcat.load(std::memory_order_relaxed);
+    if (on < 0) [[unlikely]] {
+        on = kartpad_opt == nullptr || kartpad_opt("native_mtx_concat", 1) != 0;
+        g_nativeConcat.store(on, std::memory_order_relaxed);
+    }
+    return on != 0;
 }
 
 extern "C" {

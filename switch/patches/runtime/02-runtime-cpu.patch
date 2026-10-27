@@ -54,7 +54,7 @@ diff --git a/runtime/src/recomp_mod_loader.cpp b/runtime/src/recomp_mod_loader.c
 diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 --- a/runtime/include/abi_bridge.h
 +++ b/runtime/include/abi_bridge.h
-@@ -1,801 +1,1141 @@
+@@ -1,801 +1,1144 @@
 -#pragma once
 -#include "memory.h"
 -#include "ppc_runtime.h"
@@ -1233,7 +1233,10 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +// `((a >> 2) * K) & mask` index only ever saw address bits 2..11, so two hot targets at the
 +// same offset in different 4 KiB guest pages evicted each other forever (0.5% of the guest
 +// thread sat in the miss path in a race). Must stay a power of two.
-+inline constexpr unsigned kIndirectDispatchCacheBits = 12;
++// 16K entries: Retro Rewind's overlays and hooks call more distinct targets than 4K direct-mapped
++// slots hold (test 11 race: the static-table search on memo misses was still 0.3% of the game
++// thread with the victim slot). Only the slots of called targets are ever touched.
++inline constexpr unsigned kIndirectDispatchCacheBits = 14;
 +inline constexpr size_t kIndirectDispatchCacheEntries = size_t{1} << kIndirectDispatchCacheBits;
 +
 +MKW_PPC_FORCE_INLINE size_t IndirectDispatchMemoIndex(uint32_t address) noexcept {
@@ -2474,7 +2477,21 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
 diff --git a/runtime/include/memory_access.h b/runtime/include/memory_access.h
 --- a/runtime/include/memory_access.h
 +++ b/runtime/include/memory_access.h
-@@ -116,13 +116,7 @@
+@@ -106,23 +106,17 @@
+     return addr >= 0xCC008000u && addr < 0xCC008100u;
+ }
+ 
+-// Page protections can't cover this: an MMIO write must reach GX HLE with its value or be
+-// reported, and a fault record can't carry the value, so this mask/compare sits in front of
+-// every flat store instead.
++// An MMIO write must reach GX HLE with its value or be reported (a fault can't carry it), so every flat store tests this. Bit 27: set across the MMIO window 0xCC000000..0xCDFFFFFF and clear in every mapped region (MEM1/MEM2 and mirrors, Kamek overlay 0x818,
++// locked cache 0xE00, memory.cpp); one `tbnz` instead of mask, compare and branch. Other bit-27 addresses are unmapped (a flat store there faults): the slow path's checked write reports them
++// instead. Ranges up to 1 MiB can't straddle a 128 MiB bit-27 block, so testing both ends still proves a range.
+ MKW_MEMORY_FORCE_INLINE bool FlatWriteNeedsPolicy(uint32_t address) {
+-    return (address & 0xFE000000u) == 0xCC000000u;  // 0xCC000000..0xCDFFFFFF
++    return (address & 0x08000000u) != 0;
+ }
+ 
  // Gekko stfs conversion is a bit-level narrowing operation.  In particular it
  // does not behave like a host double-to-float cast for values which were left
  // in double precision, and it has hardware-tested handling for tiny values.
