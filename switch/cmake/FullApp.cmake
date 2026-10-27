@@ -80,7 +80,11 @@ endif()
 message(STATUS "FullApp: ${MKW_BASE_FUNCTION_COUNT} base functions, "
         "${MKW_RETRO_REWIND_FUNCTION_COUNT} RR (${KARTPAD_PROFILE} profile)")
 
-set(_FP_OPTS -fno-fast-math -ffp-contract=off)
+# -fno-math-errno: with the default errno semantics clang may not treat fma() as its builtin, so the
+# runtime helpers' std::fma (fmadd/fmsub/fnmadd/fnmsub, ps_madd) was a call to newlib's
+# `fmadd d0, d0, d1, d2; ret`, clobbering every caller-saved FP register around it. Same result:
+# no translated code reads errno, and the instruction is what that call ran.
+set(_FP_OPTS -fno-fast-math -ffp-contract=off -fno-math-errno)
 
 # Lean codegen for the statically-recompiled guest code. The confirmed on-hardware
 # bottleneck is single-core instruction bloat + memory latency (GPU is idle,
@@ -386,7 +390,7 @@ set_source_files_properties("${CMAKE_SOURCE_DIR}/src/native_vector.cpp"
     "${CMAKE_SOURCE_DIR}/src/native_subsystems.cpp"
     "${CMAKE_SOURCE_DIR}/src/scalar_fp_cold.cpp"
     "${_NATIVE_SCENE_REGION}"
-    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-fno-math-errno")
 set_property(SOURCE "${_NATIVE_SCENE_REGION}" APPEND PROPERTY COMPILE_OPTIONS
     -fno-strict-aliasing -fno-slp-vectorize)
 option(KARTPAD_OUTLINE_SCALAR_FP "Share exceptional scalar FP paths in cold helpers" OFF)
@@ -405,6 +409,12 @@ if(KARTPAD_OUTLINE_SCALAR_FP)
 endif()
 option(KARTPAD_THINLTO_SHARDS "Optimize translated guest functions across shard boundaries" OFF)
 set(KARTPAD_THINLTO_JOBS "1" CACHE STRING "Maximum parallel ThinLTO backend jobs")
+# Import only small functions across shards (LLVM IR instructions; empty = LLVM's 100 with its 10x
+# hot and 100x critical multipliers). With the sample profile marking most translated call sites
+# hot, the default imported multi-thousand-instruction bodies, which turned saved frames into spills
+# (candidates F/G); a small limit with multipliers of 1 inlines the small callees whose call frame
+# is most of their cost.
+set(KARTPAD_THINLTO_IMPORT_LIMIT "" CACHE STRING "ThinLTO import-instr-limit (empty: LLVM default)")
 if(KARTPAD_THINLTO_SHARDS)
   if(NOT KARTPAD_THINLTO_JOBS MATCHES "^[1-9][0-9]*$")
     message(FATAL_ERROR "KARTPAD_THINLTO_JOBS must be a positive integer")
@@ -467,6 +477,12 @@ if(KARTPAD_THINLTO_SHARDS)
         "LINKER:--lto-O3"
         "LINKER:--plugin-opt=-vectorize-slp=false"
         "LINKER:--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    if(KARTPAD_THINLTO_IMPORT_LIMIT)
+      target_link_options(kartpad_full PRIVATE
+          "LINKER:--plugin-opt=-import-instr-limit=${KARTPAD_THINLTO_IMPORT_LIMIT}"
+          "LINKER:--plugin-opt=-import-hot-multiplier=1"
+          "LINKER:--plugin-opt=-import-critical-multiplier=1")
+    endif()
     if(KARTPAD_PGO_PROFILE)
       target_link_options(kartpad_full PRIVATE "LINKER:--lto-sample-profile=${KARTPAD_PGO_PROFILE}")
       if(KARTPAD_SPLIT_FUNCTIONS)

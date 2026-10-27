@@ -52,14 +52,16 @@ EXPECT_REL = '16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d'
 BASE_FUNCTION_COUNT = 29065
 ENTRY = '0x800060A4'
 TRANSFORM_PASSES = ('inject-scene-register-boundary', 'inject-archive-wait-checkpoint',
-                    'inject-archive-call-boundary', 'fix-rr-menu-model-flow', 'inject-globe-scene-boundary')
+                    'inject-archive-call-boundary', 'fix-rr-menu-model-flow', 'inject-globe-scene-boundary',
+                    'fix-rr-lr-skip-calls', 'inline-leaf-calls')
 FETCH_DEPS = ('fmt', 'imgui', 'sqlite3', 'tracy', 'xxhash', 'zstd')
 PROFILES = {
     'base': {'build': 'build/switch-fullapp', 'translation': 'private/self-build/translation',
              'app': 'KartPad-NX', 'nro': 'kartpad.nro', 'pgo': 'current', 'cpu_rewrites': False,
-             'variant': 'vanilla', 'payload': 'kartpad.nro.zst', 'pgo_renderer': False},
+             'variant': 'vanilla', 'payload': 'kartpad.nro.zst', 'pgo_renderer': True},
     # pgo_renderer: the profile was recorded with the current renderer sources (FullApp.cmake
-    # KARTPAD_PGO_RENDERER); Retro Rewind's h1-rr-2track is, vanilla's r39mix-race predates them.
+    # KARTPAD_PGO_RENDERER). Both are: vanilla's j1-vanilla is Retro Rewind's i1-rr-cup restricted to
+    # the runtime and the base functions that translate identically (private/perf/vanilla_profile.py).
     'retro-rewind': {'build': 'build/switch-fullapp-rr', 'translation': 'private/self-build/retro-rewind/translation',
                      'app': 'KartPad Retro Rewind', 'nro': 'kartpad-retro-rewind.nro', 'pgo': 'current-retro-rewind',
                      'cpu_rewrites': True, 'variant': 'rr', 'payload': 'kartpad-retro-rewind.nro.zst',
@@ -816,6 +818,15 @@ def translate_rr(run, jobs, spec):
         raise Failure('Retro Rewind translation is missing the mod graph')
 
 
+def pgo_name(ws, profile):
+    """The sample-PGO profile private/pgo/<marker> names for this game, falling back to
+    private/pgo/current; None without one."""
+    marker = ws / 'private/pgo' / PROFILES[profile]['pgo']
+    if not marker.is_file():
+        marker = ws / 'private/pgo/current'
+    return marker.read_text().strip() or None if marker.is_file() else None
+
+
 def transform(run, profile):
     p = PROFILES[profile]
     tr = run.ws / p['translation']
@@ -824,8 +835,13 @@ def transform(run, profile):
         ex = tr / 'nonvolatile_reload_exemptions.json'
         if ex.is_file():
             run.python('elide-redundant-flushes.py', tr / 'build_shards', '--exemptions', ex)
+    name = pgo_name(run.ws, profile)
+    order = run.ws / 'private/pgo' / (name + '.order.ld') if name else None
     for s in TRANSFORM_PASSES:
-        run.python(s + '.py', tr / 'build_shards')
+        if s == 'inline-leaf-calls' and order is not None and order.is_file():
+            run.python(s + '.py', tr / 'build_shards', '--hot-order', order)
+        else:
+            run.python(s + '.py', tr / 'build_shards')
     if p['cpu_rewrites']:
         # Last: the passes above match the translator's original access text.
         run.python('flat-guest-displacement.py', tr / 'build_shards')
@@ -858,11 +874,8 @@ def cmake_configure_cmd(run, profile, bdir, tr):
     p = PROFILES[profile]
     ws, t = run.ws, run.t
     pgo_args = []
-    marker = ws / 'private/pgo' / p['pgo']
-    if not marker.is_file():
-        marker = ws / 'private/pgo/current'
-    if marker.is_file() and marker.read_text().strip():
-        name = marker.read_text().strip()
+    name = pgo_name(ws, profile)
+    if name:
         pgo_args = [f'-DKARTPAD_PGO_PROFILE={fwd(ws / "private/pgo" / (name + ".extbin"))}',
                     f'-DKARTPAD_SECTION_ORDER={fwd(ws / "private/pgo" / (name + ".order.ld"))}',
                     '-DKARTPAD_PGO_ALL=ON', f'-DKARTPAD_PGO_RENDERER={"ON" if p["pgo_renderer"] else "OFF"}']

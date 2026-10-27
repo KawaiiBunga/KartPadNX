@@ -286,6 +286,10 @@ do_transform() {
   python3 "$repo/builder/inject-archive-call-boundary.py" "$translation_dir/build_shards"
   python3 "$repo/builder/fix-rr-menu-model-flow.py" "$translation_dir/build_shards"
   python3 "$repo/builder/inject-globe-scene-boundary.py" "$translation_dir/build_shards"
+  python3 "$repo/builder/fix-rr-lr-skip-calls.py" "$translation_dir/build_shards"
+  local hot_order=()
+  [[ -n "${KARTPAD_SECTION_ORDER:-}" && -f "$KARTPAD_SECTION_ORDER" ]] && hot_order=(--hot-order "$KARTPAD_SECTION_ORDER")
+  python3 "$repo/builder/inline-leaf-calls.py" "$translation_dir/build_shards" ${hot_order[@]+"${hot_order[@]}"}
   # CPU pass, last: the passes above match the translator's original access text.
   if [[ "${KARTPAD_CPU_REWRITES:-$cpu_rewrites_default}" == "1" ]]; then
     python3 "$repo/builder/flat-guest-displacement.py" "$translation_dir/build_shards"

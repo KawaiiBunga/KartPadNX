@@ -54,7 +54,7 @@ diff --git a/runtime/src/recomp_mod_loader.cpp b/runtime/src/recomp_mod_loader.c
 diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 --- a/runtime/include/abi_bridge.h
 +++ b/runtime/include/abi_bridge.h
-@@ -1,801 +1,1052 @@
+@@ -1,801 +1,1141 @@
 -#pragma once
 -#include "memory.h"
 -#include "ppc_runtime.h"
@@ -1311,10 +1311,42 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +
 +        auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(address)];
 +        if (cached.address == address) [[likely]] {
++            // Entries memoized while the indirect-call profiler or EABI check ran have no fast
++            // entry, which keeps every call on the checked slow path; give it back once both stop.
++            if (cached.fastEntry == nullptr && FastEntriesAllowed() && IsPlainRawDispatch(cached.record))
++                [[unlikely]] cached.fastEntry = cached.record->entry;
 +            return cached.record;
 +        }
 +
 +        return FindRawByAddressPtrMiss(address, cached);
++    }
++
++    // perf.cfg indirect_profile / eabi_verify (switch/src/perf_switch.cpp) need every indirect call
++    // on the slow path, so no memo entry gets a fast entry while either is on. They are switched
++    // on while perf.cfg is read at boot, before guest code runs and fills the memo.
++    static bool FastEntriesAllowed() noexcept {
++#if defined(__SWITCH__)
++        return kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) == 0;
++#else
++        return true;
++#endif
++    }
++
++    // The memo is direct-mapped, so two hot targets sharing a slot used to evict each other on every
++    // call, each miss a table search. A miss moves the displaced entry to the neighbouring slot
++    // (index ^ 1, its victim slot), and a primary miss that finds its target there swaps the two
++    // back. Returns the fast entry now in the primary slot, null if the victim slot does not hold
++    // `address` or the entry has none (the caller then takes the full path).
++    using RawEntry = void (*)(CpuContext*);
++    static MKW_PPC_NO_INLINE RawEntry PromoteVictim(uint32_t address) noexcept {
++        IndirectRawDispatchMemoEntry* memo = g_indirectRawDispatchMemo;
++        const size_t index = IndirectDispatchMemoIndex(address);
++        IndirectRawDispatchMemoEntry& victim = memo[index ^ 1u];
++        if (victim.address != address || victim.record == nullptr) return nullptr;
++        const IndirectRawDispatchMemoEntry promoted = victim;
++        victim = memo[index];
++        memo[index] = promoted;
++        return promoted.fastEntry;
 +    }
 +    // Look up a registered function by host (native) address.
 +    // This enables stack trace symbolication for translated functions.
@@ -1325,6 +1357,13 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    // registered records or a not-yet-published table fall through to the slow path.
 +    static MKW_PPC_NO_INLINE MKW_PPC_COLD const RawDispatchRecord* FindRawByAddressPtrMiss(
 +        uint32_t address, IndirectRawDispatchMemoEntry& cached) {
++        IndirectRawDispatchMemoEntry& victim = g_indirectRawDispatchMemo[(&cached - g_indirectRawDispatchMemo) ^ 1];
++        if (victim.address == address && victim.record != nullptr) {
++            const IndirectRawDispatchMemoEntry promoted = victim;
++            victim = cached;
++            cached = promoted;
++            return cached.record;
++        }
 +        const RawDispatchRecord* record = nullptr;
 +        if (const auto* table =
 +                g_publishedStaticIndirectDispatchTable.load(std::memory_order_acquire)) {
@@ -1333,7 +1372,8 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +        if (record == nullptr) {
 +            record = FindRawByAddressPtrSlow(address);
 +        }
-+        cached = {address, record, IsPlainRawDispatch(record) ? record->entry : nullptr};
++        if (cached.record != nullptr) victim = cached;  // see PromoteVictim
++        cached = {address, record, IsPlainRawDispatch(record) && FastEntriesAllowed() ? record->entry : nullptr};
 +        return record;
 +    }
 +
@@ -1498,7 +1538,7 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    static std::atomic<uint8_t> cachedVerdict{0};
 +    constexpr uint8_t kNegativeVerdict = 1;
 +    constexpr uint8_t kPositiveVerdict = 2;
-+    const uint8_t cached = cachedVerdict.load(std::memory_order_acquire);
++    const uint8_t cached = cachedVerdict.load(std::memory_order_relaxed);  // a verdict, nothing read through it
 +    if (cached != 0) {
 +        return cached == kPositiveVerdict;
 +    }
@@ -1535,14 +1575,28 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    return entry;
 +}
 +
++// Relaxed: the cached value is only ever called, and translated code is immutable, so nothing read
++// through it needs ordering (an acquire load is an `ldar` at every such call site).
 +template <uint32_t Target>
 +MKW_PPC_FORCE_INLINE DirectCpuRawInvoker ResolveDirectCpuFastEntry() {
 +    static std::atomic<uintptr_t> cachedEntry{0};
-+    const uintptr_t cached = cachedEntry.load(std::memory_order_acquire);
++    const uintptr_t cached = cachedEntry.load(std::memory_order_relaxed);
 +    if (cached > 1) [[likely]] {
 +        return reinterpret_cast<DirectCpuRawInvoker>(cached);
 +    }
 +    return cached == 0 ? ResolveDirectCpuFastEntrySlow<Target>(cachedEntry) : nullptr;
++}
++
++// InvokeDirectCpu's path for a target without a plain fast entry. Inline, its nonvolatile GPR/FPR
++// guards (save and restore copies), ScopedTranslatedExecutionAddress and CpuContextScope were
++// repeated at every call site whose target has no trait (~700 sites, e.g. RR overlays calling base
++// code; the translated code's memmove calls). Not cold: a target needing a guard comes here each call.
++template <uint32_t Target>
++MKW_PPC_NO_INLINE void InvokeDirectCpuResolved(CpuContext* cpu) {
++    if (TryDispatchResolvedCpuTarget(ResolveDirectCpuTargetInfoCached<Target>(), cpu)) {
++        return;
++    }
++    ReportMissingCpuTarget(Target, cpu);
 +}
 +
 +template <uint32_t Target>
@@ -1601,16 +1655,16 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +        return;
 +    }
 +
-+    const auto* registeredInfo = ResolveDirectCpuTargetInfoCached<Target>();
-+    if (TryDispatchResolvedCpuTarget(registeredInfo, cpu)) {
-+        return;
-+    }
-+
-+    ReportMissingCpuTarget(Target, cpu);
++    // Guards, context entry and the missing-target report, out of line once per target
++    // (InvokeDirectCpuResolved); these lines keep the inlined body's sample-PGO line offsets.
++    InvokeDirectCpuResolved<Target>(cpu);
++    //
++    //
++    //
 +}
 +
 +// Indirect jump (bctr without link) - used for switch tables.
-+MKW_PPC_NO_INLINE inline void InvokeIndirectJumpSlow(uint32_t target, CpuContext* ctx) {
++MKW_PPC_NO_INLINE inline void InvokeIndirectJumpResolve(uint32_t target, CpuContext* ctx) {
 +    // Use the caller's context, not the persistent global context!
 +    // This is essential for tail calls via bctr where the 'this' pointer (r3)
 +    // must be passed correctly to the target function.
@@ -1657,7 +1711,7 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    std::exit(EXIT_FAILURE);
 +}
 +
-+MKW_PPC_NO_INLINE inline void InvokeIndirectCpuSlow(uint32_t target, CpuContext* ctx) {
++MKW_PPC_NO_INLINE inline void InvokeIndirectCpuResolve(uint32_t target, CpuContext* ctx) {
 +    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
 +    if (target == 0) {
 +        ReportMissingCpuTarget(target, cpu);
@@ -1688,9 +1742,9 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr && TryGetCpuContext() == ctx)
 +        cached.fastEntry(ctx);
 +    else if (jump)
-+        InvokeIndirectJumpSlow(target, ctx);
++        InvokeIndirectJumpResolve(target, ctx);
 +    else
-+        InvokeIndirectCpuSlow(target, ctx);
++        InvokeIndirectCpuResolve(target, ctx);
 +    constexpr uint32_t kPreserved = (1u << 1) | (1u << 2) | 0xFFFFE000u;
 +    uint32_t changed = 0;
 +    for (int i = 0; i < 32; ++i)
@@ -1698,6 +1752,44 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    kartpad_eabi_record(target, returnAddress, changed, before, cpu->gpr);
 +}
 +#endif
++
++// The memo-miss paths of InvokeIndirectCpu/Jump. The indirect-call profiler and the EABI check
++// run here: while either is on, no memo entry has a fast entry (FastEntriesAllowed), so every
++// indirect call arrives here, and the inline fast path at ~14k call sites carries no check.
++MKW_PPC_NO_INLINE inline void InvokeIndirectCpuSlow(uint32_t target, CpuContext* ctx) {
++#if defined(__SWITCH__)
++    if (const int flags = kartpad_indirect_profile_enabled.load(std::memory_order_relaxed); flags != 0) [[unlikely]] {
++        if ((flags & 2) != 0) {
++            InvokeIndirectCpuEabiChecked(target, ctx);
++            return;
++        }
++        if ((++g_indirectProfileSampleCounter & 127u) == 0u)
++            kartpad_indirect_profile_record(ctx ? ctx->lr : 0u, target);
++    }
++#endif
++    // A target a slot conflict moved to its victim slot: the fast call, as InvokeIndirectCpu's.
++    if (const auto fast = TranslatedFunctionRegistry::PromoteVictim(target);
++        fast != nullptr && ctx != nullptr && TryGetCpuContext() == ctx) {
++        fast(ctx);
++        return;
++    }
++    InvokeIndirectCpuResolve(target, ctx);
++}
++
++MKW_PPC_NO_INLINE inline void InvokeIndirectJumpSlow(uint32_t target, CpuContext* ctx) {
++#if defined(__SWITCH__)
++    if ((kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) & 2) != 0) [[unlikely]] {
++        InvokeIndirectCpuEabiChecked(target, ctx, true);
++        return;
++    }
++#endif
++    if (const auto fast = TranslatedFunctionRegistry::PromoteVictim(target);
++        fast != nullptr && ctx != nullptr && TryGetCpuContext() == ctx) {
++        fast(ctx);
++        return;
++    }
++    InvokeIndirectJumpResolve(target, ctx);
++}
 +
 +// Every bctrl/bctr. The common case - a memoized plain target called from the context that is
 +// already current - is a probe and a direct branch, inlined so each call site gets its own
@@ -1707,12 +1799,12 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +// Skipped here versus the slow path: ScopedTranslatedExecutionAddress (diagnostic only, already
 +// skipped by all static translated calls) and the guards/options IsPlainRawDispatch excludes.
 +MKW_PPC_FORCE_INLINE void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
-+#if defined(__SWITCH__)
-+    if (__builtin_expect(kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) != 0, 0)) {
-+        if ((kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) & 2) != 0) { InvokeIndirectCpuEabiChecked(target, ctx); return; } else if ((++g_indirectProfileSampleCounter & 127u) == 0u)
-+            kartpad_indirect_profile_record(ctx ? ctx->lr : 0u, target);
-+    }
-+#endif
++    // The indirect-call profiler and the EABI check (perf.cfg) used to be tested here, a global
++    // load and a branch at every bctrl; they now run in InvokeIndirectCpuSlow, which every call
++    // reaches while one of them is on. These lines keep the body's line offsets, which sample
++    // PGO keys this inlined code by.
++    //
++    //
 +    const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
 +    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr &&
 +        TryGetCpuContext() == ctx) [[likely]] {
@@ -1722,12 +1814,9 @@ diff --git a/runtime/include/abi_bridge.h b/runtime/include/abi_bridge.h
 +    InvokeIndirectCpuSlow(target, ctx);
 +}
 +
-+// One line, so the inlined body keeps its line offsets for sample PGO.
-+#if defined(__SWITCH__)
-+#define MKW_EABI_VERIFY_JUMP(target, ctx) if ((kartpad_indirect_profile_enabled.load(std::memory_order_relaxed) & 2) != 0) { InvokeIndirectCpuEabiChecked(target, ctx, true); return; }
-+#else
++// The EABI check for tail jumps runs in InvokeIndirectJumpSlow (see InvokeIndirectCpu); the empty
++// macro keeps InvokeIndirectJump's inlined line offsets for sample PGO.
 +#define MKW_EABI_VERIFY_JUMP(target, ctx)
-+#endif
 +MKW_PPC_FORCE_INLINE void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
 +    MKW_EABI_VERIFY_JUMP(target, ctx) const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
 +    if (cached.address == target && cached.fastEntry != nullptr && ctx != nullptr &&
@@ -2204,8 +2293,47 @@ diff --git a/runtime/include/isa/ppc_isa_float.h b/runtime/include/isa/ppc_isa_f
 diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_isa_quantized.h
 --- a/runtime/include/isa/ppc_isa_quantized.h
 +++ b/runtime/include/isa/ppc_isa_quantized.h
-@@ -300,7 +300,9 @@
- #endif
+@@ -265,17 +265,11 @@
+ // The flat reservation makes every 32-bit guest address a host address; a pending-deferred
+ // (EFB) page is PAGE_NOACCESS so the load faults through the vectored handler instead of
+ // reading stale bytes, and unmapped pages commit on demand, same as MemoryInline::Flat* loads.
++// On Switch too: like its scalar Flat* loads, which never consult the page-bias tables (no guest
++// code registers a deferred read there, and guest_flat_memory_switch.cpp installs no protection).
+ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
+ {
+-#if defined(__SWITCH__)
+-    // The published proof covers this page and seven bytes of its successor,
+-    // including deferred reads and guest aliases. A miss keeps the original
+-    // checked read, which materializes deferred content before accessing it.
+-    const uintptr_t bias = MemoryInline::g_scalarReadablePageBias[addr >> MemoryInline::kPageShift];
+-    return bias ? reinterpret_cast<const uint8_t*>((bias - 1u) + addr) : nullptr;
+-#else
+     return MKW_FLAT_GUEST_BASE + addr;
+-#endif
+ }
+ 
+ // Same reduction for stores. Still refuses a 32-bit address wrap (one host access can't
+@@ -283,24 +277,21 @@
+ // stored value and a null result must preserve the cold GX FIFO dispatch path byte for byte.
+ // The old 1 MiB page-cross refusal is gone since the whole 4 GiB is now contiguous; deferred,
+ // executable, and unmapped pages still trap.
++// On Switch the same as the scalar FlatWrite* stores: a table lookup per psq_st bought nothing
++// there (executable-range protection is a no-op, guest_flat_memory_switch.cpp).
+ MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
+ {
+-#if defined(__SWITCH__)
+-    const uintptr_t bias = MemoryInline::g_scalarWritablePageBias[addr >> MemoryInline::kPageShift];
+-    if (bias) return reinterpret_cast<uint8_t*>((bias - 1u) + addr);
+-    uint8_t* host = nullptr;
+-    return MemoryInline::TryGetWritablePointerFast(addr, 8, host) ? host : nullptr;
+-#else
+     if (addr > UINT32_MAX - 7u) [[unlikely]]
+         return nullptr;
+     if (MemoryInline::FlatWriteNeedsPolicy(addr) ||
+         MemoryInline::FlatWriteNeedsPolicy(addr + 7u)) [[unlikely]]
+         return nullptr;
+     return MKW_FLAT_GUEST_BASE + addr;
+-#endif
  }
  
 -inline double PpcLoadPairPsqFloatFastInline(uint32_t addr)
@@ -2215,7 +2343,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
  {
      const uint8_t* host = PpcTryGetPsqReadableHostInline(addr);
      if (host != nullptr) [[likely]]
-@@ -311,7 +313,7 @@
+@@ -311,7 +302,7 @@
          PpcLoadPairPsqFloatBitsPackedInline(MemoryInline::Read64Slow(addr)));
  }
  
@@ -2224,7 +2352,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
  {
      const uint32_t raw = PpcReadUnpairedPsqInline<uint32_t>(addr);
      return PpcMakePairedResultInline(
-@@ -355,7 +357,7 @@
+@@ -355,7 +346,7 @@
          1.0f).d;
  }
  
@@ -2233,7 +2361,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
  {
      uint8_t* host = PpcTryGetPsqWritableHostInline(addr);
      if (host != nullptr) [[likely]]
-@@ -485,7 +487,7 @@
+@@ -485,7 +476,7 @@
      }
  }
  
@@ -2242,7 +2370,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
  {
      const uint32_t first = PpcConvertToSingleFTZInline(
          PpcBitCastToU64Inline(static_cast<double>(PpcGetPs0Inline(value))));
-@@ -620,15 +622,15 @@
+@@ -620,15 +611,15 @@
  {
      if constexpr (sizeof(T) == 1)
      {
@@ -2261,7 +2389,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
      }
  }
  
-@@ -637,15 +639,15 @@
+@@ -637,15 +628,15 @@
  {
      if constexpr (sizeof(T) == 1)
      {
@@ -2280,7 +2408,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
      }
  }
  
-@@ -655,24 +657,24 @@
+@@ -655,24 +646,24 @@
      if constexpr (sizeof(T) == 1)
      {
          const uint16_t packed = (static_cast<uint16_t>(first) << 8) | static_cast<uint16_t>(second);
@@ -2309,7 +2437,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
  #else
      // MemoryInline::ReadStack64's exact proof (TryGetPointerFast), then the
      // same Memory::Read64 fallback it uses on a miss.
-@@ -694,21 +696,21 @@
+@@ -694,21 +685,21 @@
  {
      if constexpr (sizeof(ValueType) == 1)
      {
@@ -2334,7 +2462,7 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
          return PpcMakePairedResultInline(
              PpcDequantizePsqInline(static_cast<ValueType>(packed >> 32), scale),
              PpcDequantizePsqInline(static_cast<ValueType>(packed), scale)).d;
-@@ -728,7 +730,7 @@
+@@ -728,7 +719,7 @@
  inline void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
  {
  #if defined(__SWITCH__)
@@ -2346,7 +2474,74 @@ diff --git a/runtime/include/isa/ppc_isa_quantized.h b/runtime/include/isa/ppc_i
 diff --git a/runtime/include/memory_access.h b/runtime/include/memory_access.h
 --- a/runtime/include/memory_access.h
 +++ b/runtime/include/memory_access.h
-@@ -635,6 +635,93 @@
+@@ -116,13 +116,7 @@
+ // Gekko stfs conversion is a bit-level narrowing operation.  In particular it
+ // does not behave like a host double-to-float cast for values which were left
+ // in double precision, and it has hardware-tested handling for tiny values.
+-MKW_MEMORY_FORCE_INLINE uint32_t ConvertPpcDoubleToSingleBits(double value) {
+-#if defined(__has_builtin) && __has_builtin(__builtin_bit_cast)
+-    const uint64_t bits = __builtin_bit_cast(uint64_t, value);
+-#else
+-    uint64_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-#endif
++MKW_MEMORY_FORCE_INLINE uint32_t NarrowPpcDoubleToSingleBits(uint64_t bits) {
+     const uint32_t exponent = static_cast<uint32_t>((bits >> 52) & 0x7FFu);
+     // The subnormal-single arm applies to exactly the exponents 874..896; every
+     // other exponent takes the plain sign/exponent/fraction narrowing below.
+@@ -144,6 +138,51 @@
+         ((bits >> 32) & 0xC0000000ULL) | ((bits >> 29) & 0x3FFFFFFFULL));
+ }
+ 
++MKW_MEMORY_FORCE_INLINE uint64_t PpcDoubleBits(double value) {
++#if defined(__has_builtin) && __has_builtin(__builtin_bit_cast)
++    return __builtin_bit_cast(uint64_t, value);
++#else
++    uint64_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++#endif
++}
++
++// Out of line and cold so clang keeps the stfs fast path a branch instead of computing both arms;
++// preserve_all leaves the caller's FP and x9-x15 registers live across the rare call.
++#if defined(__clang__) && defined(__aarch64__)
++__attribute__((noinline, cold, preserve_all))
++#else
++MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD
++#endif
++inline uint32_t NarrowPpcDoubleToSingleBitsSlow(double value) {
++    return NarrowPpcDoubleToSingleBits(PpcDoubleBits(value));
++}
++
++MKW_MEMORY_FORCE_INLINE uint32_t ConvertPpcDoubleToSingleBits(double value) {
++    const uint64_t bits = PpcDoubleBits(value);
++#if defined(__FAST_MATH__)
++    return NarrowPpcDoubleToSingleBits(bits);
++#else
++    // A double that is exactly a single (every single-precision result, every lfs) narrows to that
++    // single's bits, which is what the bit-level narrowing gives for it in any rounding or flush
++    // mode; a value that rounds, flushes or has its NaN quieted round-trips to other bits and takes
++    // the bit-level path. Clang folds fptrunc(fpext x) to x, so storing a single-precision result
++    // is one fmov (not 15 integer instructions), and an lfs/stfs pair is a word copy.
++    const float single = static_cast<float>(value);
++    if (PpcDoubleBits(static_cast<double>(single)) == bits) [[likely]] {
++#if defined(__has_builtin) && __has_builtin(__builtin_bit_cast)
++        return __builtin_bit_cast(uint32_t, single);
++#else
++        uint32_t narrowed = 0;
++        std::memcpy(&narrowed, &single, sizeof(narrowed));
++        return narrowed;
++#endif
++    }
++    return NarrowPpcDoubleToSingleBitsSlow(value);
++#endif
++}
++
+ MKW_MEMORY_FORCE_INLINE float PpcSingleBitsToFloat(uint32_t bits) {
+ #if defined(__has_builtin) && __has_builtin(__builtin_bit_cast)
+     return __builtin_bit_cast(float, bits);
+@@ -635,6 +674,93 @@
      FlatStore<uint64_t>(address, bits);
  }
  
@@ -2517,7 +2712,7 @@ diff --git a/runtime/include/native_cpu_calls.inc b/runtime/include/native_cpu_c
 diff --git a/runtime/include/ppc_runtime.h b/runtime/include/ppc_runtime.h
 --- a/runtime/include/ppc_runtime.h
 +++ b/runtime/include/ppc_runtime.h
-@@ -12,154 +12,276 @@
+@@ -12,154 +12,293 @@
  #include "isa/ppc_isa_int.h"
  #include "isa/ppc_isa_float.h"
  #include "isa/ppc_isa_quantized.h"
@@ -2927,8 +3122,25 @@ diff --git a/runtime/include/ppc_runtime.h b/runtime/include/ppc_runtime.h
 +    return PpcCommitScalarFpInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, false, false, false));
 +#endif
 +}
-+inline bool PpcFnmsubStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, false, true)); }
-+inline bool PpcFnmsubsStateInline(double& d, double a, double c, double b) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, true, true)); }
++// fnmsub(s): the reference's value without its FPSR reads around the fma (mrs/msr fpsr per op, which
++// the compiler cannot drop). With no FPSCR state kept and no exception enable set, the reference
++// writes exactly this value in the host's round-to-nearest (private/perf/fnmsub_equiv.cpp). A NaN
++// result (quieted, not negated) and enabled exceptions still go to the reference.
++inline bool PpcFnmsubReferenceInline(CpuContext* cpu, double& d, double a, double c, double b, bool single) {
++#if !KARTPAD_SCALAR_FP_EXCEPTIONS
++    namespace sem = kartpad::semantics;
++    if ((cpu->fpscr & sem::fpscr::ANY_E) == 0) [[likely]] {
++        const double v = std::fma(a, single ? sem::Force25Bit(c) : c, -b);
++        if (!std::isnan(v)) [[likely]] {
++            d = single ? static_cast<double>(sem::ForceSingle(-v, (cpu->fpscr & sem::fpscr::NI) != 0)) : -v;
++            return true;
++        }
++    }
++#endif
++    return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcFused(cpu->fpscr, a, c, b, true, single, true));
++}
++inline bool PpcFnmsubStateInline(double& d, double a, double c, double b) { return PpcFnmsubReferenceInline(CurrentCpuContext(), d, a, c, b, false); }
++inline bool PpcFnmsubsStateInline(double& d, double a, double c, double b) { return PpcFnmsubReferenceInline(CurrentCpuContext(), d, a, c, b, true); }
 +inline bool PpcFrsqrteStateInline(double& d, double value) { CpuContext* cpu = CurrentCpuContext(); return PpcCommitScalarFpValueInline(cpu, d, kartpad::semantics::EvaluatePpcEstimate(cpu->fpscr, value, true)); }
 +
 +inline double PpcFresValueStateInline(double current, double value)
