@@ -17,6 +17,7 @@ enum kartpad_thread_role {
   KARTPAD_ROLE_GX_WORKER,     // Aurora GX decode worker (perf.cfg gx_thread); Aurora passes 6
   KARTPAD_ROLE_GX_HLE,        // GX HLE thread (perf.cfg gx_hle_thread); runtime passes 7
   KARTPAD_ROLE_SND_GUEST,     // hosted guest sound thread (perf.cfg snd_host_thread); runtime passes 8
+  KARTPAD_ROLE_VIDEO_DECODE,  // THP movie frame decoder (thp_video_hle.cpp)
   KARTPAD_ROLE_COUNT
 };
 

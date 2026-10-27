@@ -6596,7 +6596,7 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
  
  extern "C" void GX__SetDrawSync_8016ed08(uint32_t token) {
      (void)token;
-@@ -36,15 +48,47 @@
+@@ -36,15 +48,80 @@
  }
  PPC_NATIVE_OVERRIDE_VOID(8016ed94, GX__FinishInterruptHandler_8016ed94, (), ());
  
@@ -6606,22 +6606,53 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
 +#include <atomic>
 +extern std::atomic<bool> g_drawdone_deferred;
 +
++// A caller whose GXDrawDone another wait stands in for (thp_video_hle.cpp: the movie draw, whose
++// texture set the decoder writes only after a later full wait): nonzero skips the wait.
++extern "C" int kartpad_gx_drawdone_skip(void) __attribute__((weak));
++
++namespace {
++// With the GX decode worker (perf.cfg gx_thread, default 1), the guest's GXDrawDone waits for every
++// queued command to be decoded, as hardware waits for the GPU. gx_thread 2 skips the wait.
++int DrawDoneGxThread() {
++    static const int gxThread = kartpad_opt ? kartpad_opt("gx_thread", 1) : 0;
++    return gxThread;
++}
++void RunDrawDone() {
++    GXDrawDone();
++    if (DrawDoneGxThread() == 1 && aurora_gx_worker_sync) aurora_gx_worker_sync();
++}
++// Full GXDrawDone waits completed: once one has finished after some point, every GX command queued
++// before that point has been executed and decoded.
++std::atomic<uint64_t> g_drawDonesCompleted{0};
++}  // namespace
++
++extern "C" uint64_t GX_HLE_DrawDonesCompleted() { return g_drawDonesCompleted.load(std::memory_order_acquire); }
++
++// GXDrawDone's wait without its guest-visible flag writes.
++extern "C" void GX_HLE_WaitDrawn() {
++    if (GxHle::Deferring()) {
++        GxHle::Submit([] { RunDrawDone(); });
++        GxHle::Sync(GxHle::kSyncDrawDone);
++    } else {
++        RunDrawDone();
++    }
++    g_drawDonesCompleted.fetch_add(1, std::memory_order_release);
++}
++
  extern "C" void GX__DrawDone_8016eab0() {
      try { Memory::Write8(kGxDrawDoneFlagAddr, 0); } catch (...) {}
 -    GXDrawDone(); GX__FinishInterruptHandler_8016ed94();
-+    // With the GX decode worker (perf.cfg gx_thread, default 1), the guest's GXDrawDone waits for every
-+    // queued command to be decoded, as hardware waits for the GPU. gx_thread 2 skips the wait.
-+    static const int gxThread = kartpad_opt ? kartpad_opt("gx_thread", 1) : 0;
++    DrawDoneGxThread();
 +    // With the GX HLE thread both waits run there and the guest waits for that thread, so guest
 +    // memory the GPU reads is stable from here on exactly as before. perf.cfg
 +    // `gx_hle_drawdone_wait 0` (experiment only) queues the call without waiting.
 +    static const int hleWait = kartpad_opt ? kartpad_opt("gx_hle_drawdone_wait", 1) : 1;
 +    static const int defer = kartpad_opt ? kartpad_opt("gxh_drawdone_defer", 0) : 0;
-+    auto drawDone = [] {
-+        GXDrawDone();
-+        if (gxThread == 1 && aurora_gx_worker_sync) aurora_gx_worker_sync();
-+    };
-+    if (GxHle::Deferring() && hleWait == 0) {
++    auto drawDone = [] { RunDrawDone(); };
++    if (GxHle::Deferring() && kartpad_gx_drawdone_skip && kartpad_gx_drawdone_skip()) {
++        // Queued in order without the worker wait (its GXDrawDone still drains the FIFO).
++        GxHle::Submit([] { GXDrawDone(); });
++    } else if (GxHle::Deferring() && hleWait == 0) {
 +        GxHle::Submit(drawDone);
 +    } else if (GxHle::Deferring() && defer != 0) {
 +        GxHle::Submit(drawDone);
@@ -6632,8 +6663,10 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
 +        // vertex layout: same queue position and wait, shadow kept (gx_vertex.cpp tracking).
 +        GxHle::Submit(drawDone);
 +        GxHle::Sync(GxHle::kSyncDrawDone);
++        g_drawDonesCompleted.fetch_add(1, std::memory_order_release);
 +    } else {
 +        drawDone();
++        g_drawDonesCompleted.fetch_add(1, std::memory_order_release);
 +    }
 +    GX__FinishInterruptHandler_8016ed94();
  }
@@ -6646,7 +6679,7 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
  }
  PPC_NATIVE_OVERRIDE_VOID(8016eb70, GX__PixModeSync_8016eb70, (), ());
  
-@@ -60,7 +104,7 @@
+@@ -60,7 +137,7 @@
  // ============================================================================
  
  extern "C" void __GX__SetSUTexRegs_801712f0() {
@@ -6655,7 +6688,7 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
      try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {}
  }
  PPC_NATIVE_OVERRIDE_VOID(801712f0, __GX__SetSUTexRegs_801712f0, (), ());
-@@ -82,7 +126,7 @@
+@@ -82,7 +159,7 @@
  // ============================================================================
  
  extern "C" void GX__SetDispCopyFrame2Field_8016f5f8(uint32_t f) {
@@ -6664,7 +6697,7 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
      try {
          const uint32_t gd = Memory::Read32(kGXDataPtrAddr);
          if (gd) {
-@@ -94,7 +138,7 @@
+@@ -94,7 +171,7 @@
  PPC_NATIVE_OVERRIDE_VOID(8016f5f8, GX__SetDispCopyFrame2Field_8016f5f8, (uint32_t f), (f));
  
  extern "C" void GX__SetCopyClamp_8016f618(uint32_t c) {
@@ -6673,7 +6706,7 @@ diff --git a/runtime/src/hle/gx/gx_stubs.cpp b/runtime/src/hle/gx/gx_stubs.cpp
      try {
          const uint32_t gd = Memory::Read32(kGXDataPtrAddr);
          if (gd) {
-@@ -107,7 +151,7 @@
+@@ -107,7 +184,7 @@
  PPC_NATIVE_OVERRIDE_VOID(8016f618, GX__SetCopyClamp_8016f618, (uint32_t c), (c));
  
  extern "C" void GX__ClearBoundingBox_8016fecc() {

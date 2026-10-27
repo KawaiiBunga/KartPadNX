@@ -1818,17 +1818,32 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
  
    u32 vtxSize;
    if (g_gxState.lastVtxFmt == fmt) LIKELY {
-@@ -2116,6 +2200,18 @@
+@@ -2116,6 +2200,33 @@
    return true;
  }
  
++// perf.cfg ztex_skip (bit 0, default 1) / dsta_skip (bit 1, default 0), read once into a relaxed
++// cache: as function-local statics they put two guard checks (acquire loads) in front of every draw
++// (test 12 race: 8% of fifo::process). Threads racing the first read store the same value.
++static std::atomic<int> sDrawSkipPolicy{-1};
++static inline int draw_skip_policy() {
++  int policy = sDrawSkipPolicy.load(std::memory_order_relaxed);
++  if (policy < 0) UNLIKELY {
++    const int ztex = kartpad_opt != nullptr ? kartpad_opt("ztex_skip", 1) : 1;
++    const int dsta = kartpad_opt != nullptr ? kartpad_opt("dsta_skip", 0) : 0;
++    policy = (ztex != 0 ? 1 : 0) | (dsta != 0 ? 2 : 0);
++    sDrawSkipPolicy.store(policy, std::memory_order_relaxed);
++  }
++  return policy;
++}
++
 +static bool draw_is_invisible(GXPrimitive prim, u16 count) {
 +  if (count == 0) return true;
 +  if (g_gxState.cullMode == GX_CULL_ALL && prim != GX_LINES &&
 +      prim != GX_LINESTRIP && prim != GX_POINTS) return true;
 +  // Same accepted diagnostic policies as handle_draw_unmerged; evaluate once here.
-+  static const int skipZtex = kartpad_opt != nullptr ? kartpad_opt("ztex_skip", 1) : 1;
-+  static const int skipDstA = kartpad_opt != nullptr ? kartpad_opt("dsta_skip", 0) : 0;
++  const int skipZtex = draw_skip_policy() & 1;
++  const int skipDstA = draw_skip_policy() & 2;
 +  return (skipZtex != 0 && g_gxState.zTextureOp != GX_ZT_DISABLE) ||
 +         (skipDstA != 0 && g_gxState.blendMode == GX_BM_BLEND &&
 +          g_gxState.blendFacSrc == GX_BL_DSTALPHA);
@@ -1837,7 +1852,7 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
  static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
    ZoneScoped;
    GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
-@@ -2141,6 +2237,12 @@
+@@ -2141,6 +2252,12 @@
    }
  
  
@@ -1850,7 +1865,7 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
    // Push raw vertex data to buffer
    const uint8_t* vertices = data + pos;
    gfx::Range vertRange = gfx::push_verts(vertices, totalVtxBytes);
-@@ -2151,11 +2253,13 @@
+@@ -2151,11 +2268,13 @@
      auto* lastDraw = gfx::get_last_draw_command<DrawData>();
      // Only if the previous draw call was a single instance draw (no lines/points handling)
      if (lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
@@ -1867,7 +1882,7 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
        CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
              "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
              vertRange.offset);
-@@ -2191,12 +2295,45 @@
+@@ -2191,12 +2310,45 @@
                                   HashType matrixTopologySignature,
                                   HashType geometrySignature, bool interpolationIdentityActive) {
    ZoneScoped;
@@ -1901,8 +1916,8 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
 +    // perf.cfg diagnostics (Time Trial overlay): drop z-texture draws / dst-alpha blended draws.
 +    // Default on: the Time Trial screen-restore draw (z-texture REPLACE) otherwise darkens the scene
 +    // and hides the HUD (hardware run rr17). `ztex_skip 0` brings the draw back for diagnosis.
-+    static const int skipZtex = kartpad_opt != nullptr ? kartpad_opt("ztex_skip", 1) : 1;
-+    static const int skipDstA = kartpad_opt != nullptr ? kartpad_opt("dsta_skip", 0) : 0;
++    const int skipZtex = draw_skip_policy() & 1;  // see draw_skip_policy
++    const int skipDstA = draw_skip_policy() & 2;
 +    if (skipZtex != 0 && g_gxState.zTextureOp != GX_ZT_DISABLE) UNLIKELY {
 +      return;
 +    }
@@ -1913,7 +1928,7 @@ diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/comma
    // Callers hold the renderer GPU mutex for the whole drain (process() and submit_raw_draw); taking it again per draw only cost a recursive re-entry.
    const auto& indexTemplate = cached_index_template(prim, vtxCount);
    const u32 numIndices = indexTemplate.indexCount;
-@@ -2223,6 +2360,17 @@
+@@ -2223,6 +2375,17 @@
    const auto& info = pipelineState.shaderInfo;
  
    resolve_sampled_textures(info);
@@ -7422,28 +7437,27 @@ diff --git a/aurora-main/lib/gx/pipeline.cpp b/aurora-main/lib/gx/pipeline.cpp
 +      mEntry->ready.notify_all();
      }
    }
+-
+-  auto module = build_shader(config);
+-  {
 +  // The last user removes the entry; the module itself is released after the lock, with mEntry.
 +  ~ShaderModuleUse() {
-+    std::lock_guard lock{sShaderModuleCacheMutex};
+     std::lock_guard lock{sShaderModuleCacheMutex};
+-    entry->module = module;
+-    entry->compiling = false;
 +    if (--mEntry->users == 0) {
 +      const auto it = sShaderModuleCache.find(mConfig);
 +      if (it != sShaderModuleCache.end() && it->second == mEntry) {
 +        sShaderModuleCache.erase(it);
 +      }
 +    }
-+  }
-+  ShaderModuleUse(const ShaderModuleUse&) = delete;
-+  ShaderModuleUse& operator=(const ShaderModuleUse&) = delete;
- 
--  auto module = build_shader(config);
--  {
--    std::lock_guard lock{sShaderModuleCacheMutex};
--    entry->module = module;
--    entry->compiling = false;
--  }
+   }
 -  entry->ready.notify_all();
 -  return module;
 -}
++  ShaderModuleUse(const ShaderModuleUse&) = delete;
++  ShaderModuleUse& operator=(const ShaderModuleUse&) = delete;
++
 +  const wgpu::ShaderModule& module() const { return mEntry->module; }
 +
 +private:

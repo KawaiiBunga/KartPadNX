@@ -6,7 +6,7 @@ set(KARTPAD_GUEST_WRAP_SYMBOLS
     func_80062C50 func_80064FD0
     func_80035340 func_800353B0 func_800365D0 func_80041D10
     func_807BE030 func_80199D30 func_8006E6F0 func_80052FD0 func_8006D6E0
-    func_80055540)
+    func_80055540 func_805FBB60)
 
 # NintendoSwitch is a custom platform, but its GCC/binutils linker supports
 # archive rescanning. Aurora and the static driver have cyclic references.

@@ -226,6 +226,7 @@ const char* role_name(int role) {
 
     case KARTPAD_ROLE_GX_HLE: return "gx_hle";
     case KARTPAD_ROLE_SND_GUEST: return "snd_guest";
+    case KARTPAD_ROLE_VIDEO_DECODE: return "video_decode";
     default: return "default";
   }
 }
@@ -485,6 +486,9 @@ extern "C" int kartpad_thread_priority(int role, int fallback) {
     // sections and AX callbacks, and the game core waits whenever it needs the lock then. At 0x2D
     // (b70) the workers preempted it mid-hold: il guest rose to 26-66 ms/s. perf.cfg snd_prio.
     case KARTPAD_ROLE_SND_GUEST: return kartpad_perf_int("snd_prio", 0x28);
+    // Below the GX and audio threads it shares the worker cores with; the guest's video thread is
+    // parked while it decodes, so a slow frame never stalls the game.
+    case KARTPAD_ROLE_VIDEO_DECODE: return 0x2D;
     default: return fallback;
   }
 }

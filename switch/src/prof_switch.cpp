@@ -264,7 +264,7 @@ u64 anchor_address() { return reinterpret_cast<u64>(&kartpad_prof_anchor); }
 }
 
 // A profiling build (FullApp.cmake KARTPAD_PROF_RACE_SECONDS) records its first race seconds without
-// a perf.cfg, sampling every thread that runs game, GX, audio or renderer code (roles 1, 4, 6, 7, 8).
+// a perf.cfg, sampling every thread that runs game, GX, audio, movie or renderer code (roles 1, 4, 6-9).
 // KARTPAD_PROF_RACE_START (perf.cfg prof_race_start) delays that capture by a number of race
 // seconds, so a test session's first race runs unprofiled and stays comparable with
 // unprofiled builds while a later race is recorded.
@@ -277,7 +277,7 @@ constexpr int kDefaultRaceStart = 0;
 constexpr int kDefaultRaceSeconds = KARTPAD_PROF_RACE_SECONDS;
 constexpr int kDefaultRoles = (1 << KARTPAD_ROLE_FRAME_WORKER) | (1 << KARTPAD_ROLE_AUDIO_MIX) |
                               (1 << KARTPAD_ROLE_GX_WORKER) | (1 << KARTPAD_ROLE_GX_HLE) |
-                              (1 << KARTPAD_ROLE_SND_GUEST);
+                              (1 << KARTPAD_ROLE_SND_GUEST) | (1 << KARTPAD_ROLE_VIDEO_DECODE);
 #else
 constexpr int kDefaultRaceSeconds = 0;
 constexpr int kDefaultRoles = 192;

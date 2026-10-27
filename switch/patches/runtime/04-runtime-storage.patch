@@ -5767,7 +5767,7 @@ diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contra
  #include <utility>
  #include <vector>
  
-@@ -335,4 +342,409 @@
+@@ -335,4 +342,434 @@
      return true;
  }
  
@@ -5849,8 +5849,17 @@ diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contra
 +// block stays valid; a request that is not wholly inside a finished or in-flight block takes the
 +// normal synchronous path, so a wrong guess only costs one wasted background read.
 +// Only the game thread calls Take/Queue; the read-ahead thread only fills blocks.
++// A stream's reads need not repeat one length: a THP movie reads each frame with the size its
++// predecessor's header gave, so a block of the last read's length missed whenever a frame grew
++// (test 13's movie menu: 40 of 64 reads a second read synchronously, 160 ms/s of the guest core).
++// A block holds several reads (ReadAheadSpan), and the next is queued while the current one still
++// holds the next two reads.
 +constexpr uint32_t kReadAheadMaxBytes = 512u * 1024u;
-+constexpr size_t kReadAheadBlocks = 4;
++constexpr size_t kReadAheadBlocks = 6;
++
++inline uint32_t ReadAheadSpan(uint32_t length) {
++    return std::min<uint32_t>(kReadAheadMaxBytes, std::max<uint32_t>(length * 4u, 128u * 1024u));
++}
 +
 +inline bool ReadAheadEnabled() {
 +    static const bool enabled =
@@ -5947,6 +5956,24 @@ diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contra
 +            }
 +        }
 +        m_cv.notify_all();
++    }
++
++    // Keeps a stream whose last read was `length` bytes ahead: unless a block already holds the
++    // next two such reads from `next`, queues one of ReadAheadSpan(length) from there (clamped to
++    // the file, so a stream's tail is not fetched again at every read).
++    void QueueStream(const std::string& path, uint64_t next, uint32_t length, uint64_t fileSize) {
++        if (length == 0 || length > kReadAheadMaxBytes || next >= fileSize) {
++            return;
++        }
++        const uint64_t left = fileSize - next;
++        const uint32_t lookahead = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{length} * 2u, left));
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (Find(path, next, std::min(lookahead, kReadAheadMaxBytes)) != nullptr) {
++                return;
++            }
++        }
++        Queue(path, next, static_cast<uint32_t>(std::min<uint64_t>(ReadAheadSpan(length), left)));
 +    }
 +
 +private:
@@ -6089,10 +6116,8 @@ diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contra
 +    if (ReadAheadEnabled() && length != 0) {
 +        uint64_t fileSize = 0;
 +        if (ReadAhead::Instance().Take(hostPath, offset, length, destination, fileSize)) {
-+            // Keep the stream one block ahead.
-+            if (offset + length < fileSize) {
-+                ReadAhead::Instance().Queue(hostPath, offset + length, length);
-+            }
++            // Keep the stream ahead.
++            ReadAhead::Instance().QueueStream(hostPath, offset + length, length, fileSize);
 +            return true;
 +        }
 +    }
@@ -6157,8 +6182,8 @@ diff --git a/runtime/include/hle/dvd_contract.h b/runtime/include/hle/dvd_contra
 +    // A read that continues the previous one on this file makes it a stream: prefetch the next block.
 +    const bool sequential = slot->nextOffset == offset;
 +    slot->nextOffset = offset + length;
-+    if (sequential && ReadAheadEnabled() && offset + length < slot->size) {
-+        ReadAhead::Instance().Queue(hostPath, offset + length, length);
++    if (sequential && ReadAheadEnabled()) {
++        ReadAhead::Instance().QueueStream(hostPath, offset + length, length, slot->size);
 +    }
 +    return true;
 +}

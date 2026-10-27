@@ -1565,7 +1565,7 @@ diff --git a/runtime/src/fiber_manager.cpp b/runtime/src/fiber_manager.cpp
 diff --git a/runtime/src/hle/os/os_alarm.cpp b/runtime/src/hle/os/os_alarm.cpp
 --- a/runtime/src/hle/os/os_alarm.cpp
 +++ b/runtime/src/hle/os/os_alarm.cpp
-@@ -1,474 +1,480 @@
+@@ -1,474 +1,484 @@
 -// OSAlarm queue HLE.
 -
 -#include <cstdint>
@@ -2282,6 +2282,10 @@ diff --git a/runtime/src/hle/os/os_alarm.cpp b/runtime/src/hle/os/os_alarm.cpp
 +    }
 +
 +    if (NandProcessPendingCallbacks(cpu, maxToProcess)) {
++        handledAny = true;
++        completionNeedsReschedule = true;
++    }
++    if (ProcessHostWorkWaits(cpu)) {
 +        handledAny = true;
 +        completionNeedsReschedule = true;
 +    }
@@ -3383,14 +3387,10 @@ new file mode 100644
 diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
 --- a/runtime/src/hle/os/os_internal.h
 +++ b/runtime/src/hle/os/os_internal.h
-@@ -11,13 +11,13 @@
- #include <cstdint>
- #include <iostream>
+@@ -13,11 +13,11 @@
  
--#include "abi_bridge.h"
--#include "memory.h"
-+#include "abi_bridge.h"
-+#include "memory.h"
+ #include "abi_bridge.h"
+ #include "memory.h"
 +#include "os_host_thread.h"
  #include "runtime_log.h"
  
@@ -3400,13 +3400,10 @@ diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
  // Tracks the current interrupt mask bits; stored as a 32-bit value for MMIO
  // tracking on the guest side. Default to 0 (no bits masked on startup).
  // OS____MaskInterrupts returns the pre-call value to the guest, so this is
-@@ -34,7 +34,17 @@
- constexpr uint32_t kOSExceptionContextAddr = 0x800000d8u;
- constexpr uint32_t kThreadListHeadAddr = 0x800000dcu;    // First thread in thread list (for iteration)
+@@ -36,6 +36,16 @@
  constexpr uint32_t kThreadListTailAddr = 0x800000e0u;    // Last added thread (tail of thread list)
--constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;  // Currently running thread context
-+constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;  // Currently running thread context
-+
+ constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;  // Currently running thread context
+ 
 +// The guest thread this host thread runs: the hosted sound thread on its own host thread,
 +// otherwise the fiber scheduler's running thread.
 +inline uint32_t CurrentRunningThread()
@@ -3416,9 +3413,19 @@ diff --git a/runtime/src/hle/os/os_internal.h b/runtime/src/hle/os/os_internal.h
 +    }
 +    return ::Memory::Read32(kOSRunningContextAddr);
 +}
- 
++
  constexpr uint32_t kDefaultThreadContextAddr = 0x80347498u;
  constexpr uint32_t kIdleThreadContextAddr = 0x803478b0u;
+ constexpr uint32_t kThreadQueueArrayAddr = 0x803477b0u;
+@@ -131,6 +141,8 @@
+ void CancelSleepTimer(uint32_t threadPtr);
+ void ClearOutstandingPark(uint32_t threadPtr);
+ bool ProcessSleepTimers(CpuContext* cpu);
++// Wakes guest threads parked by OS_HLE_WaitHostWork whose host work is done.
++bool ProcessHostWorkWaits(CpuContext* cpu);
+ 
+ // Defined in os_alarm.cpp.
+ bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess);
 diff --git a/runtime/src/hle/os/os_interrupt.cpp b/runtime/src/hle/os/os_interrupt.cpp
 --- a/runtime/src/hle/os/os_interrupt.cpp
 +++ b/runtime/src/hle/os/os_interrupt.cpp
@@ -5676,12 +5683,27 @@ diff --git a/runtime/src/hle/os/os_scheduler.cpp b/runtime/src/hle/os/os_schedul
 diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
 --- a/runtime/src/hle/os/os_sleep.cpp
 +++ b/runtime/src/hle/os/os_sleep.cpp
-@@ -235,7 +235,11 @@
-         return;
+@@ -1,6 +1,7 @@
+ // OSSleepTicks / OSSleepThread parking plus the host-side sleep-timer table.
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+@@ -19,6 +20,8 @@
+ #include "runtime_log.h"
+ #include "os_internal.h"
+ 
++void OS_HLE_WakeupThreadNoReschedule(CpuContext* ctx, uint32_t waitQueue);
++
+ namespace OsHleInternal {
+ std::mutex gSleepTimerMutex;
+ std::vector<SleepTimerEntry> gSleepTimers;
+@@ -236,6 +239,10 @@
      }
  
--    const uint64_t ticks = (static_cast<uint64_t>(cpu->gpr[3]) << 32) | cpu->gpr[4];
-+    const uint64_t ticks = (static_cast<uint64_t>(cpu->gpr[3]) << 32) | cpu->gpr[4];
+     const uint64_t ticks = (static_cast<uint64_t>(cpu->gpr[3]) << 32) | cpu->gpr[4];
 +    if (OsHostThread::OnHostedThread()) {
 +        OsHostThread::SleepTicksHosted(ticks);
 +        return;
@@ -5689,20 +5711,10 @@ diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
      const int32_t irqState = OS__DisableInterrupts_801a65ac();
  
      try {
-@@ -379,11 +383,16 @@
-     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
-     const uint32_t queuePtr = cpu->gpr[3];
-     
--    if (queuePtr == 0) {
--        RT_LOG(RT_TAG_OS) << "OSSleepThread: null queue pointer!" << std::endl;
--        return;
--    }
--
-+    if (queuePtr == 0) {
-+        RT_LOG(RT_TAG_OS) << "OSSleepThread: null queue pointer!" << std::endl;
-+        return;
-+    }
-+
+@@ -384,6 +391,11 @@
+         return;
+     }
+ 
 +    if (OsHostThread::OnHostedThread()) {
 +        OsHostThread::SleepHosted(cpu, queuePtr);
 +        return;
@@ -5711,23 +5723,111 @@ diff --git a/runtime/src/hle/os/os_sleep.cpp b/runtime/src/hle/os/os_sleep.cpp
      const int32_t irqState = OS__DisableInterrupts_801a65ac();
      
      try {
-@@ -414,10 +423,12 @@
-         // See SchedulerCanSwitchAway: parking is only safe when SelectThread is
-         // permitted to switch. Otherwise leave the thread RUNNING and the wait
+@@ -416,6 +428,8 @@
          // queue untouched and let the caller's retry loop re-test its condition.
--        if (!SchedulerCanSwitchAway()) {
--            ReportUnparkableSleep(queuePtr, currentThread);
--            OS__RestoreInterrupts_801a65d4(irqState);
--            return;
-+        if (!SchedulerCanSwitchAway()) {
-+            ReportUnparkableSleep(queuePtr, currentThread);
+         if (!SchedulerCanSwitchAway()) {
+             ReportUnparkableSleep(queuePtr, currentThread);
 +            // The caller retries; what it waits for may be the hosted thread's to release.
 +            OsHostThread::PauseUnlocked();
-+            OS__RestoreInterrupts_801a65d4(irqState);
-+            return;
+             OS__RestoreInterrupts_801a65d4(irqState);
+             return;
          }
- 
-         // Mark thread as WAITING
+@@ -472,3 +486,95 @@
+     OS__RestoreInterrupts_801a65d4(irqState);
+ }
+ PPC_NATIVE_OVERRIDE_VOID(801AA9B8, OSSleepThread_HLE_801aa9b8, (CpuContext* ctx), (ctx));
++
++// Guest threads waiting for host work (thp_video_hle.cpp: a movie frame decoded on a worker core).
++// Every guest thread is a fiber on the one guest core, so a host-side wait in a guest thread stops
++// the game too (test 13: the THP decode took 33% of the guest core in a movie menu). Such a thread
++// parks the way a deferred network ioctl does (nand_isfs.cpp): on a wait queue in a frame below its
++// stack, so the scheduler runs the other threads, and ProcessHostWorkWaits, in the alarm pass,
++// wakes it once its `done` flag is set. All of it runs on the fiber host.
++namespace {
++struct HostWorkWait {
++    const std::atomic<bool>* done = nullptr;
++    uint32_t queue = 0;
++    uint32_t thread = 0;
++};
++std::array<HostWorkWait, 4> gHostWorkWaits{};
++}  // namespace
++
++bool OsHleInternal::ProcessHostWorkWaits(CpuContext* cpu)
++{
++    if (OsHostThread::OnHostedThread()) {
++        return false;
++    }
++    bool woke = false;
++    for (HostWorkWait& wait : gHostWorkWaits) {
++        // Only a parked waiter heads its queue: one not parked yet, or cancelled while parked
++        // (OSCancelThread unlinks it), is left alone.
++        if (wait.done != nullptr && wait.done->load(std::memory_order_acquire) &&
++            ::Memory::Read32(wait.queue) == wait.thread) {
++            OS_HLE_WakeupThreadNoReschedule(cpu, wait.queue);
++            woke = true;
++        }
++    }
++    return woke;
++}
++
++// Parks the running guest thread until `*done`; true once it is set. False when the thread cannot
++// park here (the hosted thread, the scheduler disabled, no frame for the queue): the caller waits
++// on the host instead.
++extern "C" bool OS_HLE_WaitHostWork(CpuContext* ctx, const std::atomic<bool>* done)
++{
++    if (ctx == nullptr || done == nullptr) {
++        return false;
++    }
++    if (done->load(std::memory_order_acquire)) {
++        return true;
++    }
++    if (OsHostThread::OnHostedThread() || !Fiber::GuestFiberManager::IsInitialized() ||
++        !SchedulerCanSwitchAway()) {
++        return false;
++    }
++    const uint32_t thread = ::Memory::Read32(kOSRunningContextAddr);
++    if (thread == 0 || !Fiber::GuestFiberManager::HasFiber(thread)) {
++        return false;
++    }
++    constexpr uint32_t kFrameSize = 0x40u;
++    constexpr uint32_t kQueueOffset = 0x30u;  // past the linkage and r3-r10 save areas
++    const uint32_t oldStack = ctx->gpr[1];
++    const uint32_t frame = oldStack - kFrameSize;
++    if (oldStack < kFrameSize || !::Memory::Contains(frame, kFrameSize)) {
++        return false;
++    }
++    // A slot still naming this thread is from a wait it never came back from (cancelled).
++    HostWorkWait* slot = nullptr;
++    for (HostWorkWait& wait : gHostWorkWaits) {
++        if (wait.thread == thread) {
++            wait = {};
++        }
++        if (slot == nullptr && wait.done == nullptr) {
++            slot = &wait;
++        }
++    }
++    if (slot == nullptr) {
++        return false;
++    }
++    ::Memory::Write32(frame, oldStack);
++    ::Memory::Write32(frame + 4u, 0);
++    ::Memory::Write32(frame + kQueueOffset, 0);
++    ::Memory::Write32(frame + kQueueOffset + 4u, 0);
++    *slot = {done, frame + kQueueOffset, thread};
++    while (!done->load(std::memory_order_acquire)) {
++        ctx->gpr[1] = frame;
++        ctx->gpr[3] = slot->queue;
++        OSSleepThread_HLE_801aa9b8(ctx);
++        // Only ProcessHostWorkWaits wakes this queue, and only once `done` is set: still unset
++        // means OSSleepThread could not park.
++        if (!done->load(std::memory_order_acquire)) {
++            break;
++        }
++    }
++    *slot = {};
++    ctx->gpr[1] = oldStack;
++    return done->load(std::memory_order_acquire);
++}
 diff --git a/runtime/src/hle/os/os_thread.cpp b/runtime/src/hle/os/os_thread.cpp
 --- a/runtime/src/hle/os/os_thread.cpp
 +++ b/runtime/src/hle/os/os_thread.cpp
