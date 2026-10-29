@@ -154,8 +154,9 @@ void log_gpu_breadcrumbs() {
 uint32_t gpuOperationsPending = 0;
 // Outside course transitions, native submission works as without these diagnostics (candidate C,
 // docs/RR-PERFORMANCE-2026-10.md): the frame's own submits, no per-operation report and no pass,
-// copy or interval flush. Every recorded 2348-0006 timeout came in a Grand Prix course transition,
-// where the guard below makes each operation complete; v9's policy in steady state cost ~80 submits
+// copy or interval flush. Every recorded 2348-0006 timeout came while a course loaded (the first one
+// after the menus, or the next one after a race), where the guard below makes each operation
+// complete; v9's policy in steady state cost ~80 submits
 // and +3-6 ms of recording per present, and the game thread's GX wait rose from 6 to 45-230 ms/s.
 // It did not prevent the timeout either (test 6). perf.cfg `gpu_steady_v9 1` restores it everywhere.
 bool steady_v9() {
@@ -165,7 +166,7 @@ bool steady_v9() {
 #ifdef COS_DK_GPU_BREADCRUMBS
 bool gpuOperationTracked = false;  // this operation's breadcrumb was begun (gpu_operation_begin)
 #endif
-// Course transitions: the guard (switch/src/transition_guard.cpp) is asked at most every 5 ms;
+// Course loads: the guard (switch/src/transition_guard.cpp) is asked at most every 5 ms;
 // R.synchronous follows it.
 bool synchronous_operation() {
   static uint64_t nextCheck = 0;

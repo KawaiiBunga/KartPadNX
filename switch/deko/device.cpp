@@ -70,9 +70,6 @@ size_t heap_never_used_mib() {
     return size_t(fake_heap_end - top) >> 20;
 }
 
-// freed memory malloc holds below its break, in MiB: with heap_never_used_mib what is still allocatable
-size_t heap_free_inside_mib() { return size_t(mallinfo().fordblks) >> 20; }
-
 // deko3d's messages. Only the debug library (libdeko3dd, COS_DK_DEBUG_LIB=ON) calls this: its checks
 // of every call, warnings (result DkResult_Success) and errors, after which it traps. The release
 // library calls nothing on an error: it aborts with result 2359-xxxx.
@@ -246,12 +243,15 @@ void frame_stats(uint64_t presentNs) {
     const double n = double(g_times.presents);
     const MemoryStats m = memory_stats_take();
     const DescriptorStats d = descriptor_stats();
+    // fordblks: freed memory malloc holds below its break (with heap_never_used_mib, what is still
+    // allocatable); ordblks: the free chunks it is in, whose growth over a session is fragmentation
+    const struct mallinfo heap = mallinfo();
     dklog("frames %llu-%llu: %.1f presents/s; per present: frame fence %.2f ms, acquire %.2f ms, record %.2f ms, "
           "submit+present %.2f ms, longest %.2f ms, %.1f submits; command memory max %llu KiB/frame (%llu "
           "overflows), stream max %llu KiB/frame (%llu full); image heap %llu KiB in %llu chunks, blocks %llu KiB, "
           "shader code %llu KiB; descriptors: %u images, %u samplers in use, written %llu images, %llu samplers "
           "(%llu sampler evictions); window %ux%u (%llu resizes); deko3d messages %d; heap never "
-          "used %zu MiB, free inside %zu MiB",
+          "used %zu MiB, free inside %zu MiB in %zu chunks",
           (unsigned long long)(R.frame - g_times.presents + 1), (unsigned long long)R.frame,
           n * 1e9 / double(now - g_times.start), double(g_times.fenceNs) / n / 1e6, double(g_times.acquireNs) / n / 1e6,
           double(g_times.recordNs) / n / 1e6, double(g_times.submitNs) / n / 1e6, double(g_times.maxNs) / 1e6,
@@ -262,7 +262,7 @@ void frame_stats(uint64_t presentNs) {
           (unsigned long long)(m.codeBytes >> 10), d.imagesUsed, d.samplersUsed, (unsigned long long)d.imageWrites,
           (unsigned long long)d.samplerWrites, (unsigned long long)d.samplerEvictions,
           R.width, R.height, (unsigned long long)g_windowResizes, g_debugMessages, heap_never_used_mib(),
-          heap_free_inside_mib());
+          size_t(heap.fordblks) >> 20, size_t(heap.ordblks));
     g_submitsAtStats = g_submits.submits;
     g_times = Times{};
     g_times.start = now;

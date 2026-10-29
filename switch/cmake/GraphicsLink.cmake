@@ -47,6 +47,11 @@ function(kartpad_link_switch_graphics target)
     foreach(_symbol malloc free calloc realloc)
       target_link_options(${target} PRIVATE "LINKER:--wrap=${_symbol}")
     endforeach()
+  else()
+    # malloc straight to newlib's _malloc_r, not devkitA64's memalign(32) for every block over
+    # 31 bytes, which fragments the heap more with every allocation (malloc_switch.c).
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/malloc_switch.c")
+    target_link_options(${target} PRIVATE "LINKER:--wrap=malloc")
   endif()
   foreach(_symbol IN LISTS KARTPAD_GUEST_WRAP_SYMBOLS)
     target_link_options(${target} PRIVATE "LINKER:--wrap=${_symbol}")

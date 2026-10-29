@@ -358,8 +358,13 @@ def main():
                 tk.copy_file(src / 'private/pgo' / (name + ext), Path('private/pgo') / (name + ext))
             print(f'PGO {marker}: {name} (from {"this checkout" if src is REPO else "the release base"})')
     if not args.no_seeds:
-        for name in ('initial_dksh_cache.bin', 'initial_pipeline_cache.db', 'initial_pipeline_cache.id'):
-            tk.copy_file(BLD / 'private/deko-training' / name, Path('private/deko-training') / name)
+        # Native shader and pipeline recipe seeds, like the profiles: this checkout's (the newest,
+        # builder/deko-training.py packs them there), else the ones the release base carries.
+        names = ('initial_dksh_cache.bin', 'initial_pipeline_cache.db', 'initial_pipeline_cache.id')
+        src = REPO if all((REPO / 'private/deko-training' / n).is_file() for n in names) else BLD
+        for name in names:
+            tk.copy_file(src / 'private/deko-training' / name, Path('private/deko-training') / name)
+        print(f'Seeds: {"this checkout" if src is REPO else "the release base"}')
 
     # Frozen shard boundaries for each profile.
     for rel in ('private/self-build/translation/build_shards/base_common_shard_map.json',

@@ -20,9 +20,19 @@ $obj = Join-Path $aio "out\obj"
 $dist = Join-Path $aio "out\dist"
 New-Item -ItemType Directory -Force $obj, $dist | Out-Null
 
+# nxshim.exe is rebuilt only when its source changes: csc's output differs on every build, and Windows
+# app control judges each new unsigned binary afresh (on 2026-10-28 a rebuilt shim of unchanged
+# source was blocked as the compiler front end while the previous build of it ran). The source's
+# hash is kept next to the binary.
 $shim = Join-Path $obj "nxshim.exe"
-& $csc /nologo /target:exe /optimize+ /out:$shim (Join-Path $aio "shim\nxshim.cs")
-if ($LASTEXITCODE) { throw "nxshim build failed" }
+$shimSrc = Join-Path $aio "shim\nxshim.cs"
+$shimStamp = "$shim.source-sha256"
+$srcHash = (Get-FileHash $shimSrc -Algorithm SHA256).Hash
+if (-not (Test-Path $shim) -or -not (Test-Path $shimStamp) -or (Get-Content $shimStamp -Raw).Trim() -ne $srcHash) {
+  & $csc /nologo /target:exe /optimize+ /out:$shim $shimSrc
+  if ($LASTEXITCODE) { throw "nxshim build failed" }
+  Set-Content -Path $shimStamp -Value $srcHash -Encoding ascii
+}
 
 $front = Join-Path $obj "KartPadNX-Builder.exe"
 $res = @(
