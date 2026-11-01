@@ -6,6 +6,7 @@
 // Each file holds its whole session, so merge only the last file of each session (llvm-profdata 19).
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <switch.h>
@@ -38,14 +39,21 @@ PROF_SECTION(__llvm_prf_names)
 
 static uint64_t padding(uint64_t n) { return 7 & (8 - n % 8); }
 
-// In 1 MiB pieces, so the game's own SD reads are not held behind one long write.
+// In 1 MiB pieces, so the game's own SD reads are not held behind one long write. Each piece is
+// copied into pages of its own first: the FS write maps its buffer's whole pages into the server and
+// the kernel makes them read-only meanwhile, so writing the live counters faulted the next thread
+// that counted into them (two Data Aborts on hardware, 2026-10-31).
 static int put(FILE* f, const void* p, uint64_t n) {
-  static const char zeros[8];
-  if (p == NULL) p = zeros;
+  static char piece[1u << 20] __attribute__((aligned(0x1000)));
   for (const char* c = p; n > 0;) {
-    const size_t part = n < (1u << 20) ? (size_t)n : (1u << 20);
-    if (fwrite(c, 1, part, f) != part) return 0;
-    if (p != zeros) c += part;
+    const size_t part = n < sizeof(piece) ? (size_t)n : sizeof(piece);
+    if (p != NULL) {
+      memcpy(piece, c, part);
+      c += part;
+    } else {
+      memset(piece, 0, part);
+    }
+    if (fwrite(piece, 1, part, f) != part) return 0;
     n -= part;
   }
   return 1;
@@ -84,6 +92,7 @@ static void dump(const char* why) {
   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
   const uint64_t t0 = armGetSystemTick();
   FILE* f = fopen(tmp, "wb");
+  if (f != NULL) setvbuf(f, NULL, _IONBF, 0);  // every write straight from put's own pages, not a shared heap buffer
   int ok = f != NULL && write_profile(f);
   if (f != NULL) ok &= fclose(f) == 0;
   if (ok) {
