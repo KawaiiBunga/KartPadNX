@@ -354,8 +354,9 @@ def main():
         for marker, name in sorted(dict(pgo_names(BLD), **local).items()):
             src = REPO if marker in local else BLD
             tk.copy_file(src / 'private/pgo' / marker, Path('private/pgo') / marker)
-            for ext in ('.extbin', '.order.ld'):
-                tk.copy_file(src / 'private/pgo' / (name + ext), Path('private/pgo') / (name + ext))
+            for ext in ('.extbin', '.order.ld', '.profdata'):  # .profdata: instrumented PGO, optional
+                if ext != '.profdata' or (src / 'private/pgo' / (name + ext)).is_file():
+                    tk.copy_file(src / 'private/pgo' / (name + ext), Path('private/pgo') / (name + ext))
             print(f'PGO {marker}: {name} (from {"this checkout" if src is REPO else "the release base"})')
     if not args.no_seeds:
         # Native shader and pipeline recipe seeds, like the profiles: this checkout's (the newest,

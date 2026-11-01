@@ -294,8 +294,13 @@ constexpr int kDefaultMenuSeconds = KARTPAD_PROF_MENU_SECONDS;
 constexpr int kDefaultMenuSeconds = 0;
 #endif
 
+// pgo_instr_switch.c, linked only into instrumented-PGO training builds.
+extern "C" void kartpad_pgo_instr_start(void) __attribute__((weak));
+extern "C" void kartpad_pgo_instr_race_second(void) __attribute__((weak));
+
 // Called on the guest thread once its placement is final.
 extern "C" void kartpad_prof_start_guest(void) {
+  if (kartpad_pgo_instr_start) kartpad_pgo_instr_start();
   const int menuSeconds = kartpad_perf_int("prof_menu_seconds", kDefaultMenuSeconds);
   if (menuSeconds > 0) {
     const int menuStart = kartpad_perf_int("prof_menu_start", 20);
@@ -372,6 +377,7 @@ constexpr int kDefaultRaceEvery = 0;
 // counted across races) and stops after N more race seconds, so every test run yields a profile (PGO
 // refresh, hot-function analysis) without the Port menu.
 extern "C" void kartpad_prof_race_second(void) {
+  if (kartpad_pgo_instr_race_second) kartpad_pgo_instr_race_second();
   static int configured = -1;
   static int start = 0;
   static bool every = false;

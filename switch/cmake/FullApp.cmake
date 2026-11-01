@@ -164,12 +164,38 @@ target_compile_options(mkw_base_shared PRIVATE -O3 -fno-strict-aliasing ${_FP_OP
 # [build] log line carries KARTPAD_PGO_TAG so a log always says which variant ran.
 set(KARTPAD_PGO_PROFILE "" CACHE FILEPATH "LLVM sample profile for the translated shards (empty = off)")
 option(KARTPAD_SPLIT_FUNCTIONS "Split never-sampled blocks out of every target the profile optimizes (needs KARTPAD_PGO_PROFILE)" OFF)
-if(KARTPAD_PGO_PROFILE)
+# Instrumented PGO training build: the targets sample PGO covers count every block instead
+# (src/pgo_instr_switch.c writes the counts to the SD). Replaces KARTPAD_PGO_PROFILE.
+option(KARTPAD_PGO_INSTRUMENT "Instrumented PGO training build (counts to sdmc:/switch/kartpad/pgo)" OFF)
+set(KARTPAD_PGO_INSTR_PROFILE "" CACHE FILEPATH "llvm-profdata profile of KARTPAD_PGO_INSTRUMENT runs (replaces KARTPAD_PGO_PROFILE)")
+# Both sides of instrumented PGO: no value profiling, and static functions named "<source file>;<name>"
+# by the file name only, so the profile matches in any build folder (end users' AIO folders differ).
+set(_PGO_IR_OPTS "SHELL:-mllvm -disable-vp=true" "SHELL:-mllvm -static-func-full-module-prefix=false")
+set(_PGO_FLAGS)
+if(KARTPAD_PGO_INSTRUMENT)
+  message(STATUS "FullApp: instrumented PGO training build")
+  # Counter promotion goes superlinear on the translated loop nests (retro_mod shards: 10 s -> hours); counts are unchanged without it.
+  set(_PGO_FLAGS -fprofile-generate ${_PGO_IR_OPTS} "SHELL:-mllvm -do-counter-promotion=false")
+  target_compile_options(mkw_base_shared PRIVATE ${_PGO_FLAGS})
+  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PGO_TAG=\"instrumented\"")
+elseif(KARTPAD_PGO_INSTR_PROFILE)
+  if(NOT EXISTS "${KARTPAD_PGO_INSTR_PROFILE}")
+    message(FATAL_ERROR "KARTPAD_PGO_INSTR_PROFILE does not exist: ${KARTPAD_PGO_INSTR_PROFILE}")
+  endif()
+  message(STATUS "FullApp: instrumented PGO from ${KARTPAD_PGO_INSTR_PROFILE}")
+  # A function whose code changed since the training run has another hash and compiles without profile.
+  set(_PGO_FLAGS "-fprofile-use=${KARTPAD_PGO_INSTR_PROFILE}" ${_PGO_IR_OPTS}
+                 -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+  target_compile_options(mkw_base_shared PRIVATE ${_PGO_FLAGS})
+  get_filename_component(_PGO_NAME "${KARTPAD_PGO_INSTR_PROFILE}" NAME)
+  target_compile_definitions(kartpad_switch_shim PRIVATE "KARTPAD_PGO_TAG=\"${_PGO_NAME}\"")
+elseif(KARTPAD_PGO_PROFILE)
   if(NOT EXISTS "${KARTPAD_PGO_PROFILE}")
     message(FATAL_ERROR "KARTPAD_PGO_PROFILE does not exist: ${KARTPAD_PGO_PROFILE}")
   endif()
   message(STATUS "FullApp: sample PGO for translated shards from ${KARTPAD_PGO_PROFILE}")
-  target_compile_options(mkw_base_shared PRIVATE "-fprofile-sample-use=${KARTPAD_PGO_PROFILE}")
+  set(_PGO_FLAGS "-fprofile-sample-use=${KARTPAD_PGO_PROFILE}")
+  target_compile_options(mkw_base_shared PRIVATE ${_PGO_FLAGS})
   get_filename_component(_PGO_NAME "${KARTPAD_PGO_PROFILE}" NAME)
   # Machine function splitting (docs/RR-PERFORMANCE-2026-10.md): blocks the profile never saw
   # move to .text.split.<fn>, which the link order leaves behind the hot functions. Layout only:
@@ -600,8 +626,11 @@ option(KARTPAD_PGO_ALL "Apply KARTPAD_PGO_PROFILE to runtime, shim and Aurora ta
 # The renderer changes often (the v9 GPU policy, the transition guard): only a profile recorded with
 # its current sources may optimize it, or its newest code has no samples and is compiled as cold.
 option(KARTPAD_PGO_RENDERER "With KARTPAD_PGO_ALL, also apply the profile to the renderer (kartpad_deko)" OFF)
-if(KARTPAD_PGO_PROFILE AND KARTPAD_PGO_ALL)
-  message(STATUS "FullApp: sample PGO also for runtime, shim and Aurora")
+if(KARTPAD_PGO_INSTRUMENT)
+  target_sources(kartpad_full PRIVATE "${CMAKE_SOURCE_DIR}/src/pgo_instr_switch.c")
+endif()
+if(_PGO_FLAGS AND KARTPAD_PGO_ALL)
+  message(STATUS "FullApp: PGO also for runtime, shim and Aurora")
   set(_pgo_renderer "")
   if(KARTPAD_PGO_RENDERER)
     set(_pgo_renderer kartpad_deko)
@@ -609,7 +638,7 @@ if(KARTPAD_PGO_PROFILE AND KARTPAD_PGO_ALL)
   foreach(_pgo_target kartpad_full mkw_runtime_common kartpad_switch_shim ${_pgo_renderer} aurora_core aurora_gx aurora_gd
                       aurora_main aurora_os aurora_pad aurora_dvd aurora_mtx aurora_card aurora_ms aurora_vi aurora_si)
     if(TARGET ${_pgo_target})
-      target_compile_options(${_pgo_target} PRIVATE "-fprofile-sample-use=${KARTPAD_PGO_PROFILE}")
+      target_compile_options(${_pgo_target} PRIVATE ${_PGO_FLAGS})
       if(KARTPAD_SPLIT_FUNCTIONS)
         target_compile_options(${_pgo_target} PRIVATE -fsplit-machine-functions)
       endif()

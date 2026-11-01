@@ -40,6 +40,10 @@ set(CMAKE_EXE_LINKER_FLAGS
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Everything links into one static PIE, so -fPIE instead of the platform's -fPIC for libraries, and
+# globals addressed PC-relative instead of loaded from the GOT (GNU ld leaves those loads in place).
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fPIE;-fdirect-access-external-data>")
+
 set(KARTPAD_SHARDS "" CACHE FILEPATH "Path to the translated game's shards.cmake")
 option(KARTPAD_BUILD_GRAPHICS "Compile Aurora against local Switch Dawn and SDL3" OFF)
 option(KARTPAD_ENABLE_FULL_APP "Build the private translated game" OFF)

@@ -879,6 +879,9 @@ def cmake_configure_cmd(run, profile, bdir, tr):
         pgo_args = [f'-DKARTPAD_PGO_PROFILE={fwd(ws / "private/pgo" / (name + ".extbin"))}',
                     f'-DKARTPAD_SECTION_ORDER={fwd(ws / "private/pgo" / (name + ".order.ld"))}',
                     '-DKARTPAD_PGO_ALL=ON', f'-DKARTPAD_PGO_RENDERER={"ON" if p["pgo_renderer"] else "OFF"}']
+        # An instrumented-PGO profile next to it replaces the sample profile (FullApp.cmake).
+        if (ws / 'private/pgo' / (name + '.profdata')).is_file():
+            pgo_args.append(f'-DKARTPAD_PGO_INSTR_PROFILE={fwd(ws / "private/pgo" / (name + ".profdata"))}')
     dkp = fwd(t.dkp)
     llvm = t.llvm / 'bin'
     # The hardware-tested v9 configuration (docs/VANILLA-GPU-HANDOFF.md) for both

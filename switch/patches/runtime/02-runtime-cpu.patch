@@ -2558,7 +2558,26 @@ diff --git a/runtime/include/memory_access.h b/runtime/include/memory_access.h
  MKW_MEMORY_FORCE_INLINE float PpcSingleBitsToFloat(uint32_t bits) {
  #if defined(__has_builtin) && __has_builtin(__builtin_bit_cast)
      return __builtin_bit_cast(float, bits);
-@@ -635,6 +674,93 @@
+@@ -245,11 +284,16 @@
+                                                  bool needsRead, bool needsWrite) {
+     (void)needsRead;
+     const uint32_t guestStart = base + static_cast<uint32_t>(minOffset);
+-    if (length == 0 || length > kPageSize || guestStart > UINT32_MAX - (length - 1)) return nullptr;
++    if (length == 0 || length > kPageSize) return nullptr;
++    // A range no longer than the 64 KiB guard past the flat reservation that wraps 4 GiB ends in the
++    // guard and faults, as a wrapped Flat*At access does: only longer ranges need the wrap check.
++    if (length > 0x10000u && guestStart > UINT32_MAX - (length - 1)) return nullptr;
+     if (needsWrite &&
+         (FlatWriteNeedsPolicy(guestStart) || FlatWriteNeedsPolicy(guestStart + (length - 1))))
+         [[unlikely]] return nullptr;
+-    return MKW_FLAT_GUEST_BASE + guestStart;
++    uint8_t* const flat = MKW_FLAT_GUEST_BASE;
++    __builtin_assume(flat != nullptr);  // so a read-only range is never null and has no fallback path
++    return flat + guestStart;
+ }
+ 
+ // Guest-address byte order. Distinct from isa/big_endian.h, which is the
+@@ -635,6 +679,93 @@
      FlatStore<uint64_t>(address, bits);
  }
  
