@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
     paths: ['web/site/**', '.github/workflows/pages.yml']
+  schedule:
+    - cron: '17 * * * *'   # hourly: refresh rr.json (newest Retro Rewind and its date)
   workflow_dispatch:
 permissions:
   contents: read
@@ -23,6 +25,17 @@ jobs:
       - uses: actions/checkout@v4
       # Browsers cache Pages files for 10 minutes; a per-commit query makes them fetch new code at once.
       - run: sed -i -E "s/(config\.js|app\.js|style\.css)\"/\1?v=${GITHUB_SHA::8}\"/g" web/site/index.html
+      # Retro Rewind's CDN sends no CORS headers, so browsers can't read its dates; publish them here.
+      - name: Newest Retro Rewind and its release date
+        run: |
+          set +e
+          line=$(curl -fsSL https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt | grep -v '^[[:space:]]*$' | tail -n1)
+          ver=$(echo "$line" | awk '{print $1}')
+          url=$(echo "$line" | awk '{print $2}')
+          mod=$(curl -fsSI "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="last-modified"{print $2}')
+          date=$(date -u -d "$mod" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+          printf '{"version":"%s","date":"%s"}\n' "$ver" "$date" > web/site/rr.json
+          cat web/site/rr.json
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/site

@@ -177,28 +177,35 @@ $('download').addEventListener('click', async () => {
 // ---- versions: what the builder uses, and how fresh it is ----
 
 const REPO = 'KawaiiBunga/KartPadNX';
-const day = (iso) => new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-const getJson = (url) => fetch(url).then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))));
+// Every timestamp is UTC at the source and shown in the visitor's own time zone, with its name.
+const when = (iso) => new Date(iso).toLocaleString(undefined, {
+  year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const withDate = (label, iso) => (iso ? `${label} (${when(iso)})` : label);
+const getJson = (url) => fetch(url, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))));
 
 async function showVersions(status) {
+  // Newest Retro Rewind: the builder knows it when it's open; rr.json (refreshed hourly by the
+  // Pages workflow) when it isn't; Retro Rewind's own feed (version only) as the last resort.
   const rr = status && status.rr_latest;
   if (rr && rr.version) {
-    $('rr-latest').textContent = rr.date ? `${rr.version} (${day(rr.date)})` : rr.version;
-  } else {   // builder offline: Retro Rewind's own feed still says which version is newest
-    fetch('https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt').then((r) => r.text())
-      .then((t) => { $('rr-latest').textContent = t.trim().split('\n').pop().split(/\s+/)[0]; })
+    $('rr-latest').textContent = withDate(rr.version, rr.date);
+  } else {
+    getJson(`rr.json?t=${Date.now()}`)
+      .then((j) => { if (!j.version) throw new Error('empty'); $('rr-latest').textContent = withDate(j.version, j.date); })
+      .catch(() => fetch('https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt').then((r) => r.text())
+        .then((t) => { $('rr-latest').textContent = t.trim().split('\n').pop().split(/\s+/)[0]; }))
       .catch(() => { $('rr-latest').textContent = 'unknown'; });
   }
   const b = status && status.builder;
   if (b && b.tag) {
-    $('builder').textContent = b.date ? `${b.tag} (${day(b.date)})` : b.tag;
+    $('builder').textContent = withDate(b.tag, b.date);
   } else {
     getJson(`https://api.github.com/repos/${REPO}/releases?per_page=1`)
-      .then(([r]) => { $('builder').textContent = `${r.tag_name} (${day(r.published_at)})`; })
+      .then(([r]) => { $('builder').textContent = withDate(r.tag_name, r.published_at); })
       .catch(() => { $('builder').textContent = 'unknown'; });
   }
   getJson(`https://api.github.com/repos/${REPO}`)
-    .then((r) => { $('updated').textContent = day(r.pushed_at); })
+    .then((r) => { $('updated').textContent = when(r.pushed_at); })
     .catch(() => { $('updated').textContent = 'unknown'; });
 }
 
