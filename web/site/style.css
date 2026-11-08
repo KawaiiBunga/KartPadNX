@@ -36,6 +36,8 @@ progress { width: 100%; height: 10px; accent-color: var(--accent); }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 240px; overflow: auto; }
 code { font-size: 14px; }
 a { color: var(--accent); }
-ol { padding-left: 20px; }
+ol, ul { padding-left: 20px; }
+.guide h2 { margin-top: 20px; }
+.guide h2:first-child { margin-top: 0; }
 li { margin: 6px 0; }
 footer { font-size: 13px; margin-top: 24px; }

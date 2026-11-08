@@ -2,18 +2,27 @@
 
 KartPad-NX distributes port/builder source under the applicable open-source licenses. It must **not** distribute Nintendo game code/assets, translated Nintendo C++, generated game-data initializers, private mod payloads, or a game NRO containing those derivatives.
 
-## Current local-user flow
+## Current user flows
 
-The implemented base flow is:
+**PC builder (AIO, `aio/`):**
 
-1. User supplies their own Mario Kart Wii **PAL RMCP01 rev0** dump.
-2. The local builder extracts/translates the supported game and builds the derivative Switch NRO locally.
-3. The user runs the standalone KartPad disc extractor on Switch to materialize the disc DATA partition at `sdmc:/switch/kartpad/data`.
-4. The locally built game NRO checks the extractor's completion manifest and uses that tree as its default `dvd_root`.
+1. The user supplies their own Mario Kart Wii **PAL RMCP01 rev0** dump.
+2. The builder, on the user's PC, extracts the disc, translates the game and builds the derivative
+   game NROs, packs them into `mkw-launcher.nro`, and writes the SD card folder: the launcher, the
+   extracted disc at `switch/kartpad/data` with its completion manifest, and Retro Rewind's own
+   pack from its CDN.
+3. The game checks the completion manifest and uses that tree as its default `dvd_root`.
 
-The standalone extraction path is hardware-verified. A real supported dump produced 2032 files / 2,682,689,784 bytes on a physical Switch. The game runtime's data gate now accepts that completed tree; older statements that it only checked a two-file stub are obsolete.
+The launcher can also import a dump on the console (Game Files > Import disc, or the standalone
+extractor); that path is hardware-verified (2032 files / 2,682,689,784 bytes from a real dump).
 
-The game does **not** currently perform the full extraction inline during its own first launch. The separate extractor is the supported current ingestion UI.
+**Web builder (`web/`):** the same pipeline runs on the maintainer's PC on a dump the user
+uploads, and the user downloads the resulting SD card folder as a zip. That zip holds the derivative
+game NROs and the files of the uploaded disc, so serving it is distribution of both from the
+maintainer's machine, even though it goes only to the uploader, the upload is deleted after the
+build and the result after 24 hours. This conflicts with the policy above; running the web builder
+publicly is the maintainer's own decision and risk. Nothing disc-derived is ever committed or put
+in a release.
 
 ## SD layout
 
@@ -21,25 +30,23 @@ Typical local layout:
 
 ```text
 sdmc:/switch/
-  kartpad.nro                 locally built derivative game NRO
-  kartpad-disc-extractor.nro  source-built extractor
-
-sdmc:/iso/
-  RMCP01.wbfs                 user's own dump (or supported raw ISO location)
+  mkw-launcher.nro            launcher with both locally built game NROs packed in
 
 sdmc:/switch/kartpad/
   Config.toml
   kartpad-runtime.log
-  data/
+  data/                       the extracted disc
     sys/
       fst.bin
       ...
     files/
       ...
     .kartpad-extraction-complete
+  retro-rewind/RetroRewind6/  Retro Rewind's own pack, the version that was built
+  mods/<name>/                user file mods, switched on per game in the launcher
 ```
 
-The full game NRO contains translated/generated code/data derived from the user's dump, so it remains a local derivative and must not be published with source releases. Game assets are not embedded in ROMFS.
+The game NROs contain translated/generated code/data derived from the user's dump, so they remain local derivatives and must not be published with source releases. Game assets are not embedded in ROMFS.
 
 ## Disc decryption
 

@@ -9,7 +9,9 @@ How the port is put together, and the constraints a change must keep. Build step
 |---|---|---|
 | Game NRO, base | `switch/`, staged runtime, local translation | `build/switch-fullapp/kartpad.nro` |
 | Game NRO, Retro Rewind | same, plus the RR mod translation | `build/switch-fullapp-rr/kartpad-retro-rewind.nro` |
-| MKW Launcher | `launcher/` | disc extraction, profiles, saves, Miis, settings, updates; starts a game NRO |
+| MKW Launcher | `launcher/` | disc extraction, mods, profiles, saves, Miis, settings, updates; starts a game NRO |
+| AIO builder | `aio/` | Windows program running the whole pipeline on a user's PC; writes the SD card folder |
+| Web builder | `web/` | static site (GitHub Pages) + a server on the maintainer's PC running the same pipeline on an uploaded disc |
 
 The game NROs contain translated Nintendo code and are local builds only
 ([DISTRIBUTION.md](DISTRIBUTION.md)). The public launcher is game-free; a local "payload" launcher
@@ -27,9 +29,16 @@ switch/src, switch/deko ──────────────────�
 Dawn Null, SDL3, libnx, deko3d ─────────────┘
 ```
 
-There is no PowerPC JIT or interpreter: every game function is translated C++ compiled for
-AArch64. Profiles are `base` and `retro-rewind`. The translated graph, data initializers and
+Every game function is translated C++ compiled for AArch64; the game NROs contain no PowerPC
+interpreter. Profiles are `base` and `retro-rewind`. The translated graph, data initializers and
 generated native regions stay under `private/` and `build/`.
+
+Retro Rewind's `Code.pul` is translated in too (`translate-mod`: the module image, its functions
+and the base functions its hooks patch), so a new Retro Rewind version means a rebuild. The
+builders take the newest version from Retro Rewind's own feed (`rr_from_feed` in
+`aio/pipeline/kpnx_aio.py`) and fall back to the approved list if it doesn't build yet. Loading a
+new `Code.pul` at runtime instead (a Kamek loader plus an interpreter for changed code) is in
+progress in `switch/src/dropin/`, not part of the game build: [RR-DROP-IN.md](RR-DROP-IN.md).
 
 The staged runtime and Aurora (`build/wiicompiled-fpscr`) are a working copy of upstream
 WiiCompiled plus `switch/patches` ([switch/patches/README.md](../switch/patches/README.md)).
@@ -126,5 +135,11 @@ without that evidence. Never `PPC_NATIVE_OVERRIDE` an indirect-dispatch target s
 ## Launcher
 
 `launcher/source` is split into `app` (loop, input, overlay), `screens`, `ui`, and services in
-`data` (saves, licenses, Miis, settings), `disc` (extraction), `payload` (unpack, launch) and
+`data` (saves, licenses, Miis, settings, mods), `disc` (extraction), `payload` (unpack, launch) and
 `net` (signed updates: `source/net/README.md`). Screens call services; services own files.
+
+Mods: folders in `sdmc:/switch/kartpad/mods/` are listed in the Mods tab and switched on per game
+(`config.json` `mods`). Before a launch the launcher writes that game's enabled folders to
+`Config.toml` `[paths] overlay_roots`; the runtime's Riivolution layer (`riivolution.cpp`,
+`dvd.cpp`) mounts each as a disc-shaped overlay, or applies its `riivolution/*.xml`, above the
+disc and Retro Rewind. File replacement only: memory and code patches aren't applied.
