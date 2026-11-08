@@ -14,8 +14,12 @@ that https URL in web/site/config.js. web/README.md has the whole setup.
 - Builds share one work folder, and every accepted disc has the same main.dol/StaticR.rel, so after
   the first build a player's build only re-reads their disc, copies its files and packs (minutes,
   not an hour). Each finished job keeps its SD folder (~6.5 GB) until it expires.
-- --warm-disc: rebuild with the owner's disc whenever Retro Rewind's feed has a new version, so
-  players' builds after an RR update are cache hits.
+- Builds always use the newest GitHub release of the repo (pre-releases count): its
+  KartPadNX-Builder.zip (toolkit, prebuilt parts, Python) and the pipeline scripts at its tag.
+  A new release is picked up within RELEASE_POLL seconds; a build already running finishes on the
+  release it started with. --pipeline builds from this checkout instead (development).
+- --warm-disc: rebuild with the owner's disc whenever Retro Rewind's feed or the release changes,
+  so players' builds afterwards are cache hits.
 - Uploads are deleted as soon as their build ends; results after RESULT_HOURS.
 """
 import argparse
@@ -30,8 +34,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -47,6 +53,10 @@ RESULT_HOURS = 24
 EXTS = ('.iso', '.wbfs', '.rvz')
 RR_FEED = 'https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt'
 JOB_ID = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
+RELEASE_POLL = 600
+RELEASE_ASSET = 'KartPadNX-Builder.zip'
+# The pipeline is embedded in the release's exe; these are the same files at the release's tag.
+RELEASE_SCRIPTS = ('aio/pipeline/kpnx_aio.py', 'aio/pipeline/nxtools.py', 'aio/manifest/tools.json')
 
 ARGS = None
 JOBS = {}
@@ -54,6 +64,92 @@ TICKETS = {}   # one-time download ticket -> (job id, expiry)
 LOCK = threading.Lock()
 QUEUE = queue.Queue()
 LAST_RR = {'version': None}
+BUILDER = {}   # what builds run: tag, date, pipeline (kpnx_aio.py), args
+RR_INFO = {'version': None, 'date': None, 'checked': 0}
+
+
+def fetch(url, accept=None):
+    headers = {'User-Agent': 'KartPadNX-web'}
+    if accept:
+        headers['Accept'] = accept
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60)
+
+
+# ----------------------------------------------------------------- builder release ---
+
+def use_release(tag, date, root):
+    with LOCK:
+        BUILDER.update(tag=tag, date=date, pipeline=root / 'app/kpnx_aio.py',
+                       args=['--exe-dir', str(root / 'dist'), '--shim', str(ARGS.shim),
+                             '--bundle', str(root / 'dist/KartPadNX-Builder.data')])
+
+
+def sync_release():
+    """Makes BUILDER the newest non-draft release that has the builder zip, downloading it once."""
+    with fetch(f'https://api.github.com/repos/{ARGS.repo}/releases?per_page=10', 'application/vnd.github+json') as r:
+        releases = json.load(r)
+    rel = next(r for r in releases if not r['draft'] and any(a['name'] == RELEASE_ASSET for a in r['assets']))
+    tag = rel['tag_name']
+    if BUILDER.get('tag') == tag:
+        return
+    root = ARGS.work / 'releases' / re.sub(r'[^A-Za-z0-9._-]', '_', tag)
+    if not (root / 'ready').is_file():
+        print(f'[release] downloading {tag}', flush=True)
+        part = root.with_name(root.name + '.part')
+        shutil.rmtree(part, ignore_errors=True)
+        (part / 'app').mkdir(parents=True)
+        asset = next(a for a in rel['assets'] if a['name'] == RELEASE_ASSET)
+        with fetch(asset['browser_download_url']) as r, open(part / RELEASE_ASSET, 'wb') as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        with zipfile.ZipFile(part / RELEASE_ASSET) as z:
+            for name in z.namelist():
+                if name.startswith('/') or '..' in Path(name).parts:
+                    raise RuntimeError(f'unsafe path in {RELEASE_ASSET}: {name}')
+            z.extractall(part / 'unpacked')
+        exe = next((part / 'unpacked').rglob('KartPadNX-Builder.exe'))
+        os.replace(exe.parent, part / 'dist')
+        shutil.rmtree(part / 'unpacked', ignore_errors=True)
+        (part / RELEASE_ASSET).unlink()
+        for path in RELEASE_SCRIPTS:
+            url = f'https://raw.githubusercontent.com/{ARGS.repo}/{urllib.parse.quote(tag)}/{path}'
+            with fetch(url) as r:
+                (part / 'app' / Path(path).name).write_bytes(r.read())
+        (part / 'ready').write_text(json.dumps({'tag': tag, 'date': rel['published_at']}))
+        shutil.rmtree(root, ignore_errors=True)
+        os.replace(part, root)
+    use_release(tag, rel['published_at'], root)
+    print(f'[release] builds now use {tag} ({rel["published_at"]})', flush=True)
+    # Keep this release and the one before it (a running build may still use that one).
+    ready = sorted((d for d in (ARGS.work / 'releases').iterdir() if (d / 'ready').is_file()),
+                   key=lambda d: d.stat().st_mtime, reverse=True)
+    for old in ready[2:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def release_watcher():
+    while True:
+        time.sleep(RELEASE_POLL)
+        try:
+            sync_release()
+        except Exception as e:  # noqa: BLE001 - keep the current release
+            print(f'[release] {e}', flush=True)
+
+
+def rr_info():
+    """The newest Retro Rewind in its feed and the date of its update zip, checked hourly."""
+    if time.time() - RR_INFO['checked'] > 3600:
+        try:
+            with fetch(RR_FEED) as r:
+                rows = [line.split() for line in r.read().decode('utf-8', 'replace').splitlines() if line.strip()]
+            version, url = rows[-1][0], rows[-1][1]
+            req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'KartPadNX-web'})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                modified = r.headers.get('Last-Modified')
+            RR_INFO.update(version=version, date=parsedate_to_datetime(modified).isoformat() if modified else None)
+        except Exception as e:  # noqa: BLE001 - keep the last answer
+            print(f'[rr] {e}', flush=True)
+        RR_INFO['checked'] = time.time()
+    return {'version': RR_INFO['version'], 'date': RR_INFO['date']}
 
 
 # ---------------------------------------------------------------------- disc check ---
@@ -122,8 +218,11 @@ def drop_upload(job):
 def run_build(job):
     # The player's own SD card folder: launcher, their disc's game files, and RetroRewind6.
     out = job['dir'] / 'out'
-    cmd = [ARGS.python, '-u', str(ARGS.pipeline), '--data', str(ARGS.work / 'data'), '--disc', str(job['disc']),
-           '--out', str(out), *ARGS.pipeline_args] + (['--rr'] if job['rr'] else [])
+    with LOCK:
+        builder = dict(BUILDER)   # a new release mid-build does not change this one
+    job['builder'] = builder.get('tag')
+    cmd = [ARGS.python, '-u', str(builder['pipeline']), '--data', str(ARGS.work / 'data'), '--disc', str(job['disc']),
+           '--out', str(out), *builder['args']] + (['--rr'] if job['rr'] else [])
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                             errors='replace', cwd=REPO)
     for line in proc.stdout:
@@ -185,16 +284,14 @@ def janitor():
 
 
 def warmer():
-    """Builds with the owner's disc when Retro Rewind's feed has a version not built yet."""
+    """Builds with the owner's disc when Retro Rewind's feed or the builder release has changed."""
     stamp = ARGS.work / 'warm-version.txt'
     while True:
         try:
-            with urllib.request.urlopen(urllib.request.Request(RR_FEED, headers={'User-Agent': 'KartPadNX-web'}),
-                                        timeout=60) as r:
-                rows = [line.split() for line in r.read().decode('utf-8', 'replace').splitlines() if line.strip()]
-            newest = rows[-1][0] if rows else None
+            RR_INFO['checked'] = 0
+            newest = f'{rr_info()["version"]}|{BUILDER.get("tag")}'
             built = stamp.read_text().strip() if stamp.is_file() else None
-            if newest and newest != built:
+            if rr_info()['version'] and newest != built:
                 with LOCK:
                     job = new_job('warm.iso', 0, True, disc=ARGS.warm_disc)
                     job['state'] = 'queued'
@@ -202,8 +299,8 @@ def warmer():
                 while job['state'] in ('queued', 'building'):
                     time.sleep(30)
                 if job['state'] == 'done':
-                    stamp.write_text(job['rr_version'] or newest)
-                print(f'[warm] Retro Rewind {newest}: {job["state"]} {job["error"] or ""}', flush=True)
+                    stamp.write_text(newest)
+                print(f'[warm] {newest}: {job["state"]} {job["error"] or ""}', flush=True)
         except Exception as e:  # noqa: BLE001 - try again next hour
             print(f'[warm] {e}', flush=True)
         time.sleep(3600)
@@ -253,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             busy = any(j['state'] == 'building' for j in JOBS.values())
             waiting = sum(j['state'] == 'queued' for j in JOBS.values())
             return self.reply(200, {'ok': True, 'busy': busy, 'queued': waiting, 'rr_version': LAST_RR['version'],
+                                    'rr_latest': rr_info(),
+                                    'builder': {'tag': BUILDER.get('tag'), 'date': BUILDER.get('date')},
                                     'chunk': CHUNK, 'max_size': MAX_SIZE})
         m = re.match(r'^/api/download/([A-Za-z0-9_-]{16,64})$', path)
         if m:
@@ -379,19 +478,37 @@ def main(argv=None):
     ap.add_argument('--port', type=int, default=8787)
     ap.add_argument('--host', default='127.0.0.1', help='keep 127.0.0.1 behind a tunnel')
     ap.add_argument('--python', default=str(REPO / 'aio/out/python/python.exe'))
-    ap.add_argument('--pipeline', type=Path, default=REPO / 'aio/pipeline/kpnx_aio.py')
-    ap.add_argument('--warm-disc', type=Path, help="the owner's RMCP01 image; prebuild each new Retro Rewind")
+    ap.add_argument('--repo', default='KawaiiBunga/KartPadNX', help='GitHub repo whose newest release builds use')
+    ap.add_argument('--shim', type=Path, default=REPO / 'aio/out/obj/nxshim.exe')
+    ap.add_argument('--pipeline', type=Path, help='build from this kpnx_aio.py (and this checkout\'s aio/out) '
+                                                  'instead of the newest release')
+    ap.add_argument('--warm-disc', type=Path, help="the owner's RMCP01 image; prebuild each new Retro Rewind/release")
     ap.add_argument('--verbose', action='store_true')
-    ap.add_argument('pipeline_args', nargs='*', help='extra kpnx_aio.py arguments (after --)')
+    ap.add_argument('pipeline_args', nargs='*', help='with --pipeline: kpnx_aio.py arguments (after --)')
     ARGS = ap.parse_args(argv)
-    if not ARGS.pipeline_args:
-        aio = REPO / 'aio/out'
-        ARGS.pipeline_args = ['--exe-dir', str(aio / 'dist'), '--shim', str(aio / 'obj/nxshim.exe'),
-                              '--bundle', str(aio / 'dist/KartPadNX-Builder.data')]
     ARGS.work = ARGS.work.resolve()
     (ARGS.work / 'jobs').mkdir(parents=True, exist_ok=True)
     shutil.rmtree(ARGS.work / 'jobs', ignore_errors=True)   # jobs do not survive a restart
     (ARGS.work / 'jobs').mkdir()
+    if ARGS.pipeline:
+        aio = REPO / 'aio/out'
+        BUILDER.update(tag='local checkout', date=None, pipeline=ARGS.pipeline, args=ARGS.pipeline_args or [
+            '--exe-dir', str(aio / 'dist'), '--shim', str(ARGS.shim), '--bundle', str(aio / 'dist/KartPadNX-Builder.data')])
+    else:
+        if not ARGS.shim.is_file():
+            sys.exit(f'{ARGS.shim} is missing: run aio\\release.ps1 once (it builds nxshim.exe)')
+        (ARGS.work / 'releases').mkdir(exist_ok=True)
+        try:
+            sync_release()
+        except Exception as e:  # noqa: BLE001 - offline: use the newest release already here
+            ready = sorted((d for d in (ARGS.work / 'releases').iterdir() if (d / 'ready').is_file()),
+                           key=lambda d: d.stat().st_mtime, reverse=True)
+            if not ready:
+                sys.exit(f'could not get the newest release ({e}) and none is downloaded yet')
+            info = json.loads((ready[0] / 'ready').read_text())
+            use_release(info['tag'], info['date'], ready[0])
+            print(f'[release] {e}; using {info["tag"]} from disk', flush=True)
+        threading.Thread(target=release_watcher, daemon=True).start()
     for target in (worker, janitor) + ((warmer,) if ARGS.warm_disc else ()):
         threading.Thread(target=target, daemon=True).start()
     server = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)

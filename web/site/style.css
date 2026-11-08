@@ -37,7 +37,8 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-heigh
 code { font-size: 14px; }
 a { color: var(--accent); }
 ol, ul { padding-left: 20px; }
-.guide h2 { margin-top: 20px; }
-.guide h2:first-child { margin-top: 0; }
+.help summary { cursor: pointer; font-weight: 600; }
+.facts { list-style: none; padding: 0; margin: 12px 0 0; font-size: 14px; color: var(--dim); }
+.facts strong { color: var(--text); font-weight: 600; }
 li { margin: 6px 0; }
 footer { font-size: 13px; margin-top: 24px; }

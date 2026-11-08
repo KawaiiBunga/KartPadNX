@@ -11,12 +11,30 @@ the same result as the PC builder.
 | `server/build_server.py` | your PC, Python stdlib only, reached through a tunnel |
 
 The page alone does nothing; it talks to the server on your PC. When your PC or the server is off,
-the page says the builder is offline.
+the page says it's closed. It always shows the newest Retro Rewind (and its release date), the
+builder release builds use, and when the repo's code last changed.
+
+## Where the build code comes from
+
+Builds always use the **newest GitHub release** of this repo (pre-releases count, drafts don't):
+its `KartPadNX-Builder.zip` (toolkit, prebuilt parts, Python) plus the pipeline scripts at that
+release's tag (`aio/pipeline/kpnx_aio.py`, `nxtools.py`, `aio/manifest/tools.json`). The server
+checks for a new release every 10 minutes and downloads it once; a build already running finishes
+on the release it started with. So to update what the site builds: publish a release
+(`aio\release.ps1`, then attach `KartPadNX-Builder.zip` to a new GitHub release). Make the release
+from committed code, since the scripts come from its tag. The first build after a new release takes
+the full time (about an hour); `--warm-disc` does that one for you.
+
+Retro Rewind itself comes from Retro Rewind's own feed at build time, if the release's pipeline
+has `rr_from_feed` (releases after 0.1.0-Beta); older ones use the approved list.
+
+`--pipeline aio\pipeline\kpnx_aio.py` builds from this checkout and its `aio\out` instead (for
+testing changes before a release).
 
 ## Setup (once)
 
-1. Have a working AIO setup on this PC (`aio\out\python`, `aio\out\dist`, `aio\out\obj\nxshim.exe`;
-   run `aio\release.ps1` once if they're missing). About 80 GB free for the work folder: the shared
+1. Have `aio\out\python` and `aio\out\obj\nxshim.exe` on this PC (run `aio\release.ps1` once if
+   they're missing). The builds themselves come from the newest GitHub release (below). About 80 GB free for the work folder: the shared
    build cache, plus ~6.5 GB per finished build (kept 24 hours) and the uploads in progress.
 2. Start the server:
 

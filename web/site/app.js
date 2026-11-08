@@ -1,6 +1,6 @@
 'use strict';
 // KartPadNX web builder front end: checks the disc header locally, uploads the image in chunks
-// to the build server, follows the build and downloads mkw-launcher.nro.
+// to the build server, follows the build and downloads the SD card zip.
 
 const SERVER = (new URLSearchParams(location.search).get('server') || window.KPNX_SERVER || '').replace(/\/+$/, '');
 const $ = (id) => document.getElementById(id);
@@ -33,13 +33,14 @@ async function discHeader(f) {
 }
 
 async function checkDisc(f) {
-  if (!/\.(iso|wbfs|rvz)$/i.test(f.name)) return 'Pick an .iso, .wbfs or .rvz disc image.';
+  if (!/\.(iso|wbfs|rvz)$/i.test(f.name)) return 'That isn\'t a disc file. Pick an .iso, .wbfs or .rvz file.';
   const h = await discHeader(f);
   const wii = h.length >= 0x20 && h[0x18] === 0x5d && h[0x19] === 0x1c && h[0x1a] === 0x9e && h[0x1b] === 0xa3;
-  if (!wii) return 'This is not a Wii disc image.';
+  if (!wii) return 'That isn\'t a Wii disc file.';
   const id = String.fromCharCode(...h.slice(0, 6));
-  if (id !== 'RMCP01') return `This is ${id}, not Mario Kart Wii PAL (RMCP01).`;
-  if (h[7] !== 0) return `This is revision ${h[7]}; only revision 0 is supported.`;
+  if (id === 'RMCE01' || id === 'RMCJ01' || id === 'RMCK01') return 'Wrong disc: this is the US, Japanese or Korean version. Only the European (PAL) one works.';
+  if (id !== 'RMCP01') return 'Wrong disc: this isn\'t Mario Kart Wii.';
+  if (h[7] !== 0) return 'Wrong disc version: only the original European release works.';
   return null;
 }
 
@@ -48,14 +49,14 @@ function refreshGo() { $('go').disabled = !(discOk && $('own').checked); }
 $('file').addEventListener('change', async () => {
   file = $('file').files[0] || null;
   discOk = false;
-  $('file-label').textContent = file ? `${file.name} (${(file.size / 2 ** 30).toFixed(2)} GB)` : 'Choose file';
+  $('file-label').textContent = file ? file.name : 'Choose file (.iso, .wbfs or .rvz)';
   $('check').className = 'note';
   $('check').textContent = file ? 'Checking…' : '';
   if (file) {
     const problem = await checkDisc(file).catch((e) => `Could not read the file: ${e.message}`);
     discOk = !problem;
     $('check').className = 'note ' + (discOk ? 'good' : 'bad');
-    $('check').textContent = problem || 'Mario Kart Wii PAL, revision 0. Ready.';
+    $('check').textContent = problem || 'Looks good!';
   }
   refreshGo();
 });
@@ -87,8 +88,7 @@ async function upload() {
       if (++failures > 5) throw e;
       await new Promise((r) => setTimeout(r, 2000 * failures));
     }
-    setPhase('Uploading your disc…', received / file.size,
-      `${(received / 2 ** 30).toFixed(2)} of ${(file.size / 2 ** 30).toFixed(2)} GB. Keep this tab open.`);
+    setPhase(`Uploading… ${Math.floor(100 * received / file.size)}%`, received / file.size, 'Keep this page open until the upload is done.');
   }
   await api(`/api/jobs/${job.id}/start`, { method: 'POST' });
 }
@@ -98,18 +98,15 @@ async function follow() {
     const s = await api(`/api/jobs/${job.id}`);
     $('log').textContent = (s.log || []).join('\n');
     if (s.state === 'uploading') return 'uploading';
-    if (s.state === 'queued') setPhase('Waiting for the builder…', null, `Number ${s.queue_position} in line.`);
-    if (s.state === 'building') setPhase(s.stage || 'Building…', s.progress, 'You can close this tab and come back; it picks up where it was.');
+    if (s.state === 'queued') setPhase('Waiting in line…', null, `You're number ${s.queue_position}.`);
+    if (s.state === 'building') setPhase('Building…', s.progress, `${s.stage ? s.stage + '. ' : ''}You can close this page and come back later.`);
     if (s.state === 'failed') throw new Error(s.error || 'The build failed.');
     if (s.state === 'done') return s;
     await new Promise((r) => setTimeout(r, 3000));
   }
 }
 
-function finished(s) {
-  show('done');
-  $('rr-note').textContent = s.rr_version ? `Includes Retro Rewind ${s.rr_version}.` : '';
-}
+function finished() { show('done'); }
 
 async function run(resume) {
   show('progress');
@@ -118,7 +115,7 @@ async function run(resume) {
       setPhase('Starting…', null);
       job = null;
       const created = await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: file.name, size: file.size, rr: $('rr').checked }) });
+        body: JSON.stringify({ name: file.name, size: file.size, rr: true }) });
       job = { id: created.id, token: created.token, chunk: created.chunk, size: file.size, name: file.name };
       store.set(job);
     }
@@ -133,9 +130,13 @@ async function run(resume) {
       await upload();
       s = await follow();
     }
-    finished(s);
+    finished();
   } catch (e) {
-    if (e.status === 404) store.set(null);
+    if (e.status === 404) {   // the build expired or the server restarted: start fresh
+      store.set(null);
+      job = null;
+      if (resume) { show('pick'); return; }
+    }
     setPhase('Something went wrong', 0, e.message);
   }
 }
@@ -151,27 +152,58 @@ $('download').addEventListener('click', async () => {
   try {
     const { url } = await api(`/api/jobs/${job.id}/ticket`, { method: 'POST' });
     Object.assign(document.createElement('a'), { href: SERVER + url }).click();
-    $('download').textContent = 'Download started (see your browser\'s downloads)';
+    $('download').textContent = 'Downloading! Check your browser\'s downloads';
   } catch (e) {
     $('download').textContent = `Download failed (${e.message}). Try again`;
   }
   setTimeout(() => { $('download').disabled = false; }, 5000);
 });
 
+// ---- versions: what the builder uses, and how fresh it is ----
+
+const REPO = 'KawaiiBunga/KartPadNX';
+const day = (iso) => new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+const getJson = (url) => fetch(url).then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))));
+
+async function showVersions(status) {
+  const rr = status && status.rr_latest;
+  if (rr && rr.version) {
+    $('rr-latest').textContent = rr.date ? `${rr.version} (${day(rr.date)})` : rr.version;
+  } else {   // builder offline: Retro Rewind's own feed still says which version is newest
+    fetch('https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt').then((r) => r.text())
+      .then((t) => { $('rr-latest').textContent = t.trim().split('\n').pop().split(/\s+/)[0]; })
+      .catch(() => { $('rr-latest').textContent = 'unknown'; });
+  }
+  const b = status && status.builder;
+  if (b && b.tag) {
+    $('builder').textContent = b.date ? `${b.tag} (${day(b.date)})` : b.tag;
+  } else {
+    getJson(`https://api.github.com/repos/${REPO}/releases?per_page=1`)
+      .then(([r]) => { $('builder').textContent = `${r.tag_name} (${day(r.published_at)})`; })
+      .catch(() => { $('builder').textContent = 'unknown'; });
+  }
+  getJson(`https://api.github.com/repos/${REPO}`)
+    .then((r) => { $('updated').textContent = day(r.pushed_at); })
+    .catch(() => { $('updated').textContent = 'unknown'; });
+}
+
 // ---- start ----
 
 (async () => {
   if (!SERVER || SERVER.includes('example.com')) {
-    $('server').textContent = 'No builder is set up for this page yet.';
+    showVersions(null);
+    $('server').textContent = 'Not open yet. Check back soon.';
     $('server').className = 'pill bad';
     return;
   }
   try {
     const st = await api('/api/status');
-    $('server').textContent = st.busy ? `Builder online, busy (${st.queued} waiting)` : 'Builder online';
+    showVersions(st);
+    $('server').textContent = st.busy ? `Open (busy, ${st.queued} waiting)` : 'Open';
     $('server').className = 'pill good';
   } catch {
-    $('server').textContent = 'The builder is offline right now. Try again later.';
+    showVersions(null);
+    $('server').textContent = 'Closed right now. Try again later.';
     $('server').className = 'pill bad';
     return;
   }
