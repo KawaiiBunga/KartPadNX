@@ -13,8 +13,8 @@ KartPadNX-Builder.data   ~282 MB, Python, the build tools and the toolkit of pre
 
 Neither contains Nintendo code or data: the games are translated and compiled on the user's PC
 from their own disc. A first run downloads only devkitPro (365 MB, in the background while the
-game is translated) and, for Retro Rewind, its pinned update (under 50 MB) and, when "Also
-download the Retro Rewind SD files" is ticked, that version's full pack (1.9 GB).
+game is translated) and, for Retro Rewind, the newest update zip from Retro Rewind's own feed
+(under 50 MB) and that version's full pack (1.9 GB) for the SD card.
 
 The data file is separate on purpose. Windows Defender re-scans an executable's whole content
 every time it starts: with the bundle appended to the exe, the window took ~10 s to appear on
@@ -51,12 +51,13 @@ of every file in FST order). The launcher verifies `main.dol` and `StaticR.rel` 
 first start. The copy and the hashes (about 10 CPU-minutes in Python, on low-priority worker
 processes) run in the background while the game is translated and compiled.
 
-Retro Rewind's files come from its full pack (`<version>-full.zip` on its CDN, pinned by size
-and SHA-256 in the approved list), because the update zips the build translates `Code.pul`
-from carry only changed files. Its `Code.pul` must be the one that was built. It replaces the
-previous `RetroRewind6` (saves sit outside it, in `retro-rewind/riivolution`). The zip is kept
-in the work folder's `downloads`, so later builds only re-check it. An approved entry without a
-full pack skips this, and `INSTALL.txt` then says where to get the files.
+Retro Rewind's files come from its full pack (`<version>-full.zip` on its CDN), because the
+update zips the build translates `Code.pul` from carry only changed files. Its `Code.pul` must be
+the one that was built, which is what vouches for a feed version's pack (an approved-list entry
+also pins its size and SHA-256). It replaces the previous `RetroRewind6` (saves sit outside it, in
+`retro-rewind/riivolution`). The zip is kept in the work folder's `downloads`, so later builds
+only re-check it. When no full pack exists yet, this is skipped and `INSTALL.txt` says where to
+get the files.
 
 The work folder holds the downloaded tools, the extracted disc and the build: about 9 GB, 11
 GB with Retro Rewind's pack. It

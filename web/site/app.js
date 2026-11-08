@@ -108,11 +108,7 @@ async function follow() {
 
 function finished(s) {
   show('done');
-  if (s.rr_version) {
-    $('rr-step').hidden = false;
-    $('rr-ver').textContent = s.rr_version;
-    $('rr-link').href = `https://cdn.update.rwfc.net/RetroRewind/zip/${encodeURIComponent(s.rr_version)}-full.zip`;
-  }
+  $('rr-note').textContent = s.rr_version ? `Includes Retro Rewind ${s.rr_version}.` : '';
 }
 
 async function run(resume) {
@@ -150,19 +146,16 @@ $('go').addEventListener('click', () => {
 });
 $('cancel').addEventListener('click', () => { store.set(null); job = null; show('pick'); });
 $('download').addEventListener('click', async () => {
+  // A one-time link the browser downloads itself: the zip is several GB, too big for fetch/Blob.
   $('download').disabled = true;
-  $('download').textContent = 'Downloading…';
   try {
-    const res = await fetch(`${SERVER}/api/jobs/${job.id}/download`, { headers: { 'X-Job-Token': job.token } });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const url = URL.createObjectURL(await res.blob());
-    Object.assign(document.createElement('a'), { href: url, download: 'mkw-launcher.nro' }).click();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-    $('download').textContent = 'Downloaded';
+    const { url } = await api(`/api/jobs/${job.id}/ticket`, { method: 'POST' });
+    Object.assign(document.createElement('a'), { href: SERVER + url }).click();
+    $('download').textContent = 'Download started (see your browser\'s downloads)';
   } catch (e) {
-    $('download').disabled = false;
     $('download').textContent = `Download failed (${e.message}). Try again`;
   }
+  setTimeout(() => { $('download').disabled = false; }, 5000);
 });
 
 // ---- start ----

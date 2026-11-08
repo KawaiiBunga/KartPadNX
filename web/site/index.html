@@ -15,6 +15,16 @@
     <p id="server" class="pill">Checking the builder…</p>
   </header>
 
+  <section class="card">
+    <h2>What you need</h2>
+    <ul>
+      <li>A Switch running homebrew (Atmosphère), with about 5 GB free on its SD card.</li>
+      <li>Your own Mario Kart Wii disc image: <strong>PAL (RMCP01), revision 0</strong>, as <code>.iso</code>, <code>.wbfs</code> or <code>.rvz</code>. NTSC (RMCE01), Japanese and Korean discs, and later PAL revisions don't work.</li>
+      <li>Time for the upload (a 4 GB image) and the download (about 6 GB).</li>
+    </ul>
+    <p class="note">Have a fast Windows PC? You can build on it instead with the <a href="https://github.com/KawaiiBunga/KartPadNX/releases">PC builder</a>; the result is the same.</p>
+  </section>
+
   <section id="pick" class="card">
     <h2>1. Your disc image</h2>
     <p>Mario Kart Wii <strong>PAL (RMCP01), revision 0</strong>, as <code>.iso</code>, <code>.wbfs</code> or <code>.rvz</code>, dumped from a disc you own.</p>
@@ -39,18 +49,45 @@
 
   <section id="done" class="card" hidden>
     <h2>3. Put it on your Switch</h2>
-    <button id="download">Download mkw-launcher.nro</button>
+    <button id="download">Download your SD card files (zip, about 6 GB)</button>
+    <p id="rr-note" class="note"></p>
     <ol>
-      <li>Copy <code>mkw-launcher.nro</code> to <code>/switch/</code> on your SD card.</li>
-      <li>Copy your disc image to <code>/iso/</code> on the SD card (ISO or WBFS; the launcher can't read RVZ, so convert it to ISO in Dolphin first).</li>
-      <li id="rr-step" hidden>Download the <a id="rr-link" href="#">Retro Rewind <span id="rr-ver"></span> full pack</a> and copy its <code>RetroRewind6</code> folder to <code>/switch/kartpad/retro-rewind/</code>.</li>
-      <li>On the Switch, hold <strong>R</strong> while starting any game, open <strong>MKW Launcher</strong> and follow its setup. It imports your disc from <code>/iso/</code>.</li>
+      <li>Unzip it and copy everything inside to the root of your SD card (merge folders if asked).</li>
+      <li>On the Switch, hold <strong>R</strong> while starting any game to open the Homebrew Menu, then start <strong>MKW Launcher</strong>. Nothing to import: the game files are already in place.</li>
     </ol>
-    <p class="note">When Retro Rewind updates, build here again and replace the two files. Mods go in <code>/switch/kartpad/mods/</code> and are switched on in the launcher's Mods tab, no rebuild needed.</p>
+    <p class="note">When Retro Rewind updates, build here again and copy the new zip over the old files; your saves are kept. Mods go in <code>/switch/kartpad/mods/</code> and are switched on in the launcher's Mods tab, no rebuild needed.</p>
+  </section>
+
+  <section class="card guide">
+    <h2>Playing</h2>
+    <p>Hold <strong>R</strong> while starting any game to open the Homebrew Menu, then start <strong>MKW Launcher</strong>. Start it this way, not from the Album: from the Album the Switch gives homebrew too little memory and the launcher shows a warning.</p>
+    <p>Pick <strong>Mario Kart Wii</strong> or <strong>Retro Rewind</strong> and press <strong>Play</strong> (or <strong>+</strong>). The other tabs: <strong>Mods</strong>, <strong>Saves</strong> (backups, made automatically before each start), <strong>Licenses</strong> (names, Miis, VR/BR), <strong>Miis</strong> (your Switch Miis, used by both games), <strong>Game Files</strong> and <strong>Settings</strong> (volume, FPS counter, widescreen, launcher updates).</p>
+
+    <h2>When Retro Rewind updates</h2>
+    <p>Build here again and copy the new zip's files over the old ones; your saves are kept. The builder always uses the newest Retro Rewind. Don't update Retro Rewind on the SD card by itself (with Wheel Wizard or a new <code>RetroRewind6</code> folder): its code is built into the game, so a different version on the card won't match.</p>
+
+    <h2>Mods</h2>
+    <ol>
+      <li>Copy each mod's folder to <code>/switch/kartpad/mods/</code> on the SD card. Inside, files are laid out like the disc (for example <code>Race/Course/…</code>), or it's a Riivolution pack with a <code>riivolution</code> folder.</li>
+      <li>In the launcher's <strong>Mods</strong> tab, pick the game and switch the mods on. Each game has its own list.</li>
+    </ol>
+    <p class="note">Mods that replace files (textures, tracks, music) work without rebuilding. Mods that change the game's code (Kamek/Pulsar <code>.pul</code> code, Gecko codes) don't.</p>
+
+    <h2>If something goes wrong</h2>
+    <ul>
+      <li><strong>The site says the disc is the wrong version:</strong> it really is; only PAL revision 0 works.</li>
+      <li><strong>The upload stopped:</strong> reload this page and pick the same file again; it carries on where it left off.</li>
+      <li><strong>The builder is offline:</strong> it runs on the maintainer's PC; try again later.</li>
+      <li><strong>"Low memory mode" in the launcher:</strong> start it by holding R on a game, not from the Album.</li>
+      <li><strong>The game crashes:</strong> <a href="https://github.com/KawaiiBunga/KartPadNX/issues">open an issue</a> with <code>/switch/kartpad/kartpad-runtime.log</code> and the newest file in <code>/atmosphere/crash_reports/</code> from your SD card, and say what you were doing.</li>
+    </ul>
+
+    <h2>Status</h2>
+    <p>The base game and Retro Rewind are playable: menus, races, Grand Prix. Retro WFC online connects and races start but is still being tested. It runs below a locked 60 fps for now.</p>
   </section>
 
   <footer>
-    <p>Your upload is deleted as soon as the build ends; the result after 24 hours. Nothing here is affiliated with Nintendo. <a href="https://github.com/KawaiiBunga/KartPadNX">Source</a></p>
+    <p>Your upload is deleted as soon as the build ends; your SD card files after 24 hours. Nothing here is affiliated with Nintendo. <a href="https://github.com/KawaiiBunga/KartPadNX">Source</a></p>
   </footer>
 </main>
 <script src="config.js"></script>

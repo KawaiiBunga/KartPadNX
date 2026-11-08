@@ -4,8 +4,10 @@ against a fake pipeline. No disc or real build needed.
 
   python web/server/test_build_server.py
 """
+import io
 import json
 import socket
+import zipfile
 import subprocess
 import sys
 import tempfile
@@ -22,8 +24,11 @@ FAKE_PIPELINE = r'''
 import argparse, json, pathlib, time
 ap = argparse.ArgumentParser()
 ap.add_argument('--out'); ap.add_argument('--disc'); ap.add_argument('--data'); ap.add_argument('--rr', action='store_true')
-ap.add_argument('--nro-only', action='store_true')
 a, _ = ap.parse_known_args()
+out = pathlib.Path(a.out)
+(out / 'switch/kartpad/data/sys').mkdir(parents=True, exist_ok=True)
+(out / 'switch/kartpad/data/sys/boot.bin').write_bytes(b'BOOT' * 256)
+(out / 'INSTALL.txt').write_text('copy to SD')
 print('@@' + json.dumps({'stage': 'build-base', 'title': 'Compiling'}), flush=True)
 print('fake log line', flush=True)
 print('@@' + json.dumps({'progress': 'x', 'done': 1, 'total': 2}), flush=True)
@@ -126,8 +131,16 @@ def main():
             time.sleep(0.2)
         check(s['state'] == 'done' and s['rr_version'] == '9.9.9' and 'fake log line' in s['log'],
               f'build finished with RR version and log ({s["state"]} {s["error"]})')
-        code, nro = call(base, 'GET', f'/api/jobs/{jid}/download', tok)
-        check(code == 200 and nro == b'NRO0' + data[:16], 'download is the pipeline output')
+        code, t = call(base, 'POST', f'/api/jobs/{jid}/ticket', tok)
+        check(code == 200 and t['url'].startswith('/api/download/'), 'one-time download link issued')
+        code, raw = call(base, 'GET', t['url'])
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        check(code == 200 and sorted(z.namelist()) == ['INSTALL.txt', 'switch/kartpad/data/sys/boot.bin',
+                                                       'switch/mkw-launcher.nro']
+              and z.read('switch/mkw-launcher.nro') == b'NRO0' + data[:16] and z.testzip() is None,
+              'download is the whole SD card folder as a valid zip')
+        code, _ = call(base, 'GET', t['url'])
+        check(code == 404, 'a download link works only once')
         check(not (tmp / 'work/jobs' / jid / 'upload.iso').exists(), 'upload deleted after the build')
 
         code, job2 = call(base, 'POST', '/api/jobs', body={'name': 'usa.iso', 'size': bad.stat().st_size})
