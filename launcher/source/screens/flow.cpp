@@ -143,8 +143,7 @@ void ImportScreen::Build(app::App& app) {
 // ---- RrImportScreen ----------------------------------------------------------------------
 
 namespace {
-// Where the user is expected to copy the RetroRewind6 folder. The service has no scan call yet,
-// so these are fixed locations (see the report for the proposed ScanForRetroRewind).
+// Where the user is expected to copy the RetroRewind6 folder.
 constexpr const char* kRrCandidates[] = {
     "sdmc:/switch/kartpad/retro-rewind/RetroRewind6",
     "sdmc:/RetroRewind6",
@@ -156,8 +155,10 @@ RrImportScreen::RrImportScreen(std::function<void(bool ok)> done) : done_(std::m
 void RrImportScreen::OnEnter(app::App& app) {
     ResetWidgets();
     Add<ui::Label>("Import Retro Rewind", ui::kDisplay, Align::Center)->rect = {0, 60, ui::kLogicalW, 60};
-    Add<ui::Label>("Download RetroRewind6 from rwfc.net, copy the folder to SD, then pick it here.",
+    Add<ui::Label>("Copy the RetroRewind6 folder to the SD card, then pick it here.",
                    ui::kBody, Align::Center)->rect = {0, 130, ui::kLogicalW, 40};
+    Add<ui::Label>("It must be the Retro Rewind version your launcher was built for. Newer version? Rebuild first.",
+                   ui::kSmall, Align::Center)->rect = {0, 166, ui::kLogicalW, 24};
     float y = 200;
     for (const char* path : kRrCandidates) {
         const std::string p = path;
@@ -201,7 +202,6 @@ bool SetupWizard::OnBack(app::App& app) {
 
 void SetupWizard::Build(app::App& app) {
     ResetWidgets();
-    mkw::LauncherSettings& s = app.settings();
     auto title = [this](const char* t) {
         Add<ui::Label>(t, ui::kDisplay, Align::Center)->rect = {0, 80, ui::kLogicalW, 60};
     };
@@ -216,8 +216,7 @@ void SetupWizard::Build(app::App& app) {
     switch (step_) {
         case Step::Welcome: {
             title("Welcome to MKW Launcher");
-            body("This launcher turns your own Mario Kart Wii PAL disc into the files KartPad-NX needs.", 180);
-            body("It ships no Nintendo data. Nothing is downloaded from the disc.", 226);
+            body("First, import your Mario Kart Wii PAL disc from the SD card.", 180);
             auto* next = Add<ui::Button>(Centered(260, 64, 340), "Begin", true, [this, &app]() {
                 step_ = Step::Disc;
                 Build(app);
@@ -239,38 +238,26 @@ void SetupWizard::Build(app::App& app) {
             std::string version;
             const bool rr = mkw::Disc().HasValidRetroRewind(&version);
             if (rr) {
-                body(("Found Retro Rewind " + version + ". Ready to play.").c_str(), 180);
+                body(("Found Retro Rewind " + version + ".").c_str(), 180);
                 Track(Add<ui::Button>(Centered(260, 64, 300), "Next", true, [this, &app]() {
-                    step_ = Step::Driver;
+                    step_ = Step::Done;
                     Build(app);
                 }));
             } else {
-                body("Retro Rewind is a separate download. You can add it later in Game Files.", 180);
+                body("Retro Rewind is optional. You can add it later in Game Files.", 180);
                 Track(Add<ui::Button>(Centered(260, 64, 300), "Import Retro Rewind", true, [&app]() {
                     app.Push(std::make_unique<RrImportScreen>(nullptr));
                 }));
                 Track(Add<ui::Button>(Centered(260, 64, 390), "Skip", false, [this, &app]() {
-                    step_ = Step::Driver;
+                    step_ = Step::Done;
                     Build(app);
                 }));
             }
             break;
         }
-        case Step::Driver: {
-            title("Pick a colour");
-            body("You can change the colour later in Settings.", 180);
-            Track(Add<ui::ListRow>(ui::Rect{kCx - 300, 260, 600, 64}, "Accent",
-                                   [&s]() { return std::string(ui::AccentName(ui::AccentFromIndex(s.accent))); },
-                                   [&s]() { s.accent = (s.accent + 1) % ui::kAccentCount; }));
-            Track(Add<ui::Button>(Centered(260, 64, 450), "Next", true, [this, &app]() {
-                step_ = Step::Done;
-                Build(app);
-            }));
-            break;
-        }
         case Step::Done: {
-            title("You're on the grid");
-            body("Pick a game on the Play tab. Everything else is one tab away (L / R).", 180);
+            title("All set");
+            body("Pick a game and press Play. L / R switch tabs.", 180);
             Track(Add<ui::Button>(Centered(260, 64, 300), "Start", true, [&app]() {
                 mkw::Settings().Save(app.settings());
                 app.Replace(std::make_unique<MainScreen>());

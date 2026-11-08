@@ -3,6 +3,7 @@
 #include "mkw/data.h"
 
 #include "data/fsutil.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -110,6 +111,16 @@ void GetPercent(const TomlFile& t, const char* section, const char* key, int& ou
     if (end != v.c_str() && d >= 0.0 && d <= 1.0) out = static_cast<int>(std::lround(d * 100.0));
 }
 
+// A TOML basic string.
+std::string Quote(const std::string& s) {
+    std::string q = "\"";
+    for (const char c : s) {
+        if (c == '"' || c == '\\') q += '\\';
+        q += c;
+    }
+    return q + '"';
+}
+
 std::string Percent(int p) {
     char buf[16];
     std::snprintf(buf, sizeof buf, "%.2f", p / 100.0);
@@ -146,6 +157,16 @@ public:
                 s.updateChannel = j.value("update_channel", s.updateChannel);
                 s.lastVariant = j.value("last_variant", s.lastVariant);
                 s.backupBeforeLaunch = j.value("backup_before_launch", s.backupBeforeLaunch);
+                if (j.contains("mods") && j["mods"].is_object()) {
+                    for (int v = 0; v < 2; ++v) {
+                        const auto& list = j["mods"].value(VariantId(static_cast<Variant>(v)), nlohmann::json::array());
+                        s.mods[v].clear();
+                        if (!list.is_array()) continue;
+                        for (const auto& name : list) {
+                            if (name.is_string()) s.mods[v].push_back(name.get<std::string>());
+                        }
+                    }
+                }
             }
         }
 
@@ -176,6 +197,7 @@ public:
         j["update_channel"] = s.updateChannel;
         j["last_variant"] = s.lastVariant;
         j["backup_before_launch"] = s.backupBeforeLaunch;
+        j["mods"] = {{VariantId(Variant::Vanilla), s.mods[0]}, {VariantId(Variant::RetroRewind), s.mods[1]}};
         const bool launcherOk = WriteAtomically(mkw::kLauncherConfig, j.dump(2));
 
         TomlFile t{ReadLines(kGameConfig)};
@@ -206,6 +228,32 @@ public:
         fs::remove(backup, ec);
         fs::rename(kPerfCfg, backup, ec);
         return !ec;
+    }
+
+    std::vector<std::string> ListMods() override {
+        std::vector<std::string> names;
+        std::error_code ec;
+        for (fs::directory_iterator it(kModsDir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->is_directory(ec)) names.push_back(it->path().filename().string());
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    bool ApplyMods(Variant v, const LauncherSettings& s) override {
+        const auto present = ListMods();
+        std::string roots = "[";
+        for (const auto& name : s.mods[static_cast<int>(v)]) {
+            if (std::find(present.begin(), present.end(), name) == present.end()) continue;
+            if (roots.size() > 1) roots += ", ";
+            roots += Quote(std::string(kModsDir) + "/" + name);
+        }
+        roots += "]";
+        TomlFile t{ReadLines(kGameConfig)};
+        t.Set("paths", "overlay_roots", roots);
+        std::ostringstream out;
+        for (const auto& line : t.lines) out << line << '\n';
+        return WriteAtomically(kGameConfig, out.str());
     }
 };
 

@@ -63,10 +63,10 @@ private:
     std::function<void(bool ok)> done_;
 };
 
-// First-run setup: Welcome -> Disc -> Retro Rewind (optional) -> Driver -> Done -> main screen.
+// First-run setup: Welcome -> Disc -> Retro Rewind (optional) -> Done -> main screen.
 class SetupWizard : public Screen {
 public:
-    enum class Step : int { Welcome, Disc, RetroRewind, Driver, Done };
+    enum class Step : int { Welcome, Disc, RetroRewind, Done };
 
     void OnEnter(app::App& app) override;
     bool OnBack(app::App& app) override;

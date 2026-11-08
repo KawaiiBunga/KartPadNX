@@ -31,15 +31,28 @@ You need:
 The SD card folder has the launcher with both games inside, your game files already
 extracted, and Retro Rewind's own files in the exact version that was built.
 
+### No fast PC?
+
+Use the web builder instead: pick your disc image on the site, it builds on the maintainer's PC,
+and you download `mkw-launcher.nro`. Setup and details: [web/README.md](web/README.md).
+
 ### Retro Rewind updates
 
-When Retro Rewind updates, wait until the new version is supported here, then click **Build**
-again and copy the SD card folder over again. Only Retro Rewind gets rebuilt, and its files
-come out matching the game.
+When Retro Rewind updates, click **Build** again (or build on the site again) and copy the
+results over. The builder always takes the newest Retro Rewind straight from its own update feed,
+so there's nothing to wait for. Only Retro Rewind gets rebuilt, and its files come out matching
+the game.
 
 Don't update Retro Rewind on the SD card by itself (with Wheel Wizard, or by copying a new
 `RetroRewind6` folder over). The game has Retro Rewind's code built in, so a different version
 on the card won't line up with it.
+
+### Mods
+
+Mods that replace game files (textures, tracks, music, or a Riivolution pack with a `riivolution`
+folder) need no rebuild. Copy each mod's folder to `/switch/kartpad/mods/` on the SD card and
+switch it on in the launcher's **Mods** tab, separately for Mario Kart Wii and Retro Rewind. Mods
+that change the game's code (Kamek/Pulsar `.pul` code, Gecko codes) aren't supported this way.
 
 ### If something goes wrong
 

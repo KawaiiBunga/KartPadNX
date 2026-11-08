@@ -70,6 +70,8 @@ run_test profiles_test "" -- "$tests/profiles_test.cpp" "${data_sources[@]}" -lz
 # never creates the device component, so give the host run the same root.
 sd_root() { mkdir -p "sdmc:"; }
 
+run_test settings_service_test sd_root -- "$tests/settings_service_test.cpp" "$src/data/settings_service.cpp"
+
 run_test mii_create_test sd_root -- "$tests/mii_create_test.cpp" "${data_sources[@]}" -lz
 
 run_test switch_mii_test "" -- "$tests/switch_mii_test.cpp" "$src/data/switch_mii.cpp" "$src/data/mii_record.cpp"

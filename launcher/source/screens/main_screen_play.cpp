@@ -1,9 +1,8 @@
-// Main screen, Play tab: game cards, quick actions and launching.
+// Main screen, Play and Mods tabs: game cards, launching, and mod toggles.
 #include "screens/main_screen.h"
 #include "screens/main_screen_ui.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,8 +10,6 @@
 #include "app/app.h"
 #include "mkw/data.h"
 #include "screens/flow.h"
-#include "screens/profiles.h"
-#include "ui/keyboard.h"
 
 namespace screens {
 
@@ -30,69 +27,98 @@ void MainScreen::BuildPlay(app::App& app) {
     struct Card {
         Variant v;
         const char* title;
-        std::string blurb;
+        const char* blurb;
         const char* image;
-        float x;
     };
     const Card cards[] = {
-        {Variant::Vanilla, "Vanilla Mario Kart", "Play the classic experience", "romfs:/ui/card-vanilla.png", 68.0f},
-        {Variant::RetroRewind, "Retro Rewind",
-         "Custom tracks, items and Retro WFC",
-         "romfs:/ui/card-rr.png", 466.0f},
+        {Variant::Vanilla, "Mario Kart Wii", "The original game", "romfs:/ui/card-vanilla.png"},
+        {Variant::RetroRewind, "Retro Rewind", "Custom tracks and Retro WFC online", "romfs:/ui/card-rr.png"},
     };
+    constexpr float kCardW = 382.0f, kGap = 40.0f;
+    float x = kContent.x + (kContent.w - (2 * kCardW + kGap)) * 0.5f;
     int focusIndex = 0;
     for (const Card& c : cards) {
         const mkw::PayloadInfo* p = FindPayload(payloads, c.v);
-        auto* box = Add<ui::ItemBox>(Rect{c.x, 196, 382, 380}, c.title, c.blurb);
+        auto* box = Add<ui::ItemBox>(Rect{x, 196, kCardW, 380}, c.title, c.blurb);
+        x += kCardW + kGap;
         box->SetImage(c.image);
         box->SetSelected(c.v == selected_);
+        const size_t mods = app.settings().mods[static_cast<int>(c.v)].size();
         if (!p) {
-            box->SetDisabled("Not included in this launcher build");
+            box->SetDisabled("Not in this launcher build");
         } else if (!gameData) {
-            box->SetDisabled("Import your disc in Game Files first");
+            box->SetDisabled("Import your disc first");
         } else if (c.v == Variant::RetroRewind && !rrData) {
-            box->SetDisabled("Add Retro Rewind in Game Files first");
-        } else if (!p->unpacked) {
-            box->SetBadge("First start", th.accent);
+            box->SetDisabled("Add Retro Rewind in Game Files");
+        } else if (mods > 0) {
+            box->SetBadge(std::to_string(mods) + (mods == 1 ? " mod" : " mods"), th.accent);
         } else if (c.v == Variant::RetroRewind) {
             box->SetBadge("v" + rrVersion, th.good);
         }
         box->enabled = p && gameData && (c.v == Variant::Vanilla || rrData);
-        // A selects the game; A again (or Launch Game) starts it.
+        // A selects the game; A again (or Play) starts it.
         box->OnActivate([this, &app, v = c.v]() {
             if (selected_ == v) {
                 Launch(app, v);
                 return;
             }
-            selected_ = v;
+            selected_ = profileVariant_ = v;
             app.settings().lastVariant = v == Variant::RetroRewind ? 1 : 0;
             settingsDirty_ = true;
-            RefreshProfile();
             Build(app);
         });
         Track(box);
         if (c.v == selected_) focusIndex = static_cast<int>(focus_.Items().size()) - 1;
     }
-
-    // Quick settings: the most used game options.
-    mkw::LauncherSettings& s = app.settings();
-    auto dirty = [this](bool) { settingsDirty_ = true; };
-    const float x = kQuick.x + 14, w = kQuick.w - 28, h = 50.0f, gap = 56.0f;
-    float y = kQuick.y + kHeadH + 20;
-    Track(Add<ui::ToggleRow>(Rect{x, y, w, h}, "Show FPS", &s.showFps, dirty));
-    y += gap;
-    Track(Add<ui::ToggleRow>(Rect{x, y, w, h}, "Widescreen", &s.widescreen, dirty));
-    y += gap;
-    Track(Add<ui::SliderRow>(Rect{x, y, w, h}, "Volume", &s.masterVolume, 0, 100, 5, "%"));
-    y += gap;
-    Track(Add<ui::ToggleRow>(Rect{x, y, w, h}, "Mute", &s.muted, dirty));
-    y += gap;
-    Track(Add<ui::ToggleRow>(Rect{x, y, w, h}, "Back up save", &s.backupBeforeLaunch, dirty));
-    y += gap;
-    auto* more = Add<ui::Button>(Rect{x, y + 4, w, 46}, "More settings", false, [this, &app]() { SetTab(app, Tab::Settings); });
-    Track(more);
-    settingsDirty_ = true;  // sliders have no change callback
     focus_.SetIndex(focusIndex);
+}
+
+// ---- Mods --------------------------------------------------------------------------------
+
+void MainScreen::BuildMods(app::App& app) {
+    const ui::Theme th = app.theme();
+    const float x = 252.0f, w = 776.0f;
+    AddGameRow(app, x, kBodyTop, w);
+
+    modNames_ = mkw::Settings().ListMods();
+    if (modNames_.empty()) {
+        auto* msg = Add<ui::Label>("No mods yet. Copy a mod folder to SD:/switch/kartpad/mods, then come back.",
+                                   ui::kBody, Align::Center);
+        msg->rect = {kContent.x, kBodyTop + 90, kContent.w, 30};
+        msg->SetColor(th.textDim);
+        auto* how = Add<ui::Label>("A mod folder holds files laid out like the disc (Race/Course/...), "
+                                   "or a Riivolution pack with a riivolution folder.",
+                                   ui::kSmall, Align::Center);
+        how->rect = {kContent.x, kBodyTop + 126, kContent.w, 24};
+        how->SetDim(true);
+        return;
+    }
+
+    auto& enabled = app.settings().mods[static_cast<int>(profileVariant_)];
+    modOn_ = std::make_unique<bool[]>(modNames_.size());
+    for (size_t i = 0; i < modNames_.size(); ++i) {
+        modOn_[i] = std::find(enabled.begin(), enabled.end(), modNames_[i]) != enabled.end();
+    }
+    // Five rows fit; a long list scrolls by page with the last row.
+    constexpr size_t kRows = 5;
+    const size_t first = std::min(static_cast<size_t>(modPage_) * kRows, (modNames_.size() - 1) / kRows * kRows);
+    float y = kBodyTop + 62;
+    for (size_t i = first; i < modNames_.size() && i < first + kRows; ++i) {
+        Track(Add<ui::ToggleRow>(Rect{x, y, w, 50}, modNames_[i], &modOn_[i], [this, &app, i](bool on) {
+            auto& list = app.settings().mods[static_cast<int>(profileVariant_)];
+            list.erase(std::remove(list.begin(), list.end(), modNames_[i]), list.end());
+            if (on) list.push_back(modNames_[i]);
+            settingsDirty_ = true;
+        }));
+        y += 56;
+    }
+    if (modNames_.size() > kRows) {
+        Track(Add<ui::Button>(Rect{x, y + 4, w, 42}, "More mods", false, [this, &app]() {
+            const int pages = static_cast<int>((modNames_.size() + kRows - 1) / kRows);
+            modPage_ = (modPage_ + 1) % pages;
+            Build(app);
+        }));
+    }
 }
 
 void MainScreen::Launch(app::App& app, Variant v) {
@@ -108,21 +134,23 @@ void MainScreen::Launch(app::App& app, Variant v) {
     s.lastVariant = v == Variant::RetroRewind ? 1 : 0;
     mkw::Settings().Save(s);
     settingsDirty_ = false;
+    if (!mkw::Settings().ApplyMods(v, s)) {
+        app.Toast("Could not write the mod list to Config.toml.", 3.5f);
+        return;
+    }
 
     // No save yet (first run) is fine; only an existing save that fails to back up stops the launch.
-    if (s.backupBeforeLaunch) {
-        if (mkw::Saves().HasSave(v) && !mkw::Saves().BackupCurrent(v)) {
-            app.overlay().ShowModal(ui::Modal{
-                "Save backup failed",
-                "Your save could not be backed up before starting.\nStart anyway?",
-                {{"Cancel", nullptr, false},
-                 {"Start anyway", [this, &app, v]() {
-                      app.settings().backupBeforeLaunch = false;
-                      Launch(app, v);
-                      app.settings().backupBeforeLaunch = true;
-                  }, true}}});
-            return;
-        }
+    if (s.backupBeforeLaunch && mkw::Saves().HasSave(v) && !mkw::Saves().BackupCurrent(v)) {
+        app.overlay().ShowModal(ui::Modal{
+            "Save backup failed",
+            "Your save could not be backed up before starting.\nStart anyway?",
+            {{"Cancel", nullptr, false},
+             {"Start anyway", [this, &app, v]() {
+                  app.settings().backupBeforeLaunch = false;
+                  Launch(app, v);
+                  app.settings().backupBeforeLaunch = true;
+              }, true}}});
+        return;
     }
 
     if (!mkw::Payloads().StartUnpack(v)) {

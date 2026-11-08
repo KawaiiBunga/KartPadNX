@@ -163,14 +163,20 @@ everything cached takes a couple of minutes.
 ## When Retro Rewind updates
 
 Retro Rewind's code (`Code.pul`) is translated and compiled into the game, so an update that
-changes it needs a rebuild, and the SD card's `RetroRewind6` has to be the same version. Players
-never need a new builder for this: on
-every build it reads the approved version list, a public copy of `manifest/rr-versions.json`
-at `retro_rewind.approved_url` in `tools.json`, and builds its `latest`. When the list cannot be
-read it builds the version in `tools.json`. List entries may only point at
-`cdn.update.rwfc.net`, and every file is hash-checked.
+changes it needs a rebuild, and the SD card's `RetroRewind6` has to be the same version.
 
-To approve a new version:
+Nothing needs approving or pushing: every build reads Retro Rewind's own feed
+(`update.rwfc.net/RetroRewind/RetroRewindVersion.txt`), takes the newest version, finds the
+newest update zip carrying `Code.pul` (an asset-only update reuses the previous code), and builds
+that (`rr_from_feed` in `kpnx_aio.py`). Everything comes from `cdn.update.rwfc.net` over HTTPS;
+the full pack's `Code.pul` must match the one built. If that version doesn't translate or compile
+yet (it needs a translator change), the build falls back to the approved list below and logs
+why. Players just click Build again; the web builder (`web/`) rebuilds by itself.
+
+The approved list is now only that fallback: a public copy of `manifest/rr-versions.json` at
+`retro_rewind.approved_url` in `tools.json` (or the version in `tools.json` when it can't be
+read). Entries may only point at `cdn.update.rwfc.net`, and every file is hash-checked. Update it
+when a feed version needed a fix, so builds that can't reach the feed get a working version:
 
 ```powershell
 python aio\toolkit\approve-rr.py              # newest in the feed; or give a version
@@ -186,7 +192,11 @@ into `tools.json` `retro_rewind` (the fallback) before the next release.
 Check the result plays, then commit and push `aio/manifest/rr-versions.json`: the approved URL
 is this file on the repo's `main` branch. Players get it the next time they click Build: only
 Retro Rewind is re-translated and rebuilt (about 12 minutes), the SD card folder's
-`RetroRewind6` is replaced from the new full pack, and they copy the folder to the card again. The builder also logs when the feed has a newer version than the approved one.
+`RetroRewind6` is replaced from the new full pack, and they copy the folder to the card again.
+
+`--nro-only` (used by the web builder) writes just `switch/mkw-launcher.nro` to `--out`: no game
+files, no `RetroRewind6`. The translation and game builds are keyed on the verified `main.dol` /
+`StaticR.rel` hashes, not on the image's path, so a different copy of the same disc reuses them.
 
 ## Making a release
 

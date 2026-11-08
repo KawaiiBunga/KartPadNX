@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KartPadNX Builder</title>
+<meta name="description" content="Build KartPadNX from your own Mario Kart Wii disc without a powerful PC.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>KartPadNX Builder</h1>
+    <p class="lede">Build Mario Kart Wii for your Switch from your own disc. The build runs on our PC, so yours doesn't have to be fast.</p>
+    <p id="server" class="pill">Checking the builder…</p>
+  </header>
+
+  <section id="pick" class="card">
+    <h2>1. Your disc image</h2>
+    <p>Mario Kart Wii <strong>PAL (RMCP01), revision 0</strong>, as <code>.iso</code>, <code>.wbfs</code> or <code>.rvz</code>, dumped from a disc you own.</p>
+    <label class="file">
+      <input id="file" type="file" accept=".iso,.wbfs,.rvz">
+      <span id="file-label">Choose file</span>
+    </label>
+    <p id="check" class="note" aria-live="polite"></p>
+    <label class="row"><input id="rr" type="checkbox" checked> Include Retro Rewind (newest version)</label>
+    <label class="row"><input id="own" type="checkbox"> I dumped this image from a disc I own, and the build is only for me.</label>
+    <button id="go" disabled>Upload and build</button>
+  </section>
+
+  <section id="progress" class="card" hidden>
+    <h2>2. Building</h2>
+    <p id="phase" aria-live="polite">Uploading…</p>
+    <progress id="bar" max="1"></progress>
+    <p id="detail" class="note"></p>
+    <details><summary>Build log</summary><pre id="log"></pre></details>
+    <button id="cancel" class="secondary">Start over</button>
+  </section>
+
+  <section id="done" class="card" hidden>
+    <h2>3. Put it on your Switch</h2>
+    <button id="download">Download mkw-launcher.nro</button>
+    <ol>
+      <li>Copy <code>mkw-launcher.nro</code> to <code>/switch/</code> on your SD card.</li>
+      <li>Copy your disc image to <code>/iso/</code> on the SD card (ISO or WBFS; the launcher can't read RVZ, so convert it to ISO in Dolphin first).</li>
+      <li id="rr-step" hidden>Download the <a id="rr-link" href="#">Retro Rewind <span id="rr-ver"></span> full pack</a> and copy its <code>RetroRewind6</code> folder to <code>/switch/kartpad/retro-rewind/</code>.</li>
+      <li>On the Switch, hold <strong>R</strong> while starting any game, open <strong>MKW Launcher</strong> and follow its setup. It imports your disc from <code>/iso/</code>.</li>
+    </ol>
+    <p class="note">When Retro Rewind updates, build here again and replace the two files. Mods go in <code>/switch/kartpad/mods/</code> and are switched on in the launcher's Mods tab, no rebuild needed.</p>
+  </section>
+
+  <footer>
+    <p>Your upload is deleted as soon as the build ends; the result after 24 hours. Nothing here is affiliated with Nintendo. <a href="https://github.com/KawaiiBunga/KartPadNX">Source</a></p>
+  </footer>
+</main>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

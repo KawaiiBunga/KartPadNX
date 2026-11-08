@@ -158,6 +158,8 @@ struct LauncherSettings {
     int updateChannel = 0;   // 0 stable, 1 beta
     int lastVariant = 0;     // 0 vanilla, 1 Retro Rewind; used by the quick-launch gesture
     bool backupBeforeLaunch = true;
+    // Enabled mod folders (names under kModsDir), per game: [0] vanilla, [1] Retro Rewind.
+    std::vector<std::string> mods[2];
 
     // Game audio (Config.toml [audio])
     int masterVolume = 100;  // volume
@@ -183,8 +185,16 @@ public:
     virtual bool HasPerformanceOverrides() = 0;
     // Moves perf.cfg to perf.cfg.bak so the game uses its built-in tuning.
     virtual bool ResetPerformanceTuning() = 0;
+    // Mod folders in kModsDir, sorted by name. Each is a disc-shaped file overlay (files replace
+    // the disc's at the same path) or a Riivolution pack with a riivolution/*.xml.
+    virtual std::vector<std::string> ListMods() = 0;
+    // Points the game's Config.toml [paths] overlay_roots at this game's enabled mods that still
+    // exist, so the next launch loads them. No game rebuild needed.
+    virtual bool ApplyMods(Variant v, const LauncherSettings& s) = 0;
     virtual ~SettingsService() = default;
 };
+
+inline constexpr const char* kModsDir = "sdmc:/switch/kartpad/mods";
 
 SaveService& Saves();
 MiiService& Miis();

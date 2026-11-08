@@ -72,7 +72,6 @@ void MainScreen::BuildSaves(app::App& app) {
                                                   {"Restore", [this, &app, v, slot]() {
                                                        const bool ok = mkw::Saves().Restore(v, slot);
                                                        app.Toast(ok ? "Save restored." : "Restore failed. Your save was not changed.", 3.5f);
-                                                       RefreshProfile();
                                                        Build(app);
                                                    }, true}}});
                                          });
@@ -89,13 +88,7 @@ void MainScreen::BuildLicenses(app::App& app) {
     const ui::Theme th = app.theme();
     const float x = 252.0f, w = 776.0f, h = 52.0f, gap = 60.0f;
     float y = kBodyTop;
-    auto* game = Add<ui::ListRow>(Rect{x, y, w, h}, "Game", [this]() { return std::string(mkw::VariantDisplayName(profileVariant_)); },
-                                  [this, &app]() {
-                                      profileVariant_ = profileVariant_ == Variant::Vanilla ? Variant::RetroRewind : Variant::Vanilla;
-                                      Build(app);
-                                  });
-    game->SetIcon(ui::icon::kFlag);
-    Track(game);
+    AddGameRow(app, x, y, w);
     y += gap + 4;
 
     std::string err;

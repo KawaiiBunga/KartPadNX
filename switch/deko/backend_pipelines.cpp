@@ -74,10 +74,10 @@ Stage compile(WGPUShaderModule module, WGPUStringView entry, ShaderStage stage) 
   return s;
 }
 // Where pipeline creation time goes, summed over all creations and logged every 64 pipelines:
-// Dawn's WGSL parse and validation (shader modules), the native stage lookup or compile, and
-// Dawn's own pipeline validation.
+// the native stage lookup or compile, and the rest of the pipeline (state conversion). Shader
+// modules and pipelines never reach Dawn (see the wrappers below).
 struct BuildTimes {
-  std::atomic<uint64_t> moduleUs{0}, modules{0}, stagesUs{0}, dawnPipelineUs{0}, pipelines{0};
+  std::atomic<uint64_t> moduleUs{0}, modules{0}, stagesUs{0}, stateUs{0}, pipelines{0};
 };
 BuildTimes buildTimes;
 uint64_t micros_since(std::chrono::steady_clock::time_point start) {
@@ -85,17 +85,17 @@ uint64_t micros_since(std::chrono::steady_clock::time_point start) {
                       std::chrono::steady_clock::now() - start)
                       .count());
 }
-void count_pipeline_build(uint64_t stagesUs, uint64_t dawnPipelineUs) {
+void count_pipeline_build(uint64_t stagesUs, uint64_t stateUs) {
   buildTimes.stagesUs += stagesUs;
-  buildTimes.dawnPipelineUs += dawnPipelineUs;
+  buildTimes.stateUs += stateUs;
   const uint64_t n = ++buildTimes.pipelines;
   if (n % 64)
     return;
   const uint64_t modules = std::max<uint64_t>(buildTimes.modules.load(), 1);
-  swdk::dklog("pipeline builds: %llu pipelines; per pipeline: native stages %.1f ms, Dawn pipeline "
-              "%.1f ms; per shader module (%llu): Dawn WGSL %.1f ms",
+  swdk::dklog("pipeline builds: %llu pipelines; per pipeline: native stages %.1f ms, state "
+              "%.2f ms; per shader module (%llu): %.2f ms",
               (unsigned long long)n, buildTimes.stagesUs.load() / 1000.0 / n,
-              buildTimes.dawnPipelineUs.load() / 1000.0 / n, (unsigned long long)modules,
+              buildTimes.stateUs.load() / 1000.0 / n, (unsigned long long)modules,
               buildTimes.moduleUs.load() / 1000.0 / modules);
 }
 DkCompareOp compare(WGPUCompareFunction f) {
@@ -160,40 +160,49 @@ DkBlendOp blendop(WGPUBlendOperation o) {
 } // namespace kd
 
 extern "C" {
+// A WGSL module is the adapter's own handle, not a Dawn object: nothing downstream uses Dawn's
+// module (pipelines, SetPipeline and draws are native; the depth-peek compute pipeline is compiled
+// out under deko), and Dawn's WGSL parse, validation and reflection cost 12-33 ms per module on
+// the console (measured in melee-nx). The WGSL is kept for compile(), which runs Tint only when
+// the shader cache misses. A retained module now costs its WGSL text, not a Dawn object.
 WGPUShaderModule __wrap_wgpuDeviceCreateShaderModule(WGPUDevice d,
                                                      const WGPUShaderModuleDescriptor *desc) {
-  kd::Lock api(kd::shaderApiMutex);
+  const WGPUShaderSourceWGSL *wgsl = nullptr;
+  for (auto c = desc ? desc->nextInChain : nullptr; c; c = c->next)
+    if (c->sType == WGPUSType_ShaderSourceWGSL)
+      wgsl = reinterpret_cast<const WGPUShaderSourceWGSL *>(c);
+  if (!wgsl)
+    return __real_wgpuDeviceCreateShaderModule(d, desc);
   const auto start = std::chrono::steady_clock::now();
-  auto h = __real_wgpuDeviceCreateShaderModule(d, desc);
+  auto h = reinterpret_cast<WGPUShaderModule>(new char);
+  {
+    kd::Lock l(kd::mutex);
+    kd::modules[h] = {kd::str(wgsl->code), 1};
+  }
   kd::buildTimes.moduleUs += kd::micros_since(start);
   ++kd::buildTimes.modules;
-  kd::Lock l(kd::mutex);
-  if (auto it = kd::modules.find(h); it != kd::modules.end()) {
-    ++it->second.second; // Create returns an owned reference even on a Dawn
-                         // cache hit.
-    return h;
-  }
-  for (auto c = desc->nextInChain; c; c = c->next)
-    if (c->sType == WGPUSType_ShaderSourceWGSL)
-      kd::modules[h] = {kd::str(reinterpret_cast<const WGPUShaderSourceWGSL *>(c)->code), 1};
   return h;
 }
 void __wrap_wgpuShaderModuleAddRef(WGPUShaderModule h) {
-  kd::Lock api(kd::shaderApiMutex);
   {
     kd::Lock l(kd::mutex);
-    if (kd::modules.count(h))
-      ++kd::modules[h].second;
+    if (auto it = kd::modules.find(h); it != kd::modules.end()) {
+      ++it->second.second;
+      return;
+    }
   }
   __real_wgpuShaderModuleAddRef(h);
 }
 void __wrap_wgpuShaderModuleRelease(WGPUShaderModule h) {
-  kd::Lock api(kd::shaderApiMutex);
   {
     kd::Lock l(kd::mutex);
-    auto it = kd::modules.find(h);
-    if (it != kd::modules.end() && !--it->second.second)
-      kd::modules.erase(it);
+    if (auto it = kd::modules.find(h); it != kd::modules.end()) {
+      if (!--it->second.second) {
+        kd::modules.erase(it);
+        delete reinterpret_cast<char *>(h);
+      }
+      return;
+    }
   }
   __real_wgpuShaderModuleRelease(h);
 }
@@ -210,6 +219,7 @@ WGPURenderPipeline __wrap_wgpuDeviceCreateRenderPipeline(WGPUDevice d,
   p->fs =
       kd::compile(desc->fragment->module, desc->fragment->entryPoint, swdk::ShaderStage::Fragment);
   const uint64_t stagesUs = kd::micros_since(stagesStart);
+  const auto stateStart = std::chrono::steady_clock::now();
   dkRasterizerStateDefaults(&p->raster);
   dkDepthStencilStateDefaults(&p->depth);
   // WebGPU omitting depthStencil disables both operations. deko3d's defaults
@@ -296,33 +306,32 @@ WGPURenderPipeline __wrap_wgpuDeviceCreateRenderPipeline(WGPUDevice d,
       }
     }
   }
-  kd::Lock api(kd::pipelineApiMutex);
-  const auto dawnStart = std::chrono::steady_clock::now();
-  auto h = __real_wgpuDeviceCreateRenderPipeline(d, desc);
-  kd::count_pipeline_build(stagesUs, kd::micros_since(dawnStart));
+  // The handle is the native pipeline itself (no Dawn pipeline: its modules are not Dawn objects).
+  // Its address cannot be reused while a recorded SetPipeline still holds the shared_ptr.
+  auto h = reinterpret_cast<WGPURenderPipeline>(p.get());
+  kd::count_pipeline_build(stagesUs, kd::micros_since(stateStart));
   kd::Lock l(kd::mutex);
-  if (auto it = kd::pipelines.find(h); it != kd::pipelines.end())
-    ++it->second->refs;
-  else
-    kd::pipelines[h] = p;
+  kd::pipelines[h] = p;
   return h;
 }
 void __wrap_wgpuRenderPipelineAddRef(WGPURenderPipeline h) {
-  kd::Lock api(kd::pipelineApiMutex);
   {
     kd::Lock l(kd::mutex);
-    if (kd::pipelines.count(h))
-      ++kd::pipelines[h]->refs;
+    if (auto it = kd::pipelines.find(h); it != kd::pipelines.end()) {
+      ++it->second->refs;
+      return;
+    }
   }
   __real_wgpuRenderPipelineAddRef(h);
 }
 void __wrap_wgpuRenderPipelineRelease(WGPURenderPipeline h) {
-  kd::Lock api(kd::pipelineApiMutex);
   {
     kd::Lock l(kd::mutex);
-    auto it = kd::pipelines.find(h);
-    if (it != kd::pipelines.end() && !--it->second->refs)
-      kd::pipelines.erase(it);
+    if (auto it = kd::pipelines.find(h); it != kd::pipelines.end()) {
+      if (!--it->second->refs)
+        kd::pipelines.erase(it);
+      return;
+    }
   }
   __real_wgpuRenderPipelineRelease(h);
 }

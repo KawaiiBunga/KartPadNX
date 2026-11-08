@@ -4,10 +4,7 @@
 #include "backend_internal.h"
 
 namespace kd {
-std::recursive_mutex mutex;
-// Dawn API interning must be ordered against reference changes, independently
-// of the GPU queue. No parser, translator or compiler wait may own `mutex`.
-std::recursive_mutex shaderApiMutex, pipelineApiMutex;
+std::recursive_mutex mutex;  // no parser, translator or compiler wait may own it
 std::mutex compilerMutex;
 std::string str(WGPUStringView s) {
   return s.data ? std::string(s.data, s.length == WGPU_STRLEN ? strlen(s.data) : s.length) : "";

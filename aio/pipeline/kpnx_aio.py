@@ -702,12 +702,72 @@ def _full_pack_problem(entry):
     return None
 
 
-def resolve_rr(manifest, override=None):
-    """The Retro Rewind version to build: the newest entry of the approved list (hosted by the
-    maintainer, aio/manifest/rr-versions.json, URL in tools.json retro_rewind.approved_url), or
-    the version built into this exe when there is no list or it cannot be read. An entry may
-    only point at Retro Rewind's own CDN, and every file it names is hash-checked, so the list
-    chooses a version but cannot make the builder fetch anything else."""
+RR_CODE_PUL = 'RetroRewind6/Binaries/Code.pul'
+
+
+def _remote_size(url):
+    with _request(url, byte_range=(0, 0)) as r:
+        if r.status == 206:
+            return int(r.headers['Content-Range'].rsplit('/', 1)[1])
+        return int(r.headers['Content-Length'])
+
+
+def rr_from_feed(cache):
+    """The newest Retro Rewind straight from its own update feed, so a new version needs no
+    approval or push from the maintainer. Code.pul comes from the newest update zip that carries
+    it (an asset-only update reuses the previous code); every file is fetched from Retro
+    Rewind's CDN over HTTPS, and the full pack is checked against that Code.pul when unpacked."""
+    with _request(RR_FEED) as r:
+        rows = [line.split() for line in r.read().decode('utf-8', 'replace').splitlines() if line.strip()]
+    updates = [(row[0], row[1]) for row in rows if len(row) >= 2]
+    if not updates:
+        raise ValueError('empty feed')
+    version, newest_url = updates[-1]
+    for v, url in reversed(updates):
+        if urllib.parse.urlparse(url).scheme != 'https' or urllib.parse.urlparse(url).netloc != RR_CDN:
+            raise ValueError(f'{url} is not on {RR_CDN}')
+        size = _remote_size(url)
+        path = Path(cache) / Path(urllib.parse.urlparse(url).path).name
+        if not (path.is_file() and path.stat().st_size == size):
+            download(url, path, size, label=f'Retro Rewind {v} update')
+        with zipfile.ZipFile(path) as z:
+            if RR_CODE_PUL in z.namelist():
+                code = hashlib.sha256(z.read(RR_CODE_PUL)).hexdigest()
+                break
+    else:
+        raise ValueError('no update in the feed carries Code.pul')
+    full_url = newest_url.rsplit('/', 1)[0] + f'/{version}-full.zip'
+    spec = {'version': version, 'url': url, 'size': size, 'sha256': sha256_file(path), 'code_pul_sha256': code}
+    try:
+        spec.update(full_url=full_url, full_size=_remote_size(full_url), full_sha256=None)
+    except Exception as e:  # noqa: BLE001 - no full pack yet: the game still builds
+        log(f'Retro Rewind {version}: no full pack on the CDN yet ({e})')
+    return spec
+
+
+def resolve_rr(manifest, override=None, cache=None):
+    """The Retro Rewind versions to try, best first: the newest one in Retro Rewind's own feed
+    (rr_from_feed, when `cache` is given), then the newest entry of the approved list (hosted by
+    the maintainer, URL in tools.json retro_rewind.approved_url) or the version built into this
+    exe. The approved list is only a fallback for a feed version that does not translate or
+    build yet. An entry may only point at Retro Rewind's own CDN, and every file it names is
+    hash-checked, so the list chooses a version but cannot make the builder fetch anything else."""
+    specs = []
+    if cache is not None and not override:
+        try:
+            feed = rr_from_feed(cache)
+            specs.append({**{k: v for k, v in manifest['retro_rewind'].items() if not k.startswith('full_')},
+                          **feed})
+            log(f'Retro Rewind: newest in the official feed is {feed["version"]}')
+        except Exception as e:  # noqa: BLE001 - offline or feed changed: use the approved list
+            log(f'Retro Rewind: official feed unavailable ({e})')
+    fallback = _resolve_approved(manifest, override)
+    if not specs or specs[0]['code_pul_sha256'] != fallback['code_pul_sha256']:
+        specs.append(fallback)
+    return specs
+
+
+def _resolve_approved(manifest, override=None):
     builtin = manifest['retro_rewind']
     source = override or builtin.get('approved_url')
     spec, origin = builtin, 'built in'
@@ -739,15 +799,7 @@ def resolve_rr(manifest, override=None):
                     spec.update({k: entry[k] for k in ('full_url', 'full_size', 'full_sha256')})
         except Exception as e:  # noqa: BLE001 - any problem with the list falls back
             log(f'Retro Rewind: approved version list unavailable ({e}); using the built-in {builtin["version"]}')
-    log(f'Retro Rewind: building version {spec["version"]} ({origin})')
-    try:
-        with _request(RR_FEED) as r:
-            newest = r.read().decode('utf-8', 'replace').split()[-4]
-        if _version_key(newest) > _version_key(spec['version']):
-            log(f'Retro Rewind {newest} is out but not approved for KartPad-NX yet; keep {spec["version"]} '
-                f'on the SD card. Once it is approved, click Build again to update.')
-    except Exception:
-        pass
+    log(f'Retro Rewind: fallback version {spec["version"]} ({origin})')
     return spec
 
 
@@ -755,8 +807,8 @@ def rr_inputs(run, spec):
     """Code.pul from the chosen Retro Rewind update, and the live Retro-WFC payload checked
     against the production signing key (the same checks as builder/translate-profile.py)."""
     work = run.ws / 'private/self-build/retro-rewind'
-    zpath = download(spec['url'], run.t.dl / Path(spec['url']).name, spec['size'], spec['sha256'],
-                     label=f'Retro Rewind {spec["version"]} update')
+    zpath = download(spec['url'], run.t.dl / Path(urllib.parse.urlparse(spec['url']).path).name, spec['size'],
+                     spec['sha256'], label=f'Retro Rewind {spec["version"]} update')
     pack = work / 'pack' / 'RetroRewind6'   # the overlay root name the runtime registers
     if pack.exists():
         shutil.rmtree(pack.parent)
@@ -1112,7 +1164,7 @@ def stage_rr_sd(state, tools, spec, out_dir):
     root = Path(out_dir) / 'switch/kartpad/retro-rewind'
     dest = root / 'RetroRewind6'
     xml, code = dest / 'xml/RetroRewind6.xml', dest / 'Binaries/Code.pul'
-    key = f'{dest.resolve()}|{spec["full_sha256"]}'
+    key = f'{dest.resolve()}|{spec.get("full_sha256") or spec["code_pul_sha256"]}'
     if state.done('rr-sd', key) and xml.is_file() and code.is_file() \
             and sha256_file(code) == spec['code_pul_sha256']:
         return True
@@ -1122,8 +1174,12 @@ def stage_rr_sd(state, tools, spec, out_dir):
     for old in tools.dl.glob('*-full.zip'):
         if old.name != name:
             old.unlink()   # the pack of a version no longer built
-    zpath = download(spec['full_url'], tools.dl / name, spec['full_size'], spec['full_sha256'],
-                     label=f'Retro Rewind {version} full pack')
+    zpath = tools.dl / name
+    # A feed version has no pinned pack hash: reuse a complete download, the Code.pul check below
+    # vouches for its contents.
+    if spec.get('full_sha256') or not (zpath.is_file() and zpath.stat().st_size == spec['full_size']):
+        download(spec['full_url'], zpath, spec['full_size'], spec.get('full_sha256'),
+                 label=f'Retro Rewind {version} full pack')
     emit(progress='extract', item='RetroRewind6', done=0, total=0)
     # Unpacked beside the old folder and swapped in, so files a newer version dropped do not
     # linger. Saves live in retro-rewind/riivolution, outside RetroRewind6, and are untouched.
@@ -1168,6 +1224,8 @@ def main():
         (p for p in (HERE / 'tools.json', HERE.parent / 'manifest/tools.json') if p.is_file()), HERE / 'tools.json'))
     ap.add_argument('--shim', type=Path, default=None)
     ap.add_argument('--keep-downloads', action='store_true')
+    ap.add_argument('--nro-only', action='store_true',
+                    help='only the launcher NRO in --out: no game files or RetroRewind6 folder (web builder)')
     args = ap.parse_args()
 
     data = args.data.resolve()
@@ -1200,18 +1258,23 @@ def main():
         run = Runner(tools, ws)
         stage_disc(state, run, args.disc)
         disc_key = state.root.joinpath('disc.done').read_text(encoding='utf-8')
+        # Every accepted disc has exactly these main.dol and StaticR.rel, so the translation and
+        # the game builds do not depend on which image file (or upload) they came from.
+        game_key = f'rmcp01-rev0:{EXPECT_DOL}:{EXPECT_REL}'
         # The SD card's game files are copied and hashed while the game is translated and built.
-        sd_game = Background(lambda: sd_game_files(state, run, args.out, disc_key))
-        rr_spec = resolve_rr(manifest, args.rr_list) if args.rr else manifest['retro_rewind']
+        sd_game = Background(lambda: None if args.nro_only else sd_game_files(state, run, args.out, disc_key))
+        rr_specs = resolve_rr(manifest, args.rr_list, tools.dl) if args.rr else [manifest['retro_rewind']]
+        rr_spec = rr_specs[0]
         nros = {}
-        for profile in profiles:
-            key = state.root.joinpath('disc.done').read_text(encoding='utf-8')
+
+        def build_profile(profile, spec):
+            key = game_key
             if profile == 'retro-rewind':
                 # A Retro Rewind update changes Code.pul: re-translate and rebuild just RR.
-                key += '|rr:' + rr_spec['code_pul_sha256']
+                key += '|rr:' + spec['code_pul_sha256']
             if not state.done('translate-' + profile, key):
                 stage('translate-' + profile, f'Translating the game ({PROFILES[profile]["app"]})')
-                (translate_base(run, jobs) if profile == 'base' else translate_rr(run, jobs, rr_spec))
+                (translate_base(run, jobs) if profile == 'base' else translate_rr(run, jobs, spec))
                 stage('transform-' + profile, f'Applying source passes ({PROFILES[profile]["app"]})')
                 transform(run, profile)
                 state.mark('translate-' + profile, key)
@@ -1222,13 +1285,31 @@ def main():
                 stage('build-' + profile, f'Compiling {PROFILES[profile]["app"]} (this takes a while)')
                 nro = configure_and_build(run, profile, jobs)
                 state.mark('build-' + profile, key)
-            nros[profile] = nro
+            return nro
+
+        for profile in profiles:
+            if profile != 'retro-rewind':
+                nros[profile] = build_profile(profile, None)
+                continue
+            # The feed's newest first; a version the translator cannot handle yet falls back to
+            # the approved one instead of failing the whole build.
+            for i, spec in enumerate(rr_specs):
+                try:
+                    nros[profile] = build_profile(profile, spec)
+                    rr_spec = spec
+                    break
+                except Failure as e:
+                    if i + 1 == len(rr_specs):
+                        raise
+                    log(f'Retro Rewind {spec["version"]} did not build ({e}); '
+                        f'falling back to {rr_specs[i + 1]["version"]}')
         need_devkitpro()
         stage('launcher', 'Packing the launcher')
         dest = pack_launcher(run, nros, args.out)
         sha = sha256_file(dest)
         rr = rr_spec['version']
-        rr_sd = args.rr and stage_rr_sd(state, tools, rr_spec, args.out)
+        emit(rr_version=rr if args.rr else None)
+        rr_sd = args.rr and not args.nro_only and stage_rr_sd(state, tools, rr_spec, args.out)
         if sd_game.thread.is_alive():
             stage('sd-game', 'Finishing the game files for the SD card')
         sd_game.join()
