@@ -74,22 +74,37 @@ function setPhase(text, fraction, detail = '') {
   $('detail').textContent = detail;
 }
 
+// Several pieces at once: one connection through the tunnel is capped far below a fast line.
+const PARALLEL = 6;
+
 async function upload() {
   const chunk = job.chunk;
-  let { received } = await api(`/api/jobs/${job.id}`);
-  let failures = 0;
-  while (received < file.size) {
-    const end = Math.min(received + chunk, file.size);
-    try {
-      ({ received } = await api(`/api/jobs/${job.id}/upload?offset=${received}`, { method: 'PUT', body: file.slice(received, end) }));
-      failures = 0;
-    } catch (e) {
-      if (e.body && typeof e.body.received === 'number') { received = e.body.received; continue; }
-      if (++failures > 5) throw e;
-      await new Promise((r) => setTimeout(r, 2000 * failures));
+  const total = Math.ceil(file.size / chunk);
+  const st = await api(`/api/jobs/${job.id}`);   // resumes after a reload
+  // A server from before parallel pieces has no `missing` list and takes pieces only in order.
+  const todo = st.missing || [...Array(total).keys()].slice(Math.floor(st.received / chunk));
+  const workers = st.missing ? PARALLEL : 1;
+  let done = total - todo.length;
+  const show = () => setPhase(`Uploading… ${Math.floor(100 * done / total)}%`, done / total,
+    'Keep this page open until the upload is done.');
+  show();
+  async function worker() {
+    for (let i = todo.shift(); i !== undefined; i = todo.shift()) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await api(`/api/jobs/${job.id}/upload?offset=${i * chunk}`,
+            { method: 'PUT', body: file.slice(i * chunk, Math.min((i + 1) * chunk, file.size)) });
+          break;
+        } catch (e) {
+          if (e.status === 404 || e.status === 409 || attempt > 5) throw e;
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
+        }
+      }
+      done++;
+      show();
     }
-    setPhase(`Uploading… ${Math.floor(100 * received / file.size)}%`, received / file.size, 'Keep this page open until the upload is done.');
   }
+  await Promise.all(Array.from({ length: workers }, worker));
   await api(`/api/jobs/${job.id}/start`, { method: 'POST' });
 }
 

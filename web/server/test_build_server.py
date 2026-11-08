@@ -4,6 +4,7 @@ against a fake pipeline. No disc or real build needed.
 
   python web/server/test_build_server.py
 """
+import concurrent.futures
 import io
 import json
 import socket
@@ -114,15 +115,22 @@ def main():
         code, _ = call(base, 'GET', f'/api/jobs/{jid}', token='wrong')
         check(code == 404, 'wrong token refused')
         data = iso.read_bytes()
+        n = (len(data) + chunk - 1) // chunk
         code, r = call(base, 'PUT', f'/api/jobs/{jid}/upload?offset=5', tok, data=data[:10])
-        check(code == 409 and r['received'] == 0, 'out-of-order chunk refused with resume offset')
+        check(code == 409 and r['missing'] == list(range(n)), 'misaligned piece refused, missing list returned')
         code, _ = call(base, 'POST', f'/api/jobs/{jid}/start', tok)
         check(code == 409, 'start refused before the upload is complete')
-        off = 0
-        while off < len(data):
-            code, r = call(base, 'PUT', f'/api/jobs/{jid}/upload?offset={off}', tok, data=data[off:off + chunk])
-            off = r['received']
-        check(off == len(data), f'uploaded in {(len(data) + chunk - 1) // chunk} chunks')
+        # The last piece first, then the rest in parallel (as the site does), one of them twice.
+        last = (n - 1) * chunk
+        call(base, 'PUT', f'/api/jobs/{jid}/upload?offset={last}', tok, data=data[last:])
+        code, s = call(base, 'GET', f'/api/jobs/{jid}', tok)
+        check(s['missing'] == list(range(n - 1)) and s['received'] == len(data) - last, 'status lists the missing pieces')
+        with concurrent.futures.ThreadPoolExecutor(6) as pool:
+            codes = list(pool.map(lambda i: call(base, 'PUT', f'/api/jobs/{jid}/upload?offset={i * chunk}', tok,
+                                                 data=data[i * chunk:(i + 1) * chunk])[0], list(range(n - 1)) + [0]))
+        code, s = call(base, 'GET', f'/api/jobs/{jid}', tok)
+        check(all(c == 200 for c in codes) and s['missing'] == [] and s['received'] == len(data),
+              f'{n} pieces in any order and in parallel, a repeated one accepted')
         code, r = call(base, 'POST', f'/api/jobs/{jid}/start', tok)
         check(code == 200, 'build queued')
         for _ in range(100):

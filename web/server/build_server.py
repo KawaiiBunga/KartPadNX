@@ -192,9 +192,11 @@ def new_job(name, size, rr, disc=None):
     job = {'id': job_id, 'token': secrets.token_urlsafe(24), 'size': size, 'rr': rr, 'dir': d,
            'disc': Path(disc) if disc else d / f'upload{ext}', 'internal': disc is not None,
            'state': 'uploading', 'received': 0, 'touched': time.time(), 'stage': '', 'progress': None,
-           'error': None, 'log': collections.deque(maxlen=60), 'rr_version': None, 'out': None}
+           'error': None, 'log': collections.deque(maxlen=60), 'rr_version': None, 'out': None,
+           'chunks': set(), 'nchunks': (size + CHUNK - 1) // CHUNK}
     if not job['internal']:
-        job['disc'].touch()
+        with open(job['disc'], 'wb') as f:
+            f.truncate(size)   # chunks arrive in any order and land at their offset
     JOBS[job_id] = job
     return job
 
@@ -226,8 +228,9 @@ def public(job):
     position = None
     if job['state'] == 'queued':
         position = sum(1 for j in JOBS.values() if j['state'] == 'queued' and j['touched'] <= job['touched'])
+    missing = [i for i in range(job['nchunks']) if i not in job['chunks']] if job['state'] == 'uploading' else []
     return {k: job[k] for k in ('id', 'state', 'size', 'received', 'stage', 'progress', 'error', 'rr_version')} | {
-        'queue_position': position, 'log': list(job['log'])[-12:]}
+        'queue_position': position, 'log': list(job['log'])[-12:], 'missing': missing}
 
 
 def drop_upload(job):
@@ -452,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
                         del TICKETS[t]
                     TICKETS[ticket] = (job['id'], now + TICKET_SECONDS)
                 return self.reply(200, {'url': f'/api/download/{ticket}'})
-            if job['state'] != 'uploading' or job['received'] != job['size']:
+            if job['state'] != 'uploading' or len(job['chunks']) != job['nchunks']:
                 return self.reply(409, {'error': 'the upload is not complete'})
             problem = disc_problem(job['disc'])
             if problem:
@@ -472,21 +475,26 @@ class Handler(BaseHTTPRequestHandler):
         job = self.job(m.group(1))
         if not job:
             return
+        # One CHUNK-sized piece at a CHUNK-aligned offset; the site sends several at once, in any order.
         offset, n = int(m.group(2)), int(self.headers.get('Content-Length') or 0)
         if job['state'] != 'uploading':
             return self.reply(409, {'error': 'this upload is closed'})
-        if offset != job['received'] or n <= 0 or n > CHUNK or offset + n > job['size']:
-            return self.reply(409, {'error': 'out of order', 'received': job['received']})
+        index = offset // CHUNK
+        if offset % CHUNK or index >= job['nchunks'] or n != min(CHUNK, job['size'] - offset):
+            return self.reply(409, {'error': 'bad piece', 'missing': public(job)['missing']})
         with open(job['disc'], 'r+b') as f:
             f.seek(offset)
             left = n
             while left:
                 block = self.rfile.read(min(left, 1 << 20))
                 if not block:
-                    return self.reply(400, {'error': 'upload interrupted', 'received': job['received']})
+                    return self.reply(400, {'error': 'upload interrupted'})
                 f.write(block)
                 left -= len(block)
-        job['received'], job['touched'] = offset + n, time.time()
+        with LOCK:
+            job['chunks'].add(index)
+            job['received'] = sum(min(CHUNK, job['size'] - i * CHUNK) for i in job['chunks'])
+            job['touched'] = time.time()
         return self.reply(200, {'received': job['received']})
 
     def log_message(self, fmt, *args):
