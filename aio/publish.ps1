@@ -23,13 +23,19 @@ Set-Location $repo
 
 function Need($ok, $message) { if (-not $ok) { Write-Host "`n$message" -ForegroundColor Red; exit 1 } }
 function Run($exe) { & $exe @args; if ($LASTEXITCODE) { throw "$exe $($args -join ' ') failed (exit $LASTEXITCODE)" } }
+# Exit code of a check whose failure is an answer, not an error (PowerShell 5.1 turns redirected
+# native stderr into a terminating error under "Stop").
+function ExitCode($exe) {
+    $ErrorActionPreference = "Continue"
+    & $exe @args 2>&1 | Out-Null
+    return $LASTEXITCODE
+}
 
 # Tools: the GitHub CLI, and git (on PATH, or the one GitHub Desktop ships).
 $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
 if (-not $gh -and (Test-Path "$env:ProgramFiles\GitHub CLI\gh.exe")) { $gh = "$env:ProgramFiles\GitHub CLI\gh.exe" }
 Need $gh "The GitHub CLI isn't installed. Run these once, then try again:`n  winget install GitHub.cli`n  gh auth login"
-& $gh auth status *> $null
-Need ($LASTEXITCODE -eq 0) "The GitHub CLI isn't logged in. Run this once, then try again:`n  gh auth login"
+Need ((ExitCode $gh auth status) -eq 0) "The GitHub CLI isn't logged in. Run this once, then try again:`n  gh auth login"
 $git = (Get-Command git -ErrorAction SilentlyContinue).Source
 if (-not $git) {
     $git = Get-ChildItem "$env:LOCALAPPDATA\GitHubDesktop\app-*\resources\app\git\cmd\git.exe" -ErrorAction SilentlyContinue |
@@ -40,8 +46,7 @@ Need $git "git not found (install Git or GitHub Desktop)."
 # The release's tag must hold exactly the code it was built from (the web builder reads its scripts there).
 Need ((& $git rev-parse --abbrev-ref HEAD) -eq "main") "Switch to the main branch first."
 Need (-not (& $git status --porcelain --untracked-files=no)) "You have uncommitted changes. Commit them in GitHub Desktop, then run this again."
-& $gh release view $Version *> $null
-Need ($LASTEXITCODE -ne 0) "A release called $Version already exists. Pick a new version number."
+Need ((ExitCode $gh release view $Version) -ne 0) "A release called $Version already exists. Pick a new version number."
 
 Write-Host "`n== push main" -ForegroundColor Cyan
 Run $gh auth setup-git
