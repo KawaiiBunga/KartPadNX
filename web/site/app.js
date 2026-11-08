@@ -208,10 +208,20 @@ async function showVersions(status) {
 async function findServer() {
   const given = new URLSearchParams(location.search).get('server') || window.KPNX_SERVER;
   if (given) return given;
-  try {
-    const r = await fetch(`https://raw.githubusercontent.com/${REPO}/builder-url/server.txt?t=${Date.now()}`, { cache: 'no-store' });
-    return r.ok ? (await r.text()).trim() : '';
-  } catch { return ''; }
+  // Through the API: raw.githubusercontent.com caches the file ~5 minutes and ignores query strings,
+  // so a restarted builder's new address would show late. The raw CDN is only the fallback (the
+  // API allows 60 requests an hour per visitor).
+  const sources = [
+    [`https://api.github.com/repos/${REPO}/contents/server.txt?ref=builder-url`, { headers: { Accept: 'application/vnd.github.raw' }, cache: 'no-store' }],
+    [`https://raw.githubusercontent.com/${REPO}/builder-url/server.txt`, { cache: 'no-store' }],
+  ];
+  for (const [url, opts] of sources) {
+    try {
+      const r = await fetch(url, opts);
+      if (r.ok) return (await r.text()).trim();
+    } catch { /* try the next one */ }
+  }
+  return '';
 }
 
 (async () => {
