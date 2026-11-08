@@ -253,6 +253,9 @@ def main():
                     help='also run make-prebuilt.py with this AIO work folder (the player then compiles '
                          'only the translated game)')
     ap.add_argument('--bundle', default=None, help='with --prebuilt-data: KartPadNX-Builder.data to take the tools from')
+    ap.add_argument('--launcher', type=Path, default=None,
+                    help='folder with mkw_launcher.elf and mkw-launcher.nacp from launcher/build-native.ps1, '
+                         'instead of the ones in --from-release/--build-root')
     args = ap.parse_args()
     if bool(args.build_root) == bool(args.from_release):
         sys.exit('give exactly one of --from-release (the last release) or --build-root (a Docker build)')
@@ -317,8 +320,9 @@ def main():
     tk.copy_file(BLD / 'build/sdl-switch-vulkan/libSDL3.a', 'build/sdl-switch-vulkan/libSDL3.a')
 
     # Launcher ELF (its NRO is rebuilt around the user's games) and NACP.
-    tk.copy_file(BLD / 'build/launcher/mkw_launcher.elf', 'build/launcher/mkw_launcher.elf')
-    tk.copy_file(BLD / 'build/launcher/mkw-launcher.nacp', 'build/launcher/mkw-launcher.nacp')
+    launcher = args.launcher.resolve() if args.launcher else BLD / 'build/launcher'
+    tk.copy_file(launcher / 'mkw_launcher.elf', 'build/launcher/mkw_launcher.elf')
+    tk.copy_file(launcher / 'mkw-launcher.nacp', 'build/launcher/mkw-launcher.nacp')
 
     # Precompiled renderer shaders, checked against this repo's sources. A release keeps them in
     # aio-prebuilt/dksh with the hashes of the GLSL they came from: a changed shader needs a

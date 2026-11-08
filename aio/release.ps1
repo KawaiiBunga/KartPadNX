@@ -3,6 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File aio\release.ps1                     # from the last release
 #   powershell -ExecutionPolicy Bypass -File aio\release.ps1 -From X.data       # from a given release's .data
 #   powershell -ExecutionPolicy Bypass -File aio\release.ps1 -BuildRoot DIR     # after a Docker source build
+#   ... -Launcher DIR      use the launcher from launcher\build-native.ps1 (aio\publish.ps1 does this)
 #
 # By default the binary parts (Dawn/SDL, the staged runtime, translator, launcher, shaders, PGO,
 # seeds) are taken from the previous release in aio\out\dist, and everything else from this repo,
@@ -11,7 +12,7 @@
 #
 # Output: aio\out\KartPadNX-Builder.zip (the release) and aio\out\dist\. Takes about 20 minutes,
 # mostly compiling the game-independent code (aio\out\work keeps those builds for next time).
-param([string]$From = "", [string]$BuildRoot = "", [switch]$Single)
+param([string]$From = "", [string]$BuildRoot = "", [string]$Launcher = "", [switch]$Single)
 $ErrorActionPreference = "Stop"
 $aio = $PSScriptRoot
 $out = Join-Path $aio "out"
@@ -69,6 +70,7 @@ function Step($name, [scriptblock]$body) {
 $toolkitArgs = @("--out", (Join-Path $out "toolkit"), "--prebuilt-data", (Join-Path $out "work"))
 if ($From) { $toolkitArgs += @("--from-release", $From, "--bundle", $From) }
 else { $toolkitArgs += @("--build-root", $BuildRoot) }
+if ($Launcher) { $toolkitArgs += @("--launcher", $Launcher) }
 
 Step "toolkit (sources from the repo, prebuilt game-independent code)" {
   & $py (Join-Path $aio "toolkit\make-toolkit.py") @toolkitArgs

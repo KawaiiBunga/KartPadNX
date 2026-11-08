@@ -201,7 +201,18 @@ files, no `RetroRewind6`. The translation and game builds are keyed on the verif
 
 ## Making a release
 
-One command, nothing installed, everything kept in `aio\out` (gitignored):
+To publish (push, build the launcher and the release, create the GitHub release; the web builder
+picks it up within 10 minutes):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File aio\publish.ps1 0.2.0
+```
+
+It needs your changes committed and, once, the GitHub CLI (`winget install GitHub.cli`,
+`gh auth login`). It builds the launcher with `launcher\build-native.ps1` (a local devkitPro, no
+Docker) and passes it to `release.ps1 -Launcher`, so launcher changes ship.
+
+Just the release zip, nothing installed, everything kept in `aio\out` (gitignored):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File aio\release.ps1

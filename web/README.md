@@ -20,10 +20,16 @@ Builds always use the **newest GitHub release** of this repo (pre-releases count
 its `KartPadNX-Builder.zip` (toolkit, prebuilt parts, Python) plus the pipeline scripts at that
 release's tag (`aio/pipeline/kpnx_aio.py`, `nxtools.py`, `aio/manifest/tools.json`). The server
 checks for a new release every 10 minutes and downloads it once; a build already running finishes
-on the release it started with. So to update what the site builds: publish a release
-(`aio\release.ps1`, then attach `KartPadNX-Builder.zip` to a new GitHub release). Make the release
-from committed code, since the scripts come from its tag. The first build after a new release takes
-the full time (about an hour); `--warm-disc` does that one for you.
+on the release it started with. So to update what the site builds, commit your changes in GitHub
+Desktop and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File aio\publish.ps1 0.2.0
+```
+
+It pushes, builds the launcher and the release, and publishes it on GitHub (one-time setup:
+`winget install GitHub.cli`, then `gh auth login`). The first build after a new release takes the
+full time (about an hour); `--warm-disc` does that one for you.
 
 Retro Rewind itself comes from Retro Rewind's own feed at build time, if the release's pipeline
 has `rr_from_feed` (releases after 0.1.0-Beta); older ones use the approved list.
