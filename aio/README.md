@@ -4,7 +4,7 @@ A Windows program that turns a user's own Mario Kart Wii disc image into the Kar
 launcher (`mkw-launcher.nro`, with the base game and optionally Retro Rewind packed in).
 Users install nothing: no Docker, WSL, devkitPro, Visual Studio, Python or .NET SDK.
 
-What you distribute is `KartPadNX-Builder.zip` (~283 MB), a folder with two files:
+What is distributed is `KartPadNX-Builder.zip` (~283 MB), a folder with two files:
 
 ```
 KartPadNX-Builder.exe    ~125 KB, the frontend (the pipeline scripts are embedded)
