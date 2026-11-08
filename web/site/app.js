@@ -2,7 +2,7 @@
 // KartPadNX web builder front end: checks the disc header locally, uploads the image in chunks
 // to the build server, follows the build and downloads the SD card zip.
 
-const SERVER = (new URLSearchParams(location.search).get('server') || window.KPNX_SERVER || '').replace(/\/+$/, '');
+let SERVER = '';   // set at start (findServer)
 const $ = (id) => document.getElementById(id);
 const store = {
   get() { try { return JSON.parse(localStorage.getItem('kpnx-job') || 'null'); } catch { return null; } },
@@ -189,10 +189,21 @@ async function showVersions(status) {
 
 // ---- start ----
 
+// ?server=, then config.js, then the address web/start-builder.ps1 last published.
+async function findServer() {
+  const given = new URLSearchParams(location.search).get('server') || window.KPNX_SERVER;
+  if (given) return given;
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${REPO}/builder-url/server.txt?t=${Date.now()}`, { cache: 'no-store' });
+    return r.ok ? (await r.text()).trim() : '';
+  } catch { return ''; }
+}
+
 (async () => {
-  if (!SERVER || SERVER.includes('example.com')) {
+  SERVER = (await findServer()).replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(SERVER)) {
     showVersions(null);
-    $('server').textContent = 'Not open yet. Check back soon.';
+    $('server').textContent = 'Closed right now. Try again later.';
     $('server').className = 'pill bad';
     return;
   }

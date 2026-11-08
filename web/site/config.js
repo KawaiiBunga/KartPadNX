@@ -1,2 +1,3 @@
-// The build server (web/server/build_server.py) behind its tunnel. ?server=https://... overrides it.
-window.KPNX_SERVER = 'https://builder.example.com';
+// The build server's address. Empty: read it from the builder-url branch, which
+// web/start-builder.ps1 updates every time it starts. ?server=https://... overrides both.
+window.KPNX_SERVER = '';

@@ -199,6 +199,29 @@ def new_job(name, size, rr, disc=None):
     return job
 
 
+PRIVATE_TEXT = [
+    # Windows and UNC paths, to the end of the line or a quote (folder names can hold spaces).
+    (re.compile(r'(?<![A-Za-z])[A-Za-z]:[\\/][^"\'<>|\r\n]*'), '<path>'),
+    (re.compile(r'\\\\[^"\'<>|\r\n]+'), '<path>'),
+    (re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?![\w.])'), '<ip>'),  # IPv4 (LAN or public)
+    (re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}\b'), '<ip>'),      # IPv6
+]
+
+
+def scrub(value):
+    """Everything the server sends to a browser goes through here: no local paths or IP addresses
+    from build logs or error messages reach players."""
+    if isinstance(value, str):
+        for pattern, repl in PRIVATE_TEXT:
+            value = pattern.sub(repl, value)
+        return value
+    if isinstance(value, dict):
+        return {k: scrub(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub(v) for v in value]
+    return value
+
+
 def public(job):
     position = None
     if job['state'] == 'queued':
@@ -310,6 +333,7 @@ def warmer():
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'KartPadNX-web/1'
+    sys_version = ''   # no Python version in the Server header
 
     def cors(self):
         self.send_header('Access-Control-Allow-Origin', ARGS.origin)
@@ -318,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Expose-Headers', 'Content-Length')
 
     def reply(self, code, body):
-        data = json.dumps(body).encode()
+        data = json.dumps(scrub(body)).encode()
         self.send_response(code)
         self.cors()
         self.send_header('Content-Type', 'application/json')

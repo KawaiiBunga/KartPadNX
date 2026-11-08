@@ -31,6 +31,7 @@ out = pathlib.Path(a.out)
 (out / 'INSTALL.txt').write_text('copy to SD')
 print('@@' + json.dumps({'stage': 'build-base', 'title': 'Compiling'}), flush=True)
 print('fake log line', flush=True)
+print(r'reading C:\Users\someone\KartPadNX\private\web-builder\jobs\x\upload.iso from 192.168.1.165:5000 and fe80:0:0:0:1:2:3:4', flush=True)
 print('@@' + json.dumps({'progress': 'x', 'done': 1, 'total': 2}), flush=True)
 print('@@' + json.dumps({'rr_version': '9.9.9' if a.rr else None}), flush=True)
 nro = pathlib.Path(a.out) / 'switch/mkw-launcher.nro'
@@ -131,6 +132,10 @@ def main():
             time.sleep(0.2)
         check(s['state'] == 'done' and s['rr_version'] == '9.9.9' and 'fake log line' in s['log'],
               f'build finished with RR version and log ({s["state"]} {s["error"]})')
+        leaked = json.dumps(s)
+        check('someone' not in leaked and '192.168' not in leaked and 'fe80' not in leaked
+              and 'reading <path>' in s['log'],
+              'paths and IP addresses are scrubbed from what players see')
         code, t = call(base, 'POST', f'/api/jobs/{jid}/ticket', tok)
         check(code == 200 and t['url'].startswith('/api/download/'), 'one-time download link issued')
         code, raw = call(base, 'GET', t['url'])

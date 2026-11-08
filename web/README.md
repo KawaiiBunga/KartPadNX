@@ -37,36 +37,35 @@ has `rr_from_feed` (releases after 0.1.0-Beta); older ones use the approved list
 `--pipeline aio\pipeline\kpnx_aio.py` builds from this checkout and its `aio\out` instead (for
 testing changes before a release).
 
-## Setup (once)
+## Opening and closing it
 
-1. Have `aio\out\python` and `aio\out\obj\nxshim.exe` on this PC (run `aio\release.ps1` once if
-   they're missing). The builds themselves come from the newest GitHub release (below). About 80 GB free for the work folder: the shared
-   build cache, plus ~6.5 GB per finished build (kept 24 hours) and the uploads in progress.
-2. Start the server:
+**Open:** double-click `web\start-builder.cmd`. It starts the build server, starts a free
+Cloudflare tunnel (installs `cloudflared` the first time), and publishes the tunnel's address to
+the `builder-url` branch, where the site reads it. **Close:** close that window (or Ctrl+C); the
+site then shows "Closed".
 
-   ```powershell
-   aio\out\python\python.exe web\server\build_server.py --work D:\kpnx-web `
-     --origin https://kawaiibunga.github.io --warm-disc iso\RMCP01.wbfs
-   ```
+Needs: `aio\out\python` and `aio\out\obj\nxshim.exe` (run `aio\release.ps1` once), the GitHub CLI
+logged in (`gh auth login`), and about 80 GB free in the work folder (`private\web-builder`: the
+shared build cache, ~6.5 GB per finished build for 24 hours, uploads in progress). With
+`iso\RMCP01.wbfs` present it prebuilds each new release and Retro Rewind with your disc, so the
+first player after an update doesn't wait an hour. Logs: `private\web-builder\server.log` and
+`tunnel.log`.
 
-   `--warm-disc` makes it build with your disc whenever Retro Rewind's feed has a new version, so
-   the first player after an RR update doesn't wait an hour.
-3. Give it a public HTTPS address. Easiest is a Cloudflare tunnel (free, no port forwarding):
+Once: GitHub repo > Settings > Pages > Source: **GitHub Actions** (the workflow
+`.github/workflows/pages.yml` publishes `web/site` on every push that changes it).
 
-   ```powershell
-   cloudflared tunnel --url http://localhost:8787
-   ```
+The link to share is `https://kawaiibunga.github.io/KartPadNX/`. `?server=https://...` on it tries
+another server.
 
-   It prints a `https://<random>.trycloudflare.com` address. That address changes every time
-   cloudflared restarts; for a fixed one, set up a named tunnel on a domain you own.
-4. Put that address in `web/site/config.js` (`window.KPNX_SERVER = 'https://...';`), commit and
-   push.
-5. Turn on Pages once: GitHub repo > Settings > Pages > Source: **GitHub Actions**. The workflow
-   (`.github/workflows/pages.yml`) publishes `web/site` on every push that changes it. Pages on a
-   free account needs the repo to be public.
+## Your IP address
 
-The link to share is `https://kawaiibunga.github.io/KartPadNX/`. To try a different server without
-pushing, add `?server=https://...` to that link.
+Players never connect to your PC: the page comes from GitHub and every request goes through
+Cloudflare's tunnel, which your PC reaches with outgoing connections only. The server listens on
+`127.0.0.1` only, so nothing on your network or the internet can reach it directly. Everything it
+sends back passes `scrub()` in `build_server.py`, which removes local paths and IP addresses from
+build logs and error messages, and its `Server` header names no Python version. The `builder-url`
+branch holds only the `trycloudflare.com` address. Your PC's own address is still seen by the sites
+it downloads from (GitHub, Retro Rewind's CDN), as with any download.
 
 ## How it behaves
 
