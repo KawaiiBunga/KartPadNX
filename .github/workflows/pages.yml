@@ -21,6 +21,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      # Browsers cache Pages files for 10 minutes; a per-commit query makes them fetch new code at once.
+      - run: sed -i -E "s/(config\.js|app\.js|style\.css)\"/\1?v=${GITHUB_SHA::8}\"/g" web/site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/site
