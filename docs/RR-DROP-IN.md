@@ -1,9 +1,36 @@
 # Drop-in Retro Rewind code updates: what it would take
 
 Goal: copy a new `RetroRewind6` folder to the SD card and play, with no rebuild, even when
-`Code.pul` changed. Status: **not started**. What ships today instead: the builder takes the newest
+`Code.pul` changed. Status: **started, not wired into the game** (steps 1-2 below exist in
+`switch/src/dropin/`, steps 3-5 are open). What ships today instead: the builder takes the newest
 RR from its own feed (no approval, no push), the web builder rebuilds by itself, and file mods load
 at runtime (launcher Mods tab -> `Config.toml [paths] overlay_roots`).
+
+## Status (2026-11-08)
+
+| Piece | State |
+|---|---|
+| Runtime Kamek loader (`dropin/kamek_loader.{h,cpp}`) | Done. Byte-exact against `translate-mod` for RR 6.13.4: module image, code SHA-1 at `0x800017B0`, constructor range, all 1,482 patches. Loads 6.13.5 too. |
+| Interpreter (`dropin/ppc_interpreter.{h,cpp}`) | Written and host-tested: integer, branches, CR, loads/stores, scalar FP, paired singles, psq. Same FP/memory helpers as translated code. Runs real `main.dol` functions (strlen, memcpy, strcmp, PSMTXConcat, PSVECDotProduct, PSMTXMultVec). Compiles for aarch64 with the AIO toolchain. Not in the game build, never run on hardware. |
+| Validity gate, register sync, float ABI export (steps 3-4, below) | Not started (translator). |
+
+Tests: `bash switch/src/dropin/tests/run-dropin-tests.sh <work>/ws [main.dol] [Code.pul translate-mod-dir]`
+(WSL, clang++, x86-64). `tests/runtime_stubs.cpp` stands in for the runtime's memory tables and
+slow paths with one flat RAM mapping.
+
+Two things found while building them:
+
+- **Link base.** `translate-mod` resolves hook targets at `module_link_base` `0x803992E0` (where
+  Pulsar puts the module on a Wii) and its codegen remaps `[0x803992E0, +codeSize)` to `0x81800000`.
+  The runtime loader resolves everything at `0x81800000` directly, so interpreted code and the
+  patched base instructions agree on one address. The baked module image is already at
+  `0x81800000`.
+- **FPR representation.** In `CpuContext` an FPR holds either a scalar double or a packed pair, and
+  the translator decides which statically and per function (`IsGuestScalarFloatArgument`, paired
+  returns in `EmitNormalizeGuestCallFloatArguments/Return`). The interpreter tracks it per register
+  at run time (`dropin::State::paired`) and converts operands with the same
+  `PPC_PsToScalarInline` / `PPC_PsFromScalarInline` calls. Across a call into translated code it
+  needs that per-function ABI (step 6).
 
 ## Why a new Code.pul needs a rebuild today
 
@@ -45,6 +72,15 @@ pass the wrong registers.
    set would still need a rebuild (the loader can detect that and say so).
 5. Mod functions move between versions (absolute addresses inside the module change), so matching
    build-time translations by address mostly fails; match by content with relocations masked.
+6. **Export the translator's per-function float ABI** (which f-registers a callee takes as
+   scalars, whether it returns a pair in f1) into the runtime, so `InterpHooks::beforeNative` /
+   `afterNative` convert FPR representations the way a translated caller would.
+7. **Retro-WFC payload**: also translated at build time (`RetroWfcPayload.cs`, the static pointers in
+   `mod_data_patches.cpp`); it needs the same loader-plus-interpreter treatment.
+8. **Wiring**: load `Code.pul` from the SD card in place of `InitializeModuleImage` /
+   `ApplyExecutableBasePatches`, run its constructors through the interpreter, and route
+   `InvokeIndirectCpu` misses for module addresses to `dropin::Run`. Then a decoded-instruction
+   cache if interpreted hooks cost too much.
 
 ## Cost and risk
 
