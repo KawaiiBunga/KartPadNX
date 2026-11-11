@@ -143,3 +143,19 @@ Mods: folders in `sdmc:/switch/kartpad/mods/` are listed in the Mods tab and swi
 `Config.toml` `[paths] overlay_roots`; the runtime's Riivolution layer (`riivolution.cpp`,
 `dvd.cpp`) mounts each as a disc-shaped overlay, or applies its `riivolution/*.xml`, above the
 disc and Retro Rewind. File replacement only: memory and code patches aren't applied.
+A Riivolution pack's options are chosen on the mod's screen and saved in the pack's own
+`riivolution/config/RMCP.xml` (Riivolution/Dolphin's choices file, which `riivolution.cpp` reads);
+a pack with none gets every option on except those whose files include a `.dol`/`.rel`.
+Mods of loose files ("My Stuff", anything without its own XML or a disc layout) are never written
+to: the launcher writes one `sdmc:/switch/kartpad/riivolution/KartPadNX Mods.xml` (that folder is
+then the overlay root, so externals reach `mods/` and `mods-generated/`) mapping each enabled
+folder by file name, later patches winning. Files that belong inside archives are injected by
+`data/mod_builder.cpp` before the launch: `.szs` members matched by name (narrowed by folder
+names such as `Driver/`), character `.png` icons converted to the archive's TPL, BrawlBox
+`.brwsd`/`.brbnk` exports replaced in `revo_kart.brsar` (appended, tables repointed), and
+Wheel Wizard / Pulsar patch files (`<name>.<Archive>.szs` holding only changed members, `.delete`
+entries, `<name>.revo_kart.szs` for the sound bank, loose `<member>.<Archive>`). The patched
+copies go to `sdmc:/switch/kartpad/mods-generated/<game>/` and are rebuilt only when a mod file
+or a base archive changes (`inputs.txt`; `build-log.txt` lists what went where). New mod folders
+are switched on for both games the first time the launcher sees them (`config.json`
+`known_mods`).

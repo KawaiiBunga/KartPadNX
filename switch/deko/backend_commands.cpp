@@ -2,7 +2,10 @@
 // record closures; queue submission replays them into the frame's deko3d command buffer, where
 // the draw state (bindings, pipeline, split RGB/alpha blending) is applied. See
 // backend_internal.h for the whole adapter.
+#include <switch.h>
 #include "backend_internal.h"
+#include <cstdlib>
+#include <thread>
 #ifdef COS_DK_DEBUG_LIB
 #include "present_vsh_dksh.h"
 #include "probe_fsh_dksh.h"
@@ -45,7 +48,11 @@ template <size_t N> void copy_label(char (&out)[N], const char *label) {
 // Reports write a value and timestamp into permanent, CPU-uncached memory.
 // Neither this storage nor its CPU history moves while commands are in flight.
 // Reuse requires the old GPU-written serial, rather than a CPU submit count.
+#ifdef COS_DK_GPU_HUNT
+constexpr size_t kGpuBreadcrumbs = 32768;  // every operation is tracked: ~2 s of racing at ~260 per frame
+#else
 constexpr size_t kGpuBreadcrumbs = 16384;
+#endif
 struct Breadcrumb {
   OperationRecord operation{nullptr, 0, {}};
   uint64_t frame = 0, vs = 0, fs = 0, targetAddress = 0, depthAddress = 0;
@@ -58,6 +65,62 @@ struct Breadcrumb {
 std::array<Breadcrumb, kGpuBreadcrumbs> gpuBreadcrumbs;
 Block gpuReports;
 void log_gpu_breadcrumbs();
+uint64_t breadcrumb_value(uint64_t serial);
+#ifdef COS_DK_GPU_HUNT
+// GPU hunt: every operation gets a breadcrumb (not only course transitions), submission is left
+// exactly as normal, and a watchdog thread notices within kHuntStallMs when submitted work stops
+// completing. It then logs the breadcrumbs around the first operation the GPU never finished:
+// the one it hung on. Recording stops on the first stall so the evidence isn't overwritten.
+constexpr uint64_t kHuntStallMs = 1500;
+std::atomic<uint64_t> huntRecorded{0};   // highest serial with a breadcrumb written into a command buffer
+std::atomic<uint64_t> huntSubmitted{0};  // highest serial handed to the queue
+std::atomic<bool> huntReported{false};
+void (*huntStop)() = nullptr;  // set once the watchdog runs
+void start_gpu_hunt() {
+  static Thread watchdog;
+  static const bool started = [] {
+    swdk::dklog("GPU hunt: every GPU operation records a completion marker; stall watchdog %llu ms",
+                (unsigned long long)kHuntStallMs);
+    // A libnx thread: a std::thread here ended the game with std::terminate() on the console.
+    static std::atomic<bool> stop{false};
+    auto run = [](void *) {
+      uint64_t completed = 0, lastProgressNs = now_ns();
+      while (!stop.load(std::memory_order_relaxed)) {
+        svcSleepThread(100'000'000);
+        const uint64_t submitted = std::min(huntSubmitted.load(std::memory_order_acquire),
+                                            huntRecorded.load(std::memory_order_acquire));
+        // Contiguous completion: every operation is tracked, so the GPU's progress is the first gap.
+        uint64_t scanned = 0;
+        while (completed < submitted && breadcrumb_value(completed + 1) == completed + 1 && ++scanned < 1u << 16)
+          ++completed;
+        const uint64_t now = now_ns();
+        if (completed >= submitted || scanned) {
+          lastProgressNs = now;
+          continue;
+        }
+        if (now - lastProgressNs < kHuntStallMs * 1'000'000 || huntReported.exchange(true)) continue;
+        std::fprintf(stderr, "[gpu-hunt] GPU STOPPED: last completed operation %llu, %llu submitted after it, "
+                     "no progress for %llu ms. The hung operation is the first missing one below.\n",
+                     (unsigned long long)completed, (unsigned long long)(submitted - completed),
+                     (unsigned long long)((now - lastProgressNs) / 1'000'000));
+        log_gpu_breadcrumbs();
+        std::fflush(stderr);
+      }
+    };
+    if (R_FAILED(threadCreate(&watchdog, run, nullptr, nullptr, 0x10000, 0x2C, -2)) || R_FAILED(threadStart(&watchdog))) {
+      swdk::dklog("GPU hunt: watchdog thread could not start; breadcrumbs are still recorded");
+    } else {
+      huntStop = [] {
+        stop.store(true, std::memory_order_relaxed);
+        threadWaitForExit(&watchdog);
+        threadClose(&watchdog);
+      };
+    }
+    return true;
+  }();
+  (void)started;
+}
+#endif
 uint64_t breadcrumb_value(uint64_t serial) {
   if (!gpuReports) return 0;
   return reinterpret_cast<volatile const uint64_t *>(gpuReports.cpu)[(serial % kGpuBreadcrumbs) * 2];
@@ -104,6 +167,10 @@ void breadcrumb_end() {
   dkCmdBufReportValue(R.cmd, uint32_t(gpuOperationSerial),
                       gpuReports.gpu + (gpuOperationSerial % kGpuBreadcrumbs) * 16);
   record.recorded = true;
+#ifdef COS_DK_GPU_HUNT
+  start_gpu_hunt();
+  huntRecorded.store(gpuOperationSerial, std::memory_order_release);
+#endif
   static uint64_t nextSampleFrame = 0;
   if (record.frame >= nextSampleFrame) {
     const uint64_t sample = gpuOperationSerial > 2048 ? gpuOperationSerial - 2048 : 1;
@@ -182,6 +249,17 @@ bool synchronous_operation() {
   return R.synchronous;
 }
 #endif
+// perf.cfg gpu_copy_sync 1 (diagnostic): only the copy-engine operations complete before the next one.
+// Every recorded hang sits at an EFB snapshot image copy or among texture uploads, both copy-engine
+// work; with the guard off (gpu_guard 0) this tells whether that engine's ordering is the cause.
+bool copy_engine_sync() {
+  static const bool on = kartpad_opt && kartpad_opt("gpu_copy_sync", 0) != 0;
+  if (!on) return false;
+  for (const char *name : {"image copy", "buffer copy", "buffer to image", "image to buffer", "buffer upload",
+                           "texture upload", "buffer clear"})
+    if (std::strcmp(gpuOperation, name) == 0) return true;
+  return false;
+}
 }
 void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
   static const bool announced = [] {
@@ -209,7 +287,12 @@ void gpu_operation_begin(const char *name, uint64_t a, uint64_t b, uint64_t c) {
 #ifdef COS_DK_GPU_BREADCRUMBS
   // Steady state records no breadcrumb (its report is a GPU write and flush per operation); slots
   // only ever hold completed transition operations, so breadcrumb_begin's reuse check still holds.
+#ifdef COS_DK_GPU_HUNT
+  synchronous_operation();   // keep the course-transition policy exactly as in normal builds
+  gpuOperationTracked = !huntReported.load(std::memory_order_relaxed);
+#else
   gpuOperationTracked = steady_v9() || synchronous_operation();
+#endif
   if (gpuOperationTracked) breadcrumb_begin();
 #endif
 }
@@ -229,7 +312,7 @@ void gpu_operation_end(bool flushBoundary) {
           static_cast<unsigned long long>(R.frame + 1));
   }
 #else
-  if (synchronous_operation()) {
+  if (synchronous_operation() || copy_engine_sync()) {
     // v3's checkpoint without its validation: the operation and everything before it finish now.
     DkFence fence{};
     dkCmdBufSignalFence(R.cmd, &fence, true);
@@ -267,6 +350,16 @@ void gpu_operation_image_copy(const Tex &source, const Tex &destination,
   copy_label(gpuImageCopy.source, source.label.c_str());
   copy_label(gpuImageCopy.destination, destination.label.c_str());
 }
+#ifdef COS_DK_GPU_HUNT
+// Called right after the queue is flushed (device.cpp): everything recorded so far is the GPU's.
+void gpu_hunt_flushed() { huntSubmitted.store(huntRecorded.load(std::memory_order_acquire), std::memory_order_release); }
+// Quit to launcher (main_switch.cpp) leaves through _Exit, which skips atexit. The launcher then
+// loads into this same process, so a thread left running executes unmapped code (crash report
+// 2026-11-08 16:10: only "hbl" loaded).
+extern "C" void kartpad_deko_stop_threads() {
+  if (huntStop) huntStop();
+}
+#endif
 #ifdef COS_DK_GPU_FLUSHES
 void gpu_operation_queue_submitted() {
   // Submit the short tail too: a caller can enqueue fewer than the limit and
@@ -305,6 +398,44 @@ void log_gpu_operation_context() {
   }
 }
 #endif
+// The NVIDIA timeouts (2348-0006) at course loads all stopped on copy-engine work: an EFB snapshot
+// image copy or texture uploads among 3D passes. Completing only those operations on the CPU before
+// the next (perf.cfg gpu_copy_sync 1, course-load guard off) ended them on hardware (2026-11-11), so
+// the same ordering is kept on the GPU: a fence after the copy that the GPU's front end waits on, so
+// nothing recorded later starts before the copy is done. No CPU wait, no extra submit.
+void copy_engine_fence() {
+  // The queue reads each DkFence when it processes the submit that carries it: keep them until then.
+  static std::array<DkFence, 2048> fences;
+  static size_t used = 0;
+  static uint64_t submitsSeen = 0;
+  if (submit_stats().submits != submitsSeen) {
+    submitsSeen = submit_stats().submits;
+    used = 0;
+  }
+  if (used == fences.size()) {
+    submit("copy-engine fences");
+    submitsSeen = submit_stats().submits;
+    used = 0;
+  }
+  DkFence &fence = fences[used++];
+  fence = {};
+  dkCmdBufSignalFence(R.cmd, &fence, true);
+  dkCmdBufWaitFence(R.cmd, &fence);
+}
+// A full barrier is two GPU queue (gpfifo) entries, and libnx hands entries to the GPU only at the
+// present or when 2040 are waiting. A vanilla 2P menu frame (hundreds of render passes, each with
+// two barriers) reached 2040, and that kickoff timed out waiting for room in the 2048-entry ring
+// (2348-0006, 2026-11-11). Sending the work every 128 barriers keeps each kickoff small and lets the
+// GPU start on it early.
+void barrier(uint32_t extraInvalidations) {
+  dkCmdBufBarrier(R.cmd, DkBarrier_Full,
+                  DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache | extraInvalidations);
+  static unsigned sinceKickoff = 0;
+  if (++sinceKickoff >= 128) {
+    sinceKickoff = 0;
+    submit_readback("gpfifo chunk");
+  }
+}
 Binding *binding(BoundGroup &g, uint32_t b) {
   if (g.group)
     for (auto &e : g.group->entries)
@@ -695,6 +826,7 @@ void __wrap_wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffe
     kd::open();
     kd::barrier();
     dkCmdBufCopyBuffer(swdk::R.cmd, source->mem.gpu + so, d->mem.gpu + off, n);
+    kd::copy_engine_fence();
     // DMA writes can replace uniforms/storage at an address the shader has
     // already cached. L2 invalidation alone does not invalidate that cache.
     kd::barrier(DkInvalidateFlags_Shader);
@@ -732,6 +864,7 @@ void __wrap_wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e,
     DkImageRect sr{sx, sy, s.origin.z, w, h, n.depthOrArrayLayers},
         dr{dx, dy, d.origin.z, w, h, n.depthOrArrayLayers};
     dkCmdBufCopyImage(swdk::R.cmd, &sv, &sr, &dv, &dr, 0);
+    kd::copy_engine_fence();
     kd::barrier();
     checkpoint.finish(true);
   });
@@ -761,6 +894,7 @@ void __wrap_wgpuCommandEncoderCopyBufferToTexture(WGPUCommandEncoder e,
     DkCopyBuf b{s->mem.gpu + layout.offset, row, row * rows};
     DkImageRect r{d.origin.x, d.origin.y, d.origin.z, n.width, n.height, n.depthOrArrayLayers};
     dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &dv, &r, 0);
+    kd::copy_engine_fence();
     kd::barrier();
     s->used();
     checkpoint.finish(true);
@@ -789,6 +923,7 @@ void __wrap_wgpuCommandEncoderCopyTextureToBuffer(WGPUCommandEncoder e,
     DkCopyBuf b{d->mem.gpu + layout.offset, row, row * rows};
     DkImageRect r{s.origin.x, s.origin.y, s.origin.z, n.width, n.height, n.depthOrArrayLayers};
     dkCmdBufCopyImageToBuffer(swdk::R.cmd, &sv, &r, &b, 0);
+    kd::copy_engine_fence();
     kd::barrier(DkInvalidateFlags_Shader);
     checkpoint.finish(true);
   });
@@ -807,6 +942,7 @@ void __wrap_wgpuCommandEncoderClearBuffer(WGPUCommandEncoder e, WGPUBuffer b, ui
     auto temp = swdk::block_create(n, "buffer clear");
     memcpy(temp.cpu, zero.data(), n);
     dkCmdBufCopyBuffer(swdk::R.cmd, temp.gpu, d->mem.gpu + off, n);
+    kd::copy_engine_fence();
     swdk::block_free_deferred(temp.block);
     kd::barrier(DkInvalidateFlags_Shader);
     checkpoint.finish(true);
@@ -824,6 +960,7 @@ void __wrap_wgpuQueueWriteBuffer(WGPUQueue q, WGPUBuffer h, uint64_t off, const 
   auto temp = kd::upload_allocation(n);
   memcpy(temp->mem.cpu, data, n);
   dkCmdBufCopyBuffer(swdk::R.cmd, temp->mem.gpu, b->mem.gpu + off, n);
+  kd::copy_engine_fence();
   temp->used();
   kd::barrier(DkInvalidateFlags_Shader);
   checkpoint.finish(true);
@@ -852,6 +989,7 @@ void __wrap_wgpuQueueWriteTexture(WGPUQueue q, const WGPUTexelCopyTextureInfo *d
   DkImageRect r{dst->origin.x, dst->origin.y, dst->origin.z,
                 size->width,   size->height,  size->depthOrArrayLayers};
   dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &v, &r, 0);
+  kd::copy_engine_fence();
   temp->used();
   kd::barrier();
   checkpoint.finish(true);

@@ -43,7 +43,7 @@ private:
     bool settingsDirty_ = false;
     bool plusWasHeld_ = false;
     std::vector<std::string> modNames_;   // Mods tab rows
-    std::unique_ptr<bool[]> modOn_;       // their toggles
+    bool entered_ = false;                // OnEnter runs again on returning from a sub-screen
 };
 
 }  // namespace screens

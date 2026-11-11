@@ -37,6 +37,11 @@ extern "C" void cos_switch_flush_logs(void);  // backend_present.cpp
 extern "C" void kartpad_log_flush_sync(void);
 extern "C" void kartpad_deko_log_failure_context();
 
+#ifdef COS_DK_GPU_HUNT
+namespace kd { void gpu_hunt_flushed(); }  // backend_commands.cpp
+#endif
+extern "C" void kartpad_gpu_present_done(void) __attribute__((weak));  // switch/src/transition_guard.cpp
+
 namespace swdk {
 
 Renderer R;
@@ -339,6 +344,9 @@ void submit_readback(const char* why) {
     submit(why);
     std::lock_guard<std::mutex> lock(fence_mutex());
     dkQueueFlush(R.queue);
+#ifdef COS_DK_GPU_HUNT
+    kd::gpu_hunt_flushed();
+#endif
 }
 
 bool present_acquire(PresentImage* image) {
@@ -400,7 +408,11 @@ void frame_present(PictureFn picture, void* user, const PresentImage* acquired) 
     const uint64_t t3 = now_ns();
     submit_list();
     check_queue("the present");
-    dkQueuePresentImage(R.queue, g_swapchain, slot);
+    dkQueuePresentImage(R.queue, g_swapchain, slot);  // flushes the queue
+#ifdef COS_DK_GPU_HUNT
+    kd::gpu_hunt_flushed();
+#endif
+    if (kartpad_gpu_present_done) kartpad_gpu_present_done();
     const uint64_t t4 = now_ns();
     R.frame = frame;
     R.frameOpen = false;

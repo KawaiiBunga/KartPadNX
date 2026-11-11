@@ -10,6 +10,7 @@
 #include "app/app.h"
 #include "mkw/data.h"
 #include "screens/flow.h"
+#include "screens/mod_screen.h"
 
 namespace screens {
 
@@ -94,22 +95,18 @@ void MainScreen::BuildMods(app::App& app) {
         return;
     }
 
-    auto& enabled = app.settings().mods[static_cast<int>(profileVariant_)];
-    modOn_ = std::make_unique<bool[]>(modNames_.size());
-    for (size_t i = 0; i < modNames_.size(); ++i) {
-        modOn_[i] = std::find(enabled.begin(), enabled.end(), modNames_[i]) != enabled.end();
-    }
-    // Five rows fit; a long list scrolls by page with the last row.
+    const auto& enabled = app.settings().mods[static_cast<int>(profileVariant_)];
+    // Five rows fit; a long list scrolls by page with the last row. A opens the mod's own screen.
     constexpr size_t kRows = 5;
     const size_t first = std::min(static_cast<size_t>(modPage_) * kRows, (modNames_.size() - 1) / kRows * kRows);
     float y = kBodyTop + 62;
     for (size_t i = first; i < modNames_.size() && i < first + kRows; ++i) {
-        Track(Add<ui::ToggleRow>(Rect{x, y, w, 50}, modNames_[i], &modOn_[i], [this, &app, i](bool on) {
-            auto& list = app.settings().mods[static_cast<int>(profileVariant_)];
-            list.erase(std::remove(list.begin(), list.end(), modNames_[i]), list.end());
-            if (on) list.push_back(modNames_[i]);
-            settingsDirty_ = true;
-        }));
+        const std::string name = modNames_[i];
+        const bool on = std::find(enabled.begin(), enabled.end(), name) != enabled.end();
+        auto* row = Add<ui::ListRow>(Rect{x, y, w, 50}, name, [on]() { return std::string(on ? "On" : "Off"); },
+                                     [this, &app, name]() { app.Push(std::make_unique<ModScreen>(name, profileVariant_)); });
+        row->SetIcon(ui::icon::kTune);
+        Track(row);
         y += 56;
     }
     if (modNames_.size() > kRows) {
@@ -132,6 +129,7 @@ void MainScreen::Launch(app::App& app, Variant v) {
     }
     mkw::LauncherSettings& s = app.settings();
     s.lastVariant = v == Variant::RetroRewind ? 1 : 0;
+    mkw::Settings().PickUpNewMods(s);  // folders copied over while the launcher was open
     mkw::Settings().Save(s);
     settingsDirty_ = false;
     if (!mkw::Settings().ApplyMods(v, s)) {

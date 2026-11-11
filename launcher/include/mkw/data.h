@@ -149,6 +149,16 @@ public:
 
 // ---- Settings ----------------------------------------------------------------------------
 
+// One option of a Riivolution mod (its riivolution/*.xml), as the Riivolution menu shows it.
+struct ModOption {
+    std::string id;                    // Riivolution's config id: the option's id, or section + name
+    std::string section;
+    std::string name;
+    std::vector<std::string> choices;  // choice names; selected 0 is off, 1.. is choices[selected - 1]
+    int selected = 0;
+    bool replacesCode = false;         // a choice swaps a .dol/.rel, which this port can't run: keep it off
+};
+
 // Launcher settings (sdmc:/switch/mkw-launcher/config.json) and the Config.toml keys of the
 // game (runtime_config.h) that the launcher edits.
 struct LauncherSettings {
@@ -160,6 +170,8 @@ struct LauncherSettings {
     bool backupBeforeLaunch = true;
     // Enabled mod folders (names under kModsDir), per game: [0] vanilla, [1] Retro Rewind.
     std::vector<std::string> mods[2];
+    // Mod folders the launcher has seen; a folder not in here is new and gets switched on.
+    std::vector<std::string> knownMods;
 
     // Game audio (Config.toml [audio])
     int masterVolume = 100;  // volume
@@ -188,9 +200,18 @@ public:
     // Mod folders in kModsDir, sorted by name. Each is a disc-shaped file overlay (files replace
     // the disc's at the same path) or a Riivolution pack with a riivolution/*.xml.
     virtual std::vector<std::string> ListMods() = 0;
+    // Switches newly added mod folders on for both games and records them in knownMods (so one
+    // the player turns off stays off). True if anything changed. Load does this too.
+    virtual bool PickUpNewMods(LauncherSettings& s) = 0;
     // Points the game's Config.toml [paths] overlay_roots at this game's enabled mods that still
     // exist, so the next launch loads them. No game rebuild needed.
     virtual bool ApplyMods(Variant v, const LauncherSettings& s) = 0;
+    // A Riivolution mod's options with their current choices: the mod's riivolution/config/RMCP.xml
+    // when it has one, else every option on except those that replace game code. Empty for a plain
+    // file mod.
+    virtual std::vector<ModOption> ModOptions(const std::string& mod) = 0;
+    // Saves the choices to the mod's riivolution/config/RMCP.xml, which the game reads.
+    virtual bool SaveModOptions(const std::string& mod, const std::vector<ModOption>& options) = 0;
     virtual ~SettingsService() = default;
 };
 

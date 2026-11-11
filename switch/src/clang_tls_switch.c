@@ -119,12 +119,16 @@ static void* kartpad_tls_thread_trampoline(void* raw) {
 // switch-worker-thread-stack-size.
 extern void _exit(int) __attribute__((noreturn));
 
-// Weak so the lightweight fixture targets link without the async log sink.
+// Weak so the lightweight fixture targets link without the async log sink or main_switch.cpp.
 extern void kartpad_log_flush_sync(void) __attribute__((weak));
+extern void kartpad_request_return_to_launcher(void) __attribute__((weak));
 
 __attribute__((noreturn)) void __wrap_exit(int code) {
-  // fini is skipped, so nothing else drains the buffered runtime log.
-  if (kartpad_log_flush_sync) kartpad_log_flush_sync();
+  // The game's own exits (OSResetSystem, PPCHalt, exit) come here with every runtime thread still
+  // running: the log writer then faulted in _write_r mid-exit (Retro Rewind, 2026-11-08). The full
+  // quit path stops the SD writers, drains the log and pauses the other threads.
+  if (kartpad_request_return_to_launcher) kartpad_request_return_to_launcher();
+  else if (kartpad_log_flush_sync) kartpad_log_flush_sync();
   _exit(code);
 }
 

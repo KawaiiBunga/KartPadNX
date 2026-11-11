@@ -67,4 +67,21 @@ inline std::error_code CopyFile(const std::filesystem::path& src, const std::fil
     return ok ? std::error_code{} : std::error_code{EIO, std::generic_category()};
 }
 
+// Calls fn(path, relativePath) for every regular file under `dir` ("a/b.szs"). Builds the relative
+// path itself: std::filesystem::relative fails on "sdmc:/" paths. An entry that errors is skipped
+// instead of ending the walk.
+template <class Fn>
+void ForEachFile(const std::string& dir, Fn&& fn, const std::string& rel = std::string()) {
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code entry;
+        const std::string name = it->path().filename().string();
+        const std::string r = rel.empty() ? name : rel + "/" + name;
+        if (it->is_directory(entry))
+            ForEachFile(dir + "/" + name, fn, r);
+        else if (it->is_regular_file(entry))
+            fn(dir + "/" + name, r);
+    }
+}
+
 }  // namespace mkw::fsx

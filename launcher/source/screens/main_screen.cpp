@@ -66,8 +66,12 @@ void PushJob(app::App& app, std::string title, std::string subtitle, mkw::JobSta
 using namespace main_ui;
 
 void MainScreen::OnEnter(app::App& app) {
-    selected_ = app.settings().lastVariant == 1 ? Variant::RetroRewind : Variant::Vanilla;
-    profileVariant_ = selected_;
+    // Only the first time: coming back from a sub-screen keeps the tab's game choice.
+    if (!entered_) {
+        entered_ = true;
+        selected_ = app.settings().lastVariant == 1 ? Variant::RetroRewind : Variant::Vanilla;
+        profileVariant_ = selected_;
+    }
     Build(app);
 }
 

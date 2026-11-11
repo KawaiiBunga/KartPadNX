@@ -73,11 +73,19 @@ on the card won't line up with it.
 Mods that replace game files (textures, tracks, music, or a Riivolution pack with a `riivolution`
 folder) need no rebuild:
 
-1. Copy each mod's folder to `/switch/kartpad/mods/` on the SD card. Inside, files are laid out
-   like the disc (for example `Race/Course/...`), or it's a Riivolution pack with a `riivolution`
-   folder.
-2. In the launcher's **Mods** tab, pick the game and switch the mods on. Each game has its own
-   list, and a game's card shows how many mods are on.
+1. Put the mod's `.zip` in `/switch/kartpad/mods/` on the SD card (the launcher unpacks it), or
+   unzip it there into its own folder. A `.rar` or `.7z` has to be unpacked on a computer first. For a Riivolution pack, use its **Riivolution** download (not
+   "My Stuff"): the folder then holds `riivolution/` and the pack's own data folder. Any other mod
+   can be dropped in as it comes, in whatever folders: files replace the game's files with the
+   same name. Files the mod's instructions say to inject with BrawlBox or Wiimm's tools are put
+   in for you: character models (`wl.brres` in a `Driver` or `Award` folder), icons (`.tpl`, or a
+   `.png` named like "CSS 64x64" or "MiniMap 32x32"), and voice clips exported from the sound bank
+   (`90 GRP_VO_DK_PC.brwsd`). Wheel Wizard mod folders work as they are, including its patch
+   files (`Name.UIAssets.szs`). Folders laid out like the disc (`Race/Course/...`) work too.
+2. A new mod is switched on for both games the next time you open the launcher. To turn one off,
+   or to pick a Riivolution pack's options (like the Riivolution menu; they start on, except
+   options that swap the game's code, which can't work here), use the launcher's **Mods** tab.
+   Each game has its own list, and a game's card shows how many mods are on.
 
 Mods that change the game's code (Kamek/Pulsar `.pul` code, Gecko codes) aren't supported this way.
 

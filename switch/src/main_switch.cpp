@@ -526,11 +526,45 @@ int main(int argc, char** argv) {
   return code;
 }
 
+namespace PerfDiag {
+void Stop() __attribute__((weak));  // runtime/src/perf_diag.cpp
+}
+extern "C" void kartpad_deko_stop_threads() __attribute__((weak));  // switch/deko/backend_commands.cpp (GPU Hunt)
+
+namespace {
+void RecordThreadListHead(void* out) {
+  // _EntryWrap links a starting thread at the head of libnx's thread list, so its prev_next is the head.
+  *static_cast<Thread***>(out) = threadGetSelf()->prev_next;
+}
+
+// Pauses every other thread for good. hbl unmaps this NRO when it exits but leaves its threads
+// alive, and one waking from a timed wait (the GX worker, 2026-11-08/09) then ran unmapped code:
+// 2168-0001 in hbl. Paused threads never run again.
+// shortcut: paused threads stay in the process until hbl exits (~15 per quit), fine for the
+// handful of game launches in a session; joining each subsystem's threads would be the full fix.
+void ParkOtherThreads() {
+  Thread** head = nullptr;
+  Thread probe{};
+  if (R_FAILED(threadCreate(&probe, RecordThreadListHead, &head, nullptr, 0x4000, 0x2C, -2))) return;
+  if (R_SUCCEEDED(threadStart(&probe))) threadWaitForExit(&probe);
+  threadClose(&probe);
+  if (head == nullptr) return;
+  Thread* self = threadGetSelf();
+  for (Thread* t = *head; t != nullptr; t = t->next)
+    if (t != self) svcSetThreadActivity(t->handle, ThreadActivity_Paused);
+}
+}  // namespace
+
 extern "C" void kartpad_request_return_to_launcher() {
-  // Every _Exit path (Quit to launcher, closing from HOME) runs this: stop the async log
-  // writer first so it is not mid-write when the process tears down.
+  // Every exit path (Quit to launcher, closing from HOME, the game's own exit or reset through
+  // __wrap_exit) runs this. Stop the threads that write to the SD card before the process tears
+  // down and unmounts it: the perf reporter crashed in fopen/lseek mid-quit (2026-11-08,
+  // 2168-0002), then the async log writer. Then park the rest.
+  if (PerfDiag::Stop) PerfDiag::Stop();
+  if (kartpad_deko_stop_threads) kartpad_deko_stop_threads();  // GPU Hunt's watchdog
   kartpad_log_shutdown();
   LoadLauncherNext();
+  ParkOtherThreads();
 }
 
 extern "C" bool kartpad_has_return_path() {
