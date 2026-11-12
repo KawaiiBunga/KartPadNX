@@ -398,43 +398,29 @@ void log_gpu_operation_context() {
   }
 }
 #endif
-// The NVIDIA timeouts (2348-0006) at course loads all stopped on copy-engine work: an EFB snapshot
-// image copy or texture uploads among 3D passes. Completing only those operations on the CPU before
-// the next (perf.cfg gpu_copy_sync 1, course-load guard off) ended them on hardware (2026-11-11), so
-// the same ordering is kept on the GPU: a fence after the copy that the GPU's front end waits on, so
-// nothing recorded later starts before the copy is done. No CPU wait, no extra submit.
-void copy_engine_fence() {
-  // The queue reads each DkFence when it processes the submit that carries it: keep them until then.
-  static std::array<DkFence, 2048> fences;
-  static size_t used = 0;
-  static uint64_t submitsSeen = 0;
-  if (submit_stats().submits != submitsSeen) {
-    submitsSeen = submit_stats().submits;
-    used = 0;
-  }
-  if (used == fences.size()) {
-    submit("copy-engine fences");
-    submitsSeen = submit_stats().submits;
-    used = 0;
-  }
-  DkFence &fence = fences[used++];
-  fence = {};
-  dkCmdBufSignalFence(R.cmd, &fence, true);
-  dkCmdBufWaitFence(R.cmd, &fence);
-}
-// A full barrier is two GPU queue (gpfifo) entries, and libnx hands entries to the GPU only at the
-// present or when 2040 are waiting. A vanilla 2P menu frame (hundreds of render passes, each with
-// two barriers) reached 2040, and that kickoff timed out waiting for room in the 2048-entry ring
-// (2348-0006, 2026-11-11). Sending the work every 128 barriers keeps each kickoff small and lets the
-// GPU start on it early.
+// The NVIDIA timeouts (2348-0006) were never a GPU hang. The GPU Hunt build (2026-11-11, vanilla 2P
+// course load) showed the GPU still completing work, ~4,900 operations behind the CPU: one frame
+// recorded ~5,000 small texture uploads, the 2048-entry command ring filled, and libnx's kickoff
+// gave up waiting for room. Each full barrier is ~2 ring entries (3 with an upload's fence), so every
+// kChunk barriers the work is handed to the GPU with a fence, and the CPU waits for the fence
+// kInFlight chunks back: at most ~kChunk * kInFlight * 3 entries outstanding. Ordinary frames stay
+// well ahead of that and never wait.
 void barrier(uint32_t extraInvalidations) {
   dkCmdBufBarrier(R.cmd, DkBarrier_Full,
                   DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache | extraInvalidations);
-  static unsigned sinceKickoff = 0;
-  if (++sinceKickoff >= 128) {
-    sinceKickoff = 0;
-    submit_readback("gpfifo chunk");
-  }
+  constexpr unsigned kChunk = 96, kInFlight = 6;
+  static std::array<DkFence, kInFlight> fences{};
+  static std::array<bool, kInFlight> pending{};
+  static unsigned barriers = 0, next = 0;
+  if (++barriers < kChunk || !R.frameOpen)
+    return;
+  barriers = 0;
+  if (pending[next])
+    dkFenceWait(&fences[next], -1);
+  dkCmdBufSignalFence(R.cmd, &fences[next], false);
+  submit_readback("ring flow control");
+  pending[next] = true;
+  next = (next + 1) % kInFlight;
 }
 Binding *binding(BoundGroup &g, uint32_t b) {
   if (g.group)
@@ -826,7 +812,6 @@ void __wrap_wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffe
     kd::open();
     kd::barrier();
     dkCmdBufCopyBuffer(swdk::R.cmd, source->mem.gpu + so, d->mem.gpu + off, n);
-    kd::copy_engine_fence();
     // DMA writes can replace uniforms/storage at an address the shader has
     // already cached. L2 invalidation alone does not invalidate that cache.
     kd::barrier(DkInvalidateFlags_Shader);
@@ -864,7 +849,6 @@ void __wrap_wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e,
     DkImageRect sr{sx, sy, s.origin.z, w, h, n.depthOrArrayLayers},
         dr{dx, dy, d.origin.z, w, h, n.depthOrArrayLayers};
     dkCmdBufCopyImage(swdk::R.cmd, &sv, &sr, &dv, &dr, 0);
-    kd::copy_engine_fence();
     kd::barrier();
     checkpoint.finish(true);
   });
@@ -894,7 +878,6 @@ void __wrap_wgpuCommandEncoderCopyBufferToTexture(WGPUCommandEncoder e,
     DkCopyBuf b{s->mem.gpu + layout.offset, row, row * rows};
     DkImageRect r{d.origin.x, d.origin.y, d.origin.z, n.width, n.height, n.depthOrArrayLayers};
     dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &dv, &r, 0);
-    kd::copy_engine_fence();
     kd::barrier();
     s->used();
     checkpoint.finish(true);
@@ -923,7 +906,6 @@ void __wrap_wgpuCommandEncoderCopyTextureToBuffer(WGPUCommandEncoder e,
     DkCopyBuf b{d->mem.gpu + layout.offset, row, row * rows};
     DkImageRect r{s.origin.x, s.origin.y, s.origin.z, n.width, n.height, n.depthOrArrayLayers};
     dkCmdBufCopyImageToBuffer(swdk::R.cmd, &sv, &r, &b, 0);
-    kd::copy_engine_fence();
     kd::barrier(DkInvalidateFlags_Shader);
     checkpoint.finish(true);
   });
@@ -942,7 +924,6 @@ void __wrap_wgpuCommandEncoderClearBuffer(WGPUCommandEncoder e, WGPUBuffer b, ui
     auto temp = swdk::block_create(n, "buffer clear");
     memcpy(temp.cpu, zero.data(), n);
     dkCmdBufCopyBuffer(swdk::R.cmd, temp.gpu, d->mem.gpu + off, n);
-    kd::copy_engine_fence();
     swdk::block_free_deferred(temp.block);
     kd::barrier(DkInvalidateFlags_Shader);
     checkpoint.finish(true);
@@ -960,7 +941,6 @@ void __wrap_wgpuQueueWriteBuffer(WGPUQueue q, WGPUBuffer h, uint64_t off, const 
   auto temp = kd::upload_allocation(n);
   memcpy(temp->mem.cpu, data, n);
   dkCmdBufCopyBuffer(swdk::R.cmd, temp->mem.gpu, b->mem.gpu + off, n);
-  kd::copy_engine_fence();
   temp->used();
   kd::barrier(DkInvalidateFlags_Shader);
   checkpoint.finish(true);
@@ -989,7 +969,6 @@ void __wrap_wgpuQueueWriteTexture(WGPUQueue q, const WGPUTexelCopyTextureInfo *d
   DkImageRect r{dst->origin.x, dst->origin.y, dst->origin.z,
                 size->width,   size->height,  size->depthOrArrayLayers};
   dkCmdBufCopyBufferToImage(swdk::R.cmd, &b, &v, &r, 0);
-  kd::copy_engine_fence();
   temp->used();
   kd::barrier();
   checkpoint.finish(true);

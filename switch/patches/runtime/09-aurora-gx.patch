@@ -7504,7 +7504,7 @@ diff --git a/aurora-main/lib/gx/pipeline.hpp b/aurora-main/lib/gx/pipeline.hpp
 diff --git a/aurora-main/lib/gx/shader.cpp b/aurora-main/lib/gx/shader.cpp
 --- a/aurora-main/lib/gx/shader.cpp
 +++ b/aurora-main/lib/gx/shader.cpp
-@@ -1,2064 +1,2097 @@
+@@ -1,2064 +1,2115 @@
 -#include "../gfx/common.hpp"
 -
 -#include "../internal.hpp"
@@ -9748,6 +9748,12 @@ diff --git a/aurora-main/lib/gx/shader.cpp b/aurora-main/lib/gx/shader.cpp
 +  case GX_CC_KONST: {
 +    switch (stage.kcSel) {
 +      DEFAULT_FATAL("invalid kcSel {}", underlying(stage.kcSel));
++    // Upstream a93eaf5: unsourced encodings evaluate to zero in hardware (was a FATAL crash).
++    case static_cast<GXTevKColorSel>(0x08):
++    case static_cast<GXTevKColorSel>(0x09):
++    case static_cast<GXTevKColorSel>(0x0A):
++    case static_cast<GXTevKColorSel>(0x0B):
++      return "vec3f(0.0)";
 +    case GX_TEV_KCSEL_8_8:
 +      return "vec3f(1.0)";
 +    case GX_TEV_KCSEL_7_8:
@@ -9849,6 +9855,16 @@ diff --git a/aurora-main/lib/gx/shader.cpp b/aurora-main/lib/gx/shader.cpp
 +  case GX_CA_KONST: {
 +    switch (stage.kaSel) {
 +      DEFAULT_FATAL("invalid kaSel {}", underlying(stage.kaSel));
++    // Upstream a93eaf5: unsourced encodings evaluate to zero in hardware (was a FATAL crash).
++    case static_cast<GXTevKAlphaSel>(0x08):
++    case static_cast<GXTevKAlphaSel>(0x09):
++    case static_cast<GXTevKAlphaSel>(0x0A):
++    case static_cast<GXTevKAlphaSel>(0x0B):
++    case static_cast<GXTevKAlphaSel>(0x0C):
++    case static_cast<GXTevKAlphaSel>(0x0D):
++    case static_cast<GXTevKAlphaSel>(0x0E):
++    case static_cast<GXTevKAlphaSel>(0x0F):
++      return "0.0";
 +    case GX_TEV_KASEL_8_8:
 +      return "1.0";
 +    case GX_TEV_KASEL_7_8:
@@ -10777,8 +10793,10 @@ diff --git a/aurora-main/lib/gx/shader.cpp b/aurora-main/lib/gx/shader.cpp
 +      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}.rgb, 1.0);", i, vtx_attr(config, GX_VA_CLR0));
 +    } else if (tcg.src == GX_TG_COLOR1) {
 +      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}.rgb, 1.0);", i, vtx_attr(config, GX_VA_CLR1));
-+    } else
-+      UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
++    } else {
++      // Upstream aurora 5ffb07e: texgen was never configured (was a FATAL crash).
++      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f(0.0, 0.0, 1.0, 1.0);", i);
++    }
 +    if (tcg.inputFormAB11) {
 +      vtxXfrAttrs += fmt::format("\n    tc{}.z = 1.0;", i);
 +    }

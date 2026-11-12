@@ -199,6 +199,10 @@ stage_translate() {
   # KARTPAD_RELOAD_ELISION=0 to reproduce the pre-b73 output.
   "$py" "$here/apply-translator-reload-elision.py" "$stg"
 
+  # Translator changes ported from upstream WiiCompiled (dirty-register write-back from e9fa260,
+  # conditional linked branches from 583e702/ed6fea0). See switch/patches/README.md.
+  patch --batch -l -p1 -d "$stg" < "$repo/switch/patches/translator-upstream.patch"
+
   # Keep the graphics port reproducible after restaging upstream. These are
   # applied to Aurora, never to generated disc-derived code.
   for p in aurora-switch-dawn-api aurora-switch-surface aurora-switch-window; do

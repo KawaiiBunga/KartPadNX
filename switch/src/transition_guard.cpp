@@ -7,8 +7,8 @@
 // changes to the race scene, or a race stops running, until a race runs, at most kWindow: race frames
 // and the menus keep the asynchronous policy and its frame rate.
 //
-// Fallback only since 2026-11-11 (off unless perf.cfg gpu_guard 1): the timeouts came from copy-engine
-// work, now fenced on the GPU in switch/deko/backend_commands.cpp (copy_engine_fence).
+// Fallback only since 2026-11-11 (off unless perf.cfg gpu_guard 1): the timeouts were the command ring
+// filling while the GPU ran far behind, now flow-controlled in switch/deko/backend_commands.cpp (barrier).
 #include "memory_access.h"
 
 #include <atomic>
@@ -88,8 +88,8 @@ extern "C" int kartpad_gpu_transition_guard(void) {
     static bool raced = false, left = false, inRaceScene = false, loaded = false;
     // perf.cfg gpu_guard_until_race 1: the old window, synchronous until the countdown.
     static const bool untilRace = kartpad_opt && kartpad_opt("gpu_guard_until_race", 0) != 0;
-    // Off by default since the root cause is fixed: copy-engine work is fenced on the GPU
-    // (kd::copy_engine_fence, switch/deko/backend_commands.cpp). perf.cfg gpu_guard 1 brings it back.
+    // Off by default since the root cause is fixed: the command ring is flow-controlled
+    // (kd::barrier, switch/deko/backend_commands.cpp). perf.cfg gpu_guard 1 brings it back.
     static const bool on = kartpad_opt && kartpad_opt("gpu_guard", 0) != 0;
     if (!on) return 0;
     const auto now = Clock::now();

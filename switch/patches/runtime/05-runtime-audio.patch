@@ -146,7 +146,7 @@ diff --git a/runtime/src/audio_backend.cpp b/runtime/src/audio_backend.cpp
 diff --git a/runtime/src/hle/audio/audio.cpp b/runtime/src/hle/audio/audio.cpp
 --- a/runtime/src/hle/audio/audio.cpp
 +++ b/runtime/src/hle/audio/audio.cpp
-@@ -1,569 +1,644 @@
+@@ -1,569 +1,646 @@
 -#include "memory.h"
 -#include "guest_interrupt_context.h"
 -#include "hle_stubs.h"
@@ -1290,16 +1290,18 @@ diff --git a/runtime/src/hle/audio/audio.cpp b/runtime/src/hle/audio/audio.cpp
 +    using Clock = std::chrono::steady_clock;
 +    static thread_local Clock::time_point lastPoll = Clock::now();
 +
++    constexpr std::chrono::microseconds kMaxPollDelta{100'000};
++
 +    const Clock::time_point now = Clock::now();
-+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
-+    lastPoll = now;
-+
-+    if (elapsed < 0) {
-+        elapsed = 0;
++    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll);
++    if (elapsed.count() < 0 || elapsed > kMaxPollDelta) {
++        lastPoll = now;
++        return elapsed.count() < 0 ? 0 : kMaxPollDelta.count();
 +    }
-+
-+    constexpr int64_t kMaxPollDeltaMicros = 100'000;
-+    return std::min(elapsed, kMaxPollDeltaMicros);
++    // Upstream 814aa30: keep the sub-microsecond remainder for the next poll, so the audio clock
++    // does not lose up to 1 us per poll.
++    lastPoll += elapsed;
++    return elapsed.count();
 +}
 +
 +} // namespace

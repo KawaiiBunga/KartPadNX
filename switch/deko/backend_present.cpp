@@ -103,7 +103,6 @@ void kartpad_deko_depth_snapshot(WGPUCommandEncoder encoder, WGPUTextureView vie
     DkCopyBuf dst{slot->data.gpu, params.srcWidth * 4, bytes};
     DkImageRect rect{0, 0, 0, params.srcWidth, params.srcHeight, 1};
     dkCmdBufCopyImageToBuffer(swdk::R.cmd, &v->view, &rect, &dst, 0);
-    kd::copy_engine_fence();
     kd::barrier();
     dkCmdBufSignalFence(swdk::R.cmd, &slot->fence, true);
   });

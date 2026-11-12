@@ -220,6 +220,45 @@ def sync_runtime_patches(old_dir, stg):
         print(f'runtime patch changed since the staged runtime: {rel}')
 
 
+def apply_translator_patch(stg):
+    """switch/patches/translator-upstream.patch (the Wiicompiled translator changes ported from
+    upstream) on the staged translator. A staged tree that already has it is left alone; otherwise
+    it is applied and Translator.Cli rebuilt, which needs the .NET 8 SDK (KPNX_DOTNET_SDK = its
+    dotnet.exe, else dotnet on PATH)."""
+    text = (REPO / 'switch/patches/translator-upstream.patch').read_text(encoding='utf-8').replace('\r\n', '\n')
+    changed = False
+    for part in re.split(r'^(?=diff --git )', text, flags=re.M):
+        m = re.match(r'diff --git a/(\S+) b/', part)
+        if not m:
+            continue
+        rel = m.group(1)
+        f = stg / rel
+        raw = f.read_bytes().decode('utf-8') if f.is_file() else ''
+        crlf = '\r\n' in raw
+        lines = raw.replace('\r\n', '\n').split('\n')
+        if lines[-1] == '':
+            lines.pop()
+        try:
+            apply_section(list(lines), rel, part, reverse=True)
+            continue  # already applied
+        except SystemExit:
+            pass
+        lines = apply_section(lines, rel, part)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        out = '\n'.join(lines) + '\n'
+        f.write_bytes((out.replace('\n', '\r\n') if crlf else out).encode('utf-8'))
+        print(f'translator patch applied: {rel}')
+        changed = True
+    if not changed:
+        return
+    cli = stg / 'translator/src/Translator.Cli'
+    dotnet = os.environ.get('KPNX_DOTNET_SDK') or shutil.which('dotnet') or 'dotnet'
+    if subprocess.run([dotnet, 'build', str(cli / 'Translator.Cli.csproj'), '-c', 'Release', '-nologo', '-v', 'q']).returncode:
+        sys.exit('rebuilding the patched translator failed: install the .NET 8 SDK or set KPNX_DOTNET_SDK')
+    for obj in (stg / 'translator/src').glob('*/obj'):
+        shutil.rmtree(obj)
+
+
 def first_dir(*candidates):
     for c in candidates:
         if c.is_dir():
@@ -286,7 +325,8 @@ def main():
     tk.copy_tree(km / 'tools', 'ref/kartpad-main/tools')
     # The translation hooks builder/translator-post-hooks.py applies.
     for script in ('inject-g10-rkg-fixture-hook.py', 'inject-online-rkg-selection-hooks.py',
-                   'inject-g10-camera-lifecycle-guard.py', 'inject-retro-rel-report-guard.py'):
+                   'inject-g10-camera-lifecycle-guard.py', 'inject-retro-rel-report-guard.py',
+                   'inject-mkw-texture-link-guard.py'):
         tk.copy_file(km / 'scripts' / script, Path('ref/kartpad-main/scripts') / script)
     for lic in ('LICENSE', 'RIGHTS_AND_LICENSES.md'):
         if (km / lic).is_file():
@@ -308,6 +348,7 @@ def main():
     tk.copy_tree(stg, 'build/wiicompiled-fpscr', skip=SKIP_DIRS | {'obj'}, skip_top={'generated', 'test_output'},
                  exclude=('*.pdb',))
     sync_runtime_patches(BLD / 'switch/patches/runtime', out / 'build/wiicompiled-fpscr')
+    apply_translator_patch(out / 'build/wiicompiled-fpscr')
     dll =out / 'build/wiicompiled-fpscr/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll'
     if not dll.is_file():
         sys.exit(f'translator not built: {dll} (dotnet build it first)')

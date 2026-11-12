@@ -79,10 +79,8 @@ struct GpuCheckpoint {
 #endif
 
 // Frame helpers: a full barrier, open the frame if needed, drain the queue (CPU readback).
+// (with the command ring's flow control: backend_commands.cpp)
 void barrier(uint32_t extraInvalidations = 0);
-// After copy-engine work (dkCmdBufCopyImage, CopyBufferToImage, CopyImageToBuffer, CopyBuffer): the
-// GPU itself waits for it before running anything recorded later (backend_commands.cpp).
-void copy_engine_fence();
 inline void open() {
   if (!R.frameOpen) {
     frame_open();

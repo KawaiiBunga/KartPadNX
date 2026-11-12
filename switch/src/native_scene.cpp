@@ -274,22 +274,24 @@ bool MkwTryNativeModelSubmission(CpuContext* ctx) {
 }
 
 extern "C" int kartpad_opt(const char*, int) __attribute__((weak));
-// perf.cfg `native_mat_channels` / `native_model` (default 1): 0 = translated originals.
-static bool NativeSceneOpt(const char* key) {
-    return kartpad_opt == nullptr || kartpad_opt(key, 1) != 0;
+// perf.cfg `native_mat_channels` (default 1) / `native_model` (default 0): 0 = translated originals.
+// native_model intermittently lit the player's kart wrong (flat shading) and measured no race-frame
+// gain on hardware (p50 17.3 vs 17.7 ms, p95 24.0 both, 2026-11-12), so it is off unless asked for.
+static bool NativeSceneOpt(const char* key, int fallback) {
+    return kartpad_opt == nullptr ? fallback != 0 : kartpad_opt(key, fallback) != 0;
 }
 
 extern "C" {
 void __real_func_80062C50(CpuContext* ctx);
 void __wrap_func_80062C50(CpuContext* ctx) {
-    static const bool on = NativeSceneOpt("native_mat_channels");
+    static const bool on = NativeSceneOpt("native_mat_channels", 1);
     if (on && MkwTryNativeMaterialChannels(ctx)) [[likely]] return;
     __real_func_80062C50(ctx);
 }
 
 void __real_func_80064FD0(CpuContext* ctx);
 void __wrap_func_80064FD0(CpuContext* ctx) {
-    static const bool on = NativeSceneOpt("native_model");
+    static const bool on = NativeSceneOpt("native_model", 0);
     if (on && MkwTryNativeModelSubmission(ctx)) [[likely]] return;
     __real_func_80064FD0(ctx);
 }

@@ -10,6 +10,7 @@ each step is idempotent: an already patched tree is detected and left alone.
 | 3 | `wiicompiled-switch-fullapp.patch` | staged runtime: Switch build arms, SD paths, NAND/DVD roots | `build-fullapp.sh patch` |
 | 4 | `wiicompiled-switch-input.patch` | staged runtime: Classic Controller HLE over libnx HID | `build-fullapp.sh patch` |
 | 5 | `runtime/` (see `runtime/series`) | staged runtime + Aurora: everything KartPad changed since 2026-09-23 | `build-fullapp.sh patch` |
+| 6 | `translator-upstream.patch` | staged translator: changes ported from upstream WiiCompiled (dirty-register write-back, conditional linked branches) | `build-switch.sh`; `make-toolkit.py` applies it to a release's translator that lacks it and rebuilds Translator.Cli (.NET 8 SDK) |
 | - | `dawn-switch-complete.patch`, `dawn-abseil-switch.patch` | Dawn and its abseil, for the Switch Dawn Null build | `build-graphics.sh` |
 | - | `sdl-switch-external-graphics.patch` | SDL3: the window is drawn by the game renderer; no EGL/GLES | `build-graphics.sh` |
 | - | `sdl-switch-audio-queue.patch` | SDL3: AUDOUT double buffering and buffer ownership | `build-graphics.sh` |

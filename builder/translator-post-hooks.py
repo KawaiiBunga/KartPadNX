@@ -25,12 +25,16 @@ FUNCTION_HOOKS = [
       for fn in ("8083DFA8", "80846C1C", "8084E388", "80643F48")],
     ("inject-g10-camera-lifecycle-guard.py", "func_805A1A8C.cpp"),
     ("inject-retro-rel-report-guard.py", "func_8000A440.cpp"),
+    # kartpad 7abcd95b: skip malformed MDL0 texture links (custom-model crash).
+    ("inject-mkw-texture-link-guard.py", "func_802289DC.cpp"),
 ]
 
 # (script, mode flag) applied to the shard directory, in order.
 SHARD_HOOKS = [
     ("inject-retro-rel-report-guard.py", "--inject-shards"),
+    ("inject-mkw-texture-link-guard.py", "--inject-shards"),
     ("inject-retro-rel-report-guard.py", "--verify-shards"),
+    ("inject-mkw-texture-link-guard.py", "--verify-shards"),
 ]
 
 
