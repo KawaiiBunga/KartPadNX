@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# KartPad-NX builder for Linux: runs aio/pipeline/kpnx_aio.py with a suitable Python.
+#
+#   ./kartpadnx-builder --check --bundle KartPadNX-Builder.data
+#   ./kartpadnx-builder --disc ~/RMCP01.wbfs --bundle KartPadNX-Builder.data
+#
+# See README-LINUX.md. Every option of kpnx_aio.py works here (--help lists them).
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+script="$here/../pipeline/kpnx_aio.py"
+
+py="${KPNX_PYTHON:-}"
+if [ -z "$py" ]; then
+  for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+      py="$(command -v "$c")"
+      break
+    fi
+  done
+fi
+if [ -z "$py" ]; then
+  echo "kartpadnx-builder: Python 3.9 or newer is required (set KPNX_PYTHON to use a specific one)" >&2
+  exit 1
+fi
+[ -f "$script" ] || { echo "kartpadnx-builder: $script not found" >&2; exit 1; }
+exec "$py" "$script" "$@"

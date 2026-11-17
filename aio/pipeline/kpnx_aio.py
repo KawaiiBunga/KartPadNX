@@ -9,7 +9,10 @@ switch/kartpad/data, and with --rr Retro Rewind in switch/kartpad/retro-rewind),
 has to be imported on the Switch.
 
 Runs on Windows with nothing installed. Every tool is a pinned, hash-checked portable
-download kept under --data (see tools.json). Stages are resumable: each records what it was
+download kept under --data (see tools.json). On Linux (x86-64) the same pipeline runs with the
+tools it finds on the system (cmake, ninja, dotnet 8+, LLVM 19) and downloads the rest
+(manifest/tools-linux.json); devkitPro's real Linux host tools are used instead of nxtools.
+Stages are resumable: each records what it was
 built from in <data>/state and is skipped when nothing changed.
 
   tools      .NET runtime, CMake, Ninja, nodtool, LLVM 19.1.7, devkitPro target files
@@ -24,7 +27,8 @@ built from in <data>/state and is skipped when nothing changed.
   rr-sd      with --rr: the built version's full Retro Rewind pack
              -> <out>/switch/kartpad/retro-rewind/RetroRewind6
 
-Lines starting with "@@" are JSON progress events for the frontend; everything else is log.
+On Windows, lines starting with "@@" are JSON progress events for the frontend (on Linux only
+with --json-events); everything else is log.
 """
 import argparse
 import concurrent.futures
@@ -46,6 +50,9 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
+IS_WIN = os.name == 'nt'
+REPO_ROOT = HERE.parent.parent   # the KartPadNX checkout this file is in (--repo)
+EXE = '.exe' if IS_WIN else ''
 USER_AGENT = 'KartPadNX-Builder/1.0'
 EXPECT_DOL = '80d18895b39c63bd80f457398bfcbb91b7d16ac116a41a88967e954080155b05'
 EXPECT_REL = '16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d'
@@ -77,15 +84,35 @@ class Failure(Exception):
 
 LOG = None
 OUT_LOCK = threading.RLock()   # the devkitPro job prints from a background thread
+JSON_EVENTS = IS_WIN           # the Windows frontend reads "@@" lines; elsewhere progress is for people
+_progress_seen = {}
+_line_open = [False]           # a "\r" progress line is on screen
 
 
 def emit(**event):
     with OUT_LOCK:
-        print('@@' + json.dumps(event), flush=True)
+        if JSON_EVENTS:
+            print('@@' + json.dumps(event), flush=True)
+            return
+        kind, total = event.get('progress'), event.get('total')
+        if not kind or not total:
+            return
+        done, item = event.get('done', 0), event.get('item', '')
+        pct = min(100, int(done * 100 / total))
+        size = (f'{done / 1e6:.1f}/{total / 1e6:.1f} MB' if total < 10e6 else f'{done / 1e6:.0f}/{total / 1e6:.0f} MB')             if kind in ('download', 'extract') else f'{done}/{total}'
+        if sys.stdout.isatty():
+            print(f'\r  {item}: {pct:3d}%  {size}   ', end='' if pct < 100 else '\n', flush=True)
+            _line_open[0] = pct < 100
+        elif _progress_seen.get((kind, item)) != pct // 10:
+            _progress_seen[(kind, item)] = pct // 10
+            print(f'  {item}: {pct}%  {size}', flush=True)
 
 
 def log(msg):
     with OUT_LOCK:
+        if _line_open[0]:
+            print(flush=True)
+            _line_open[0] = False
         print(msg, flush=True)
         if LOG:
             LOG.write(msg + '\n')
@@ -108,6 +135,16 @@ def sha256_file(path, chunk=1 << 20):
 
 
 def total_ram_gb():
+    if not IS_WIN:
+        try:
+            with open('/proc/meminfo', encoding='ascii') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        return int(line.split()[1]) / (1 << 20)
+        except (OSError, ValueError):
+            pass
+        return 8.0
+
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
                     ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
@@ -313,6 +350,8 @@ def extract_zip(archive, dest, strip=0, include=None, label=None, workers=8):
             for info, out in bucket:
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
+                if not IS_WIN and info.create_system == 3 and (info.external_attr >> 16) & 0o111:
+                    os.chmod(out, ((info.external_attr >> 16) & 0o777) | 0o600)   # keep the x bit
                 with lock:
                     done[0] += info.file_size
 
@@ -328,8 +367,8 @@ def extract_zip(archive, dest, strip=0, include=None, label=None, workers=8):
 
 
 def extract_tar(archive, dest, mode, strip=0, include=None, label=None):
-    """Extract selected members; links become copies of their targets (Windows has no
-    unprivileged symlinks)."""
+    """Extract selected members; on Windows links become copies of their targets (no
+    unprivileged symlinks there), elsewhere they stay links and file modes are kept."""
     dest = Path(dest)
     links = []
     count = 0
@@ -347,12 +386,34 @@ def extract_tar(archive, dest, mode, strip=0, include=None, label=None):
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with t.extractfile(m) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
+                if not IS_WIN:
+                    os.chmod(out, (m.mode & 0o777) | 0o600)
                 count += 1
                 if count % 500 == 0:
                     emit(progress='extract', item=label or Path(archive).name, done=count, total=0)
             elif m.issym() or m.islnk():
                 links.append((rel, m.linkname, m.issym()))
     for rel, target, sym in links:
+        if not IS_WIN:
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if out.is_symlink() or out.exists():
+                out.unlink()
+            if sym:
+                if target.startswith('/'):
+                    inside = _strip(target.lstrip('/'), strip)
+                    if not inside:
+                        continue   # points outside the part that is kept
+                    target = os.path.relpath(dest / inside, out.parent)
+                os.symlink(target, out)
+            else:
+                src = dest / _strip(target, strip)
+                if src.is_file():
+                    try:
+                        os.link(src, out)
+                    except OSError:
+                        shutil.copy(src, out)
+            continue
         if sym:
             tgt = PurePosixPath(rel).parent / target if not target.startswith('/') else PurePosixPath(_strip(target.lstrip('/'), strip))
         else:
@@ -421,38 +482,120 @@ class Background:
 
 # ----------------------------------------------------------------------------- tools ---
 
+def _run_out(cmd):
+    try:
+        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=30)
+        return r.stdout + r.stderr
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
+def _which(*names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return Path(p)
+    return None
+
+
+LLVM_BINS = ('clang', 'clang++', 'ld.lld', 'llvm-ar', 'llvm-ranlib', 'llvm-nm', 'llvm-objcopy', 'llvm-strip')
+
+
+def find_system_tool(name):
+    """A usable copy of a build tool already on this (non-Windows) system, or None. For dotnet
+    it is the `dotnet` program, for llvm the root that has bin/clang. LLVM must be 19, the
+    clang of the proven Docker build."""
+    if name == 'cmake':
+        p = _which('cmake')
+        m = re.search(r'version (\d+)\.(\d+)', _run_out([p, '--version'])) if p else None
+        return p if m and (int(m[1]), int(m[2])) >= (3, 25) else None
+    if name == 'ninja':
+        return _which('ninja', 'ninja-build')
+    if name == 'dotnet':
+        p = _which('dotnet')
+        if p:
+            for m in re.finditer(r'Microsoft\.NETCore\.App (\d+)\.', _run_out([p, '--list-runtimes'])):
+                if int(m[1]) >= 8:
+                    return p.resolve()
+        return None
+    if name == 'nodtool':
+        env = os.environ.get('KPNX_NODTOOL')
+        p = Path(env) if env else _which('nodtool')
+        return p if p and p.is_file() else None
+    if name == 'llvm':
+        roots = [os.environ.get('KPNX_LLVM_DIR'), '/usr/lib/llvm-19', '/usr/lib64/llvm19', '/usr/lib/llvm19',
+                 '/opt/llvm-19', '/usr/local/llvm-19']
+        clang = _which('clang-19', 'clang')
+        if clang:
+            roots.append(str(clang.resolve().parent.parent))
+        for r in roots:
+            if not r or not all((Path(r) / 'bin' / b).exists() for b in LLVM_BINS):
+                continue
+            if re.search(r'clang version 19\.', _run_out([Path(r) / 'bin/clang', '--version'])):
+                return Path(r)
+        return None
+    return None
+
+
 class Tools:
-    def __init__(self, data, manifest, shim):
+    LOCAL = ('dotnet', 'cmake', 'ninja', 'nodtool', 'llvm')
+    # devkitPro host programs, and the nxtools command that stands in for each where the
+    # Docker image layer has no (usable) real one.
+    WRAPPED = {'devkitA64/bin/aarch64-none-elf-g++': 'link', 'tools/bin/elf2nro': 'elf2nro',
+               'tools/bin/nacptool': 'nacptool', 'tools/bin/bin2s': 'bin2s', 'tools/bin/uam': 'uam',
+               'portlibs/switch/bin/aarch64-none-elf-pkg-config': 'pkg-config'}
+    WRAPPER_MARK = '# kartpadnx-builder wrapper'
+
+    def __init__(self, data, manifest, shim, opts=None):
         self.data = Path(data)
         self.root = self.data / 'tools'
         self.dl = self.data / 'downloads'
         self.m = manifest
         self.shim = Path(shim) if shim else None
+        self.opts = opts or {}
         self.python = Path(sys.executable)
-        self.dotnet = self.root / 'dotnet' / 'dotnet.exe'
-        self.cmake = self.root / 'cmake' / 'bin' / 'cmake.exe'
-        self.ninja = self.root / 'ninja' / 'ninja.exe'
-        self.nodtool = self.root / 'nodtool' / 'nodtool.exe'
+        self.dotnet = self.root / 'dotnet' / ('dotnet' + EXE)
+        self.dotnet_root = self.dotnet.parent
+        self.cmake = self.root / 'cmake' / 'bin' / ('cmake' + EXE)
+        self.ninja = self.root / 'ninja' / ('ninja' + EXE)
+        self.nodtool = self.root / 'nodtool' / ('nodtool' + EXE)
         self.llvm = self.root / 'llvm'
         self.dkp = self.root / 'devkitpro'
+        self.linker = 'lld'   # what links the game: 'lld' (nxtools) or 'gnu' (devkitPro's ld); see install_wrappers
 
     def key(self, name):
         spec = self.m[name]
-        return spec.get('sha256') or spec.get('digest')
+        return spec.get('sha256') or spec.get('digest') or spec['url']
 
-    LOCAL = ('dotnet', 'cmake', 'ninja', 'nodtool', 'llvm')
+    def use_system(self, name):
+        """Point at the system's copy of a tool when there is a usable one (not on Windows)."""
+        if IS_WIN or self.opts.get('download_tools'):
+            return False
+        found = find_system_tool(name)
+        if not found:
+            return False
+        if name == 'dotnet':
+            self.dotnet, self.dotnet_root = found, found.parent
+        elif name == 'llvm':
+            self.llvm = found
+        else:
+            setattr(self, name, found)
+        log(f'{name}: using {found}')
+        return True
 
     def install_local(self, state, bundle, keep_downloads=False):
-        """Everything but devkitPro: from the bundle inside the exe when it has the tool,
-        otherwise from its pinned download."""
+        """Everything but devkitPro: from the system (Linux), from the bundle inside the exe
+        when it has the tool, otherwise from its pinned download."""
         stage('tools', 'Setting up build tools')
         for name in self.LOCAL:
+            if self.use_system(name):
+                continue
             dest = self.root / name
             if state.done('tool-' + name, self.key(name)) and dest.exists():
                 continue
             if dest.exists():
                 shutil.rmtree(dest)
-            if bundle and bundle.has_tool(name):
+            if IS_WIN and bundle and bundle.has_tool(name):
                 bundle.install_tool(name, dest)
             else:
                 self.download_tool(name, dest, keep_downloads)
@@ -462,7 +605,9 @@ class Tools:
         spec = self.m[name]
         log(f'{name}: {spec["url"]}')
         fname = spec.get('name') or Path(spec['url'].split('?')[0]).name
-        arc = download(spec['url'], self.dl / fname, spec['size'], spec['sha256'], label=name)
+        arc = download(spec['url'], self.dl / fname, spec.get('size'), spec.get('sha256'), label=name)
+        if not spec.get('sha256'):
+            log(f'{name}: not pinned in the manifest; sha256 of what was downloaded is {sha256_file(arc)}')
         emit(progress='extract', item=name, done=0, total=0)
         if spec['type'] == 'zip':
             extract_zip(arc, dest, strip=spec.get('strip', 0), include=spec.get('include'), label=name)
@@ -471,6 +616,8 @@ class Tools:
         elif spec['type'] == 'file':
             dest.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(arc, dest / fname)
+            if not IS_WIN:
+                os.chmod(dest / fname, 0o755)
         if not keep_downloads:
             arc.unlink(missing_ok=True)
 
@@ -493,9 +640,16 @@ class Tools:
         log('devkitpro ready')
 
     def finish(self):
-        self.install_shims()
-        for exe in (self.dotnet, self.cmake, self.ninja, self.nodtool, self.llvm / 'bin/clang.exe',
-                    self.llvm / 'bin/ld.lld.exe', self.dkp / 'libnx/switch.ld'):
+        if IS_WIN:
+            self.install_shims()
+            need = (self.dotnet, self.cmake, self.ninja, self.nodtool, self.llvm / 'bin/clang.exe',
+                    self.llvm / 'bin/ld.lld.exe', self.dkp / 'libnx/switch.ld')
+        else:
+            self.install_wrappers()
+            need = (self.dotnet, self.cmake, self.ninja, self.nodtool, self.llvm / 'bin/clang',
+                    self.llvm / 'bin/ld.lld', self.dkp / 'libnx/switch.ld',
+                    self.dkp / 'devkitA64/bin/aarch64-none-elf-g++')
+        for exe in need:
             if not exe.exists():
                 raise Failure(f'tool missing after install: {exe}')
 
@@ -516,10 +670,16 @@ class Tools:
         # Package configs, pkg-config and libtool files name the image's install prefix.
         here = fwd(self.dkp)
         for f in self.dkp.rglob('*'):
-            if f.is_file() and (f.suffix in ('.cmake', '.pc', '.la') or f.name.endswith('-config')):
+            if f.is_symlink() or not f.is_file():
+                continue
+            scripts = not IS_WIN and f.parent.name == 'bin' and f.stat().st_size < (1 << 18) \
+                and f.read_bytes()[:2] == b'#!'      # text helpers such as the pkg-config wrapper
+            if f.suffix in ('.cmake', '.pc', '.la') or f.name.endswith('-config') or scripts:
                 data = f.read_bytes()
                 if b'/opt/devkitpro' in data:
                     f.write_bytes(data.replace(b'/opt/devkitpro', here.encode('utf-8')))
+
+    # ------------------------------------------------------------- Windows: nxshim.exe ---
 
     def install_shims(self):
         if not self.shim or not self.shim.is_file():
@@ -533,6 +693,45 @@ class Tools:
             if not t.exists() or t.stat().st_size != self.shim.stat().st_size or sha256_file(t) != sha256_file(self.shim):
                 shutil.copyfile(self.shim, t)
 
+    # ----------------------------------------------------- Linux: real tools, fallbacks ---
+
+    def _is_wrapper(self, path):
+        try:
+            with open(path, 'rb') as f:
+                return self.WRAPPER_MARK.encode() in f.read(256)
+        except OSError:
+            return False
+
+    def install_wrappers(self):
+        """devkitPro's Linux image layer carries the real host programs: the g++ link driver
+        (GNU ld), elf2nro, nacptool, bin2s, uam and pkg-config. Each one that is missing, and
+        the g++ driver with --link lld, is replaced by a tiny script that runs the nxtools.py
+        port, exactly as the Windows builder's nxshim.exe does."""
+        link = self.opts.get('link', 'auto')
+        for rel, tool in self.WRAPPED.items():
+            path = self.dkp / rel
+            backup = path.with_name(path.name + '.dkp-original')
+            wrapped = path.is_file() and self._is_wrapper(path)
+            real = backup if wrapped and backup.exists() else (path if path.is_file() and not wrapped else None)
+            if tool == 'link':
+                want = link == 'lld' or real is None
+            elif tool == 'pkg-config':
+                want = real is None or not _which('pkg-config', 'pkgconf')
+            else:
+                want = real is None
+            if tool == 'link':
+                self.linker = 'lld' if want else 'gnu'
+            if want:
+                if real is path:
+                    os.replace(path, backup)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f'#!/bin/sh\n{self.WRAPPER_MARK}\n'
+                                f'exec "${{KPNX_PYTHON:-python3}}" "$KPNX_NXTOOLS" {tool} "$@"\n', encoding='utf-8')
+                os.chmod(path, 0o755)
+                log(f'devkitPro {path.name}: using the nxtools port' + (' (LLVM lld)' if tool == 'link' else ''))
+            elif wrapped and backup.exists():
+                os.replace(backup, path)     # an earlier run used a wrapper; the real one is wanted now
+
 
 # -------------------------------------------------------------------------- process ---
 
@@ -541,12 +740,20 @@ class Runner:
         self.t = tools
         self.ws = Path(ws)
         env = dict(os.environ)
-        sysroot = os.environ.get('SystemRoot', r'C:\Windows')
-        env['PATH'] = os.pathsep.join(str(p) for p in (
-            tools.llvm / 'bin', tools.cmake.parent, tools.ninja.parent, tools.dotnet.parent, tools.python.parent,
-            tools.nodtool.parent, Path(sysroot) / 'System32', Path(sysroot)))
+        if IS_WIN:
+            sysroot = os.environ.get('SystemRoot', r'C:\Windows')
+            env['PATH'] = os.pathsep.join(str(p) for p in (
+                tools.llvm / 'bin', tools.cmake.parent, tools.ninja.parent, tools.dotnet.parent, tools.python.parent,
+                tools.nodtool.parent, Path(sysroot) / 'System32', Path(sysroot)))
+        else:
+            # The pinned tools first, then the system's (sh, coreutils, ...). devkitPro's own
+            # host programs are on the path as in its Docker image.
+            env['PATH'] = os.pathsep.join([str(p) for p in (
+                tools.llvm / 'bin', tools.cmake.parent, tools.ninja.parent, tools.dotnet_root, tools.python.parent,
+                tools.nodtool.parent, tools.dkp / 'tools/bin', tools.dkp / 'devkitA64/bin')]
+                + [os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')])
         env.update({
-            'DEVKITPRO': fwd(tools.dkp), 'DOTNET_ROOT': str(tools.dotnet.parent),
+            'DEVKITPRO': fwd(tools.dkp), 'DOTNET_ROOT': str(tools.dotnet_root),
             'DOTNET_CLI_TELEMETRY_OPTOUT': '1', 'DOTNET_NOLOGO': '1', 'DOTNET_ROLL_FORWARD': 'Major',
             'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONDONTWRITEBYTECODE': '1',
             'KPNX_PYTHON': str(tools.python), 'KPNX_NXTOOLS': str(HERE / 'nxtools.py'),
@@ -936,6 +1143,9 @@ def cmake_configure_cmd(run, profile, bdir, tr):
             pgo_args.append(f'-DKARTPAD_PGO_INSTR_PROFILE={fwd(ws / "private/pgo" / (name + ".profdata"))}')
     dkp = fwd(t.dkp)
     llvm = t.llvm / 'bin'
+    # Windows links with LLVM lld through nxtools. Elsewhere devkitPro's own GNU ld does the
+    # link (the Docker build's), unless --link lld asks for the Windows behaviour.
+    linker = llvm / ('ld.lld' + EXE) if t.linker == 'lld' else t.dkp / 'devkitA64/bin/aarch64-none-elf-ld'
     # The hardware-tested v9 configuration (docs/VANILLA-GPU-HANDOFF.md) for both
     # games: Retro Rewind hit the same course-load GPU timeout (2348-0006, FIFO
     # full, 2026-10-25). Set explicitly so a reused build directory follows it.
@@ -946,9 +1156,9 @@ def cmake_configure_cmd(run, profile, bdir, tr):
            '-DCMAKE_BUILD_TYPE=Release',
            f'-DCMAKE_EXE_LINKER_FLAGS="-L{dkp}/libnx/lib" "-L{dkp}/portlibs/switch/lib" -fPIE "-specs={dkp}/libnx/switch.specs"',
            f'-DPython3_EXECUTABLE={fwd(t.python)}',
-           f'-DCMAKE_AR={fwd(llvm / "llvm-ar.exe")}', f'-DCMAKE_RANLIB={fwd(llvm / "llvm-ranlib.exe")}',
-           f'-DCMAKE_LINKER={fwd(llvm / "ld.lld.exe")}', f'-DCMAKE_STRIP={fwd(llvm / "llvm-strip.exe")}',
-           f'-DDKP_NM={fwd(llvm / "llvm-nm.exe")}', f'-DDKP_OBJCOPY={fwd(llvm / "llvm-objcopy.exe")}',
+           f'-DCMAKE_AR={fwd(llvm / ("llvm-ar" + EXE))}', f'-DCMAKE_RANLIB={fwd(llvm / ("llvm-ranlib" + EXE))}',
+           f'-DCMAKE_LINKER={fwd(linker)}', f'-DCMAKE_STRIP={fwd(llvm / ("llvm-strip" + EXE))}',
+           f'-DDKP_NM={fwd(llvm / ("llvm-nm" + EXE))}', f'-DDKP_OBJCOPY={fwd(llvm / ("llvm-objcopy" + EXE))}',
            f'-DKARTPAD_PROFILE={profile}', '-DKARTPAD_BUILD_GRAPHICS=ON', '-DKARTPAD_ENABLE_FULL_APP=ON',
            '-DKARTPAD_DEKO_DEBUG=OFF', '-DKARTPAD_DEKO_GPU_CHECKPOINTS=OFF',
            f'-DKARTPAD_DEKO_GPU_FLUSHES={gpu_flushes}',
@@ -968,11 +1178,34 @@ def cmake_configure_cmd(run, profile, bdir, tr):
     return cmd
 
 
+def ensure_builder_scripts(run):
+    """With devkitPro's own g++ (not the Windows shim) the repo's CMake links through
+    builder/link-switch.sh. The toolkit carries only builder/*.py, so copy the shell scripts
+    from the repo checkout this builder lives in."""
+    if IS_WIN:
+        return
+    src, dest = REPO_ROOT / 'builder', run.ws / 'builder'
+    for s in sorted(src.glob('*.sh')) if src.is_dir() else []:
+        d = dest / s.name
+        if not d.is_file() or d.read_bytes() != s.read_bytes():
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(s, d)
+            os.chmod(d, 0o755)
+            log(f'builder/{s.name}: copied from {src}')
+    cm = run.ws / 'switch/CMakeLists.txt'
+    if cm.is_file() and 'link-switch.sh' in cm.read_text(encoding='utf-8', errors='replace') \
+            and not (dest / 'link-switch.sh').is_file():
+        raise Failure(f'The game\'s CMake needs builder/link-switch.sh, which is not in the toolkit and not in {src}. '
+                      'Run this builder from a git checkout of KartPadNX (git clone '
+                      'https://github.com/KawaiiBunga/KartPadNX), or pass --repo with its path.')
+
+
 def configure_and_build(run, profile, jobs):
     p = PROFILES[profile]
     ws, t = run.ws, run.t
     bdir = ws / p['build']
     llvm = t.llvm / 'bin'
+    ensure_builder_scripts(run)
     run.python('integrate-deko.py')
     cmd = cmake_configure_cmd(run, profile, bdir, ws / p['translation'])
     cmd += configure_seed(run, bdir)
@@ -986,7 +1219,7 @@ def configure_and_build(run, profile, jobs):
             progress=ninja_progress(p['app']), quiet=True)
     elf = bdir / 'kartpad_full.elf'
     nro = bdir / p['nro']
-    out = subprocess.run([str(llvm / 'llvm-nm.exe'), str(elf)], capture_output=True, text=True).stdout
+    out = subprocess.run([str(llvm / ('llvm-nm' + EXE)), str(elf)], capture_output=True, text=True).stdout
     start = next((l.split()[0] for l in out.splitlines() if l.split()[-1:] == ['_start']), None)
     if start != '0000000000000000':
         nro.unlink(missing_ok=True)
@@ -995,9 +1228,40 @@ def configure_and_build(run, profile, jobs):
     return nro
 
 
+def zstd_compress(raw):
+    """pack-payloads.py's compression: level 19 with long-distance matching (8 MB window, which
+    the launcher's decoder reads by default). Python 3.14's own module when there is one, else
+    the `zstandard` package, else the zstd program."""
+    workers = min(os.cpu_count() or 1, 8)
+    try:
+        from compression import zstd
+    except ImportError:
+        zstd = None
+    if zstd:
+        opts = {zstd.CompressionParameter.compression_level: 19,
+                zstd.CompressionParameter.enable_long_distance_matching: 1}
+        try:
+            return zstd.compress(raw, options={**opts, zstd.CompressionParameter.nb_workers: workers})
+        except zstd.ZstdError:
+            return zstd.compress(raw, options=opts)  # libzstd built without threads
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard:
+        params = zstandard.ZstdCompressionParameters.from_level(19, enable_ldm=True, threads=workers)
+        return zstandard.ZstdCompressor(compression_params=params).compress(raw)
+    exe = shutil.which('zstd')
+    if exe:
+        r = subprocess.run([exe, '-19', '--long=23', f'-T{workers}', '-q', '-c'], input=raw, capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+        raise Failure('zstd failed: ' + r.stderr.decode('utf-8', 'replace')[-300:])
+    raise Failure('no zstd compressor: use Python 3.14, `pip install zstandard`, or install the zstd program')
+
+
 def pack_launcher(run, nros, out_dir):
     """builder/pack-payloads.py + the launcher's nx_create_nro, without recompiling it."""
-    from compression import zstd
     sys.path.insert(0, str(HERE))
     import nxtools
     ws = run.ws
@@ -1011,13 +1275,7 @@ def pack_launcher(run, nros, out_dir):
         p = PROFILES[profile]
         raw = nro.read_bytes()
         emit(progress='pack', item=p['app'], done=0, total=0)
-        # pack-payloads.py: level 19 with long-distance matching.
-        opts = {zstd.CompressionParameter.compression_level: 19,
-                zstd.CompressionParameter.enable_long_distance_matching: 1}
-        try:
-            comp = zstd.compress(raw, options={**opts, zstd.CompressionParameter.nb_workers: min(os.cpu_count() or 1, 8)})
-        except zstd.ZstdError:
-            comp = zstd.compress(raw, options=opts)  # libzstd built without threads
+        comp = zstd_compress(raw)
         (stage_dir / 'payload' / p['payload']).write_bytes(comp)
         stamp = re.search(rb'KARTPAD-BUILD [0-9]{4}-[0-9TZ:-]+', raw)
         entries.append({'variant': p['variant'], 'file': p['payload'], 'raw_size': len(raw),
@@ -1081,7 +1339,10 @@ def fnv1a(data, h=FNV_OFFSET):
 
 def _low_priority():
     try:
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+        if IS_WIN:
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+        else:
+            os.nice(10)
     except Exception:
         pass
 
@@ -1205,14 +1466,111 @@ def stage_rr_sd(state, tools, spec, out_dir):
     return True
 
 
+def preflight(data, out):
+    """Warnings the Windows exe would have raised before starting (RAM, disk space, CPU)."""
+    if IS_WIN:
+        return
+    import platform
+    if platform.machine() not in ('x86_64', 'AMD64'):
+        log(f"WARNING: {platform.machine()} is not x86-64; devkitPro's image layer and the pinned tools are x86-64 builds")
+    ram = total_ram_gb()
+    if ram < 8:
+        log(f'WARNING: {ram:.1f} GB RAM; 8 GB or more is recommended (jobs are limited to match)')
+    for where, need in ((Path(data), 15), (Path(out), 5)):
+        probe = where
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        free = shutil.disk_usage(probe).free / (1 << 30)
+        if free < need:
+            log(f'WARNING: only {free:.0f} GB free for {where}; about {need} GB is needed')
+
+
+def check_system(args):
+    """--check: what this machine has and what the build would download. Exit 1 on a blocker."""
+    import platform
+    manifest = load_manifest(args.manifest)
+    bad = []
+
+    def row(label, status, detail=''):
+        print(f'  {label:<22}{status:<10}{detail}')
+
+    print('KartPad-NX builder, system check')
+    py = sys.version_info
+    row('python', 'ok' if py >= (3, 9) else 'TOO OLD', f'{py.major}.{py.minor}.{py.micro} (3.9 or newer)')
+    if py < (3, 9):
+        bad.append('python')
+    row('cpu', 'ok' if platform.machine() in ('x86_64', 'AMD64') else 'WARNING', platform.machine() + ' (x86-64 needed)')
+    row('memory', 'ok' if total_ram_gb() >= 8 else 'LOW', f'{total_ram_gb():.1f} GB (8 GB recommended)')
+    probe = Path(args.data)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free / (1 << 30)
+    row('disk (work folder)', 'ok' if free >= 15 else 'LOW', f'{free:.0f} GB free at {probe} (15 GB needed)')
+    libc = platform.libc_ver()
+    row('libc', 'ok' if libc[0] == 'glibc' else 'WARNING', ' '.join(libc) + ' (devkitPro host tools need glibc)')
+    for name in Tools.LOCAL:
+        found = None if args.download_tools else find_system_tool(name)
+        if found:
+            row(name, 'system', str(found))
+        else:
+            spec = manifest.get(name, {})
+            row(name, 'download', spec.get('url', '?').rsplit('/', 1)[-1] + ('' if spec.get('sha256') else '  (not pinned)'))
+    try:
+        from compression import zstd  # noqa: F401
+        how = 'python 3.14'
+    except ImportError:
+        try:
+            import zstandard  # noqa: F401
+            how = 'zstandard module'
+        except ImportError:
+            how = 'zstd program' if shutil.which('zstd') else None
+    row('zstd', 'ok' if how else 'MISSING', how or 'Python 3.14, `pip install zstandard`, or the zstd program')
+    if not how:
+        bad.append('zstd')
+    row('pkg-config', 'system' if _which('pkg-config', 'pkgconf') else 'stub', '')
+    row('devkitPro', 'download', 'devkitpro/devkita64 image layer from Docker Hub (~365 MB)')
+    src = ('--toolkit ' + str(args.toolkit)) if args.toolkit else ('--bundle ' + str(args.bundle)) if args.bundle else None
+    present = args.toolkit and Path(args.toolkit).is_file() or args.bundle and Path(args.bundle).is_file()
+    row('toolkit', 'ok' if present else 'MISSING', src or 'give --bundle KartPadNX-Builder.data (from the Windows release zip) or --toolkit')
+    if not present:
+        bad.append('toolkit')
+    if args.disc:
+        row('disc image', 'ok' if Path(args.disc).is_file() else 'MISSING', str(args.disc))
+    print('\nBlockers: ' + ', '.join(bad) if bad else '\nNothing blocks a build.')
+    return 1 if bad else 0
+
+
+
+
+def load_manifest(path):
+    """tools.json, with the platform's tool entries from tools-linux.json laid over it."""
+    m = json.loads(Path(path).read_text(encoding='utf-8'))
+    overlay = Path(path).with_name('tools-linux.json')
+    if not IS_WIN and overlay.is_file():
+        m.update({k: v for k, v in json.loads(overlay.read_text(encoding='utf-8')).items() if not k.startswith('_')})
+    return m
+
+
 def main():
-    global LOG
+    global LOG, JSON_EVENTS, REPO_ROOT
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--data', required=True, type=Path)
-    ap.add_argument('--disc', required=True, type=Path)
-    ap.add_argument('--out', required=True, type=Path)
+    ap.add_argument('--data', type=Path, required=IS_WIN,
+                    help='work folder (about 11 GB); Linux default: ~/.local/share/kartpadnx-builder')
+    ap.add_argument('--disc', type=Path, required=IS_WIN)
+    ap.add_argument('--out', type=Path, required=IS_WIN, help='SD card folder; Linux default: ./KartPadNX-SD')
     ap.add_argument('--rr', action='store_true',
-                    help="also build Retro Rewind, and put its matching RetroRewind6 folder in --out")
+                    help="also build Retro Rewind, and put its matching RetroRewind6 folder in --out "
+                         "(the default on Linux)")
+    ap.add_argument('--no-rr', action='store_true', help='Linux: build only the base game')
+    ap.add_argument('--link', choices=('auto', 'gnu', 'lld'), default='auto',
+                    help="Linux: link with devkitPro's GNU ld (auto/gnu, as the Docker build does) or with "
+                         "LLVM lld through nxtools (the Windows builder's method)")
+    ap.add_argument('--download-tools', action='store_true',
+                    help='Linux: ignore the cmake/ninja/dotnet/LLVM/nodtool on this system and use the pinned downloads')
+    ap.add_argument('--repo', type=Path, default=None,
+                    help='Linux: the KartPadNX git checkout, for builder/*.sh the toolkit lacks (default: the one this file is in)')
+    ap.add_argument('--json-events', action='store_true', help='print "@@" JSON progress lines (for a frontend)')
+    ap.add_argument('--check', action='store_true', help='Linux: report what is missing and exit')
     ap.add_argument('--rr-sd', action='store_true', help=argparse.SUPPRESS)  # older frontends; implied by --rr
     ap.add_argument('--jobs', type=int, default=0)
     ap.add_argument('--toolkit', default=None)
@@ -1227,6 +1585,17 @@ def main():
     ap.add_argument('--nro-only', action='store_true',
                     help='only the launcher NRO in --out: no game files or RetroRewind6 folder (web builder)')
     args = ap.parse_args()
+    JSON_EVENTS = IS_WIN or args.json_events
+    if args.repo:
+        REPO_ROOT = args.repo.resolve()
+    if not IS_WIN:
+        args.data = args.data or Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'kartpadnx-builder'
+        args.out = args.out or Path('KartPadNX-SD')
+        args.rr = args.rr or args.rr_sd or not args.no_rr
+    if args.check:
+        return check_system(args)
+    if not args.disc:
+        ap.error('--disc is required')
 
     data = args.data.resolve()
     (data / 'logs').mkdir(parents=True, exist_ok=True)
@@ -1236,9 +1605,11 @@ def main():
     log(f'KartPad-NX AIO builder: data={data} out={args.out} jobs={jobs} profiles={",".join(profiles)}')
     t0 = time.time()
     try:
-        manifest = json.loads(args.manifest.read_text(encoding='utf-8'))
+        manifest = load_manifest(args.manifest)
         state = State(data / 'state')
-        tools = Tools(data, manifest, args.shim or (data / 'tools' / 'bin' / 'nxshim.exe'))
+        preflight(data, args.out)
+        tools = Tools(data, manifest, args.shim or ((data / 'tools' / 'bin' / 'nxshim.exe') if IS_WIN else None),
+                      {'link': args.link, 'download_tools': args.download_tools})
         bundle = Bundle(args.bundle) if args.bundle else None
         tools.install_local(state, bundle, args.keep_downloads)
         # devkitPro is only needed to compile: fetch it while the disc is read and translated.

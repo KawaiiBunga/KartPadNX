@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Windows stand-ins for the devkitPro host tools the Switch build calls.
+"""Stand-ins for the devkitPro host tools the Switch build calls (Windows has none; on Linux
+they fill in for any tool the devkitPro image layer lacks, and `link` serves --link lld).
 
 devkitPro publishes its toolchain as Linux/msys2 packages; the AIO builder only takes the
 target-side files (libnx, newlib, libstdc++, crt objects, headers) from devkitPro's official
@@ -12,7 +13,8 @@ Docker Hub image and replaces every host program with one of these:
   uam       copies the toolkit's precompiled .dksh for a shader (no GLSL compiler on Windows)
   pkg-config  minimal stub: Switch.cmake requires the program to exist
 
-Each tool is reached through nxshim.exe copies named after the real program; the shim runs
+Each tool is reached through nxshim.exe copies (Linux: small shell scripts) named after the real
+program; the shim runs
 `python nxtools.py <tool> <args...>`. Environment: KPNX_DEVKITPRO (the extracted devkitPro
 tree), KPNX_LLVM (LLVM root), KPNX_DKSH (precompiled shader directory).
 """
@@ -27,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 GCC_VERSION = '15.2.0'
+EXE = '.exe' if os.name == 'nt' else ''
 
 
 def env_path(name):
@@ -167,8 +170,8 @@ def lld_linker_script(switch_ld, out_file):
 def tool_link(argv):
     dkp = env_path('KPNX_DEVKITPRO')
     llvm = env_path('KPNX_LLVM')
-    lld = llvm / 'bin' / 'ld.lld.exe'
-    clang = llvm / 'bin' / 'clang.exe'
+    lld = llvm / 'bin' / ('ld.lld' + EXE)
+    clang = llvm / 'bin' / ('clang' + EXE)
     gcclib = dkp / 'devkitA64' / 'lib' / 'gcc' / 'aarch64-none-elf' / GCC_VERSION / 'pic'
     clib = dkp / 'devkitA64' / 'aarch64-none-elf' / 'lib' / 'pic'
 

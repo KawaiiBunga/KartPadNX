@@ -1,0 +1,41 @@
+{
+  "_comment": "Laid over tools.json on non-Windows hosts (kpnx_aio.load_manifest): each key here replaces the key of the same name. A tool already on the system (cmake >= 3.25, ninja, dotnet >= 8, LLVM 19, nodtool) is used instead of its download unless --download-tools is given. Entries without sha256/size are NOT pinned: the builder logs the SHA-256 of what it downloaded, and you should copy it in here once you have checked it. The devkitPro entry is the same pinned Docker Hub layer as on Windows (it is a linux/amd64 image), but keeps devkitPro's own Linux host programs.",
+  "dotnet": {
+    "url": "https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.32/dotnet-runtime-8.0.32-linux-x64.tar.gz",
+    "type": "tar"
+  },
+  "cmake": {
+    "url": "https://github.com/Kitware/CMake/releases/download/v3.31.12/cmake-3.31.12-linux-x86_64.tar.gz",
+    "type": "tar",
+    "strip": 1,
+    "include": ["bin/cmake", "share/cmake-3.31/"]
+  },
+  "ninja": {
+    "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip",
+    "type": "zip"
+  },
+  "nodtool": {
+    "url": "https://github.com/encounter/nod/releases/download/v2.0.0-alpha.9/nodtool-linux-x86_64",
+    "type": "file",
+    "name": "nodtool"
+  },
+  "llvm": {
+    "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz",
+    "type": "tar",
+    "strip": 1,
+    "include": ["bin/clang", "bin/clang-19", "bin/clang++", "bin/ld.lld", "bin/lld", "bin/llvm-ar",
+                "bin/llvm-ranlib", "bin/llvm-nm", "bin/llvm-objcopy", "bin/llvm-strip", "bin/llvm-readelf",
+                "bin/llvm-readobj", "bin/llvm-addr2line", "bin/llvm-symbolizer", "lib/clang/"]
+  },
+  "devkitpro": {
+    "comment": "devkitPro's official devkitpro/devkita64:20260219 image (linux/amd64), switch-dev + switch-portlibs layer. On Linux the host programs (g++ link driver with GNU ld, elf2nro, nacptool, bin2s, uam) are kept; any that the layer lacks is replaced by the nxtools port.",
+    "registry": "https://registry-1.docker.io",
+    "auth": "https://auth.docker.io/token?service=registry.docker.io&scope=repository:devkitpro/devkita64:pull",
+    "repository": "devkitpro/devkita64",
+    "digest": "sha256:da5be4661c9ac4e389f9e5f939e58bff7d32bc60569fa7c14e849d5246881691",
+    "size": 382982909,
+    "type": "oci-layer",
+    "strip": "opt/devkitpro/",
+    "include": ["devkitA64/", "libnx/", "portlibs/switch/", "cmake/", "tools/"]
+  }
+}
